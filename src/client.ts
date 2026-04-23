@@ -53,6 +53,50 @@ export interface AdsPowerProfile {
   [key: string]: unknown;
 }
 
+/** One document pulled from wyreg's authenticated inbox. The buffer is the
+ *  PDF bytes base64-encoded so the response stays JSON-serialisable over HTTP. */
+export interface WyregPolledDoc {
+  upstream_doc_id: string;
+  filename: string;
+  upstream_order_id: string | null;
+  entity_name_hint: string | null;
+  filing_date_hint: string | null;
+  buffer_base64: string;
+}
+
+export interface WyregPollDocsResponse {
+  ok: boolean;
+  portal: 'wyreg_poll_docs';
+  url: string;
+  docs: WyregPolledDoc[];
+}
+
+export interface WyregDocRowDescriptor {
+  docId: string;
+  filename: string;
+  entityNameHint: string | null;
+  filingDateHint: string | null;
+  upstreamOrderId: string | null;
+  downloadHref: string | null;
+  downloadClickSelector: string | null;
+}
+
+export interface WyregInspectDocsResponse {
+  ok: boolean;
+  portal: 'wyreg_inspect_docs';
+  url: string;
+  rows: WyregDocRowDescriptor[];
+  nav_links: Array<{ tag: string; text: string; href: string | null; class: string }>;
+  business_tiles: Array<{ text: string; href: string | null }>;
+  /** Filename on the worker's SCREENSHOT_DIR; fetchable via GET /screenshot/:name. */
+  screenshot: string;
+  /** Same screenshot, inlined so callers don't need a second round-trip. */
+  screenshot_base64: string;
+  html_excerpt: string;
+  body_text_excerpt: string;
+  routes_attempted: Array<{ url: string; settled: boolean; reason: string }>;
+}
+
 export class BrowserWorkerError extends Error {
   constructor(message: string, readonly status: number, readonly body: unknown) {
     super(message);
@@ -124,5 +168,32 @@ export class BrowserWorkerClient {
   /** Admin-token-only. Runs a PowerShell command on the Contabo host. Narrow escape hatch. */
   exec(req: ExecRequest): Promise<ExecResponse> {
     return this.request('POST', '/exec', req, (req.timeout_ms ?? 30_000) + 5_000);
+  }
+
+  /**
+   * Poll the wyregisteredagent.net documents inbox for a given AdsPower profile.
+   * Credentials live on the worker (WYREG_USERNAME/WYREG_PASSWORD); the persistent
+   * profile keeps the Keycloak session warm so this call rarely has to log in.
+   * PDF bytes come back base64-encoded inside each doc entry.
+   */
+  pollWyregDocs(opts: { profileId: string; jobId?: string; timeoutMs?: number }): Promise<WyregPollDocsResponse> {
+    const { profileId, jobId, timeoutMs } = opts;
+    return this.submit(
+      { profileId, portal: 'wyreg_poll_docs', jobId },
+      { timeoutMs: timeoutMs ?? 5 * 60_000 },
+    ) as unknown as Promise<WyregPollDocsResponse>;
+  }
+
+  /**
+   * Diagnostic flavour of pollWyregDocs: no downloads, returns nav/tile snapshot
+   * and a screenshot (inline base64 + worker-side filename) so an operator can
+   * tune selectors against the live portal.
+   */
+  inspectWyregDocs(opts: { profileId: string; jobId?: string; timeoutMs?: number }): Promise<WyregInspectDocsResponse> {
+    const { profileId, jobId, timeoutMs } = opts;
+    return this.submit(
+      { profileId, portal: 'wyreg_inspect_docs', jobId },
+      { timeoutMs: timeoutMs ?? 3 * 60_000 },
+    ) as unknown as Promise<WyregInspectDocsResponse>;
   }
 }
