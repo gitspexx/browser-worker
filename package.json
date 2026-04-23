@@ -1,0 +1,20 @@
+{
+  "name": "@spexx/browser-worker",
+  "version": "0.2.0",
+  "description": "HTTP client for the Contabo browser-worker: AdsPower + Playwright automation over Tailscale for claims-hq, bca-app, flights, growthops",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
