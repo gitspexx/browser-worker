@@ -53,6 +53,60 @@ export interface AdsPowerProfile {
   [key: string]: unknown;
 }
 
+/** One PDF pulled from the wyreg documents inbox. `buffer_base64` decodes to the raw PDF bytes. */
+export interface WyregPolledDoc {
+  upstream_doc_id: string;
+  filename: string;
+  upstream_order_id: string | null;
+  entity_name_hint: string | null;
+  filing_date_hint: string | null;
+  buffer_base64: string;
+  size_bytes: number;
+}
+
+export interface WyregPollDocsResponse {
+  ok: boolean;
+  portal: 'wyreg_poll_docs';
+  url: string;
+  docs: WyregPolledDoc[];
+  skipped: Array<{ filename: string; reason: string }>;
+}
+
+export interface WyregInspectDocsRow {
+  docId: string;
+  filename: string;
+  entityNameHint: string | null;
+  filingDateHint: string | null;
+  upstreamOrderId: string | null;
+  downloadHref: string | null;
+  downloadClickSelector: string | null;
+}
+
+export interface WyregInspectNavLink {
+  tag: string;
+  text: string;
+  href: string | null;
+  class: string;
+}
+
+export interface WyregInspectBusinessTile {
+  text: string;
+  href: string | null;
+}
+
+export interface WyregInspectDocsResponse {
+  ok: boolean;
+  portal: 'wyreg_inspect_docs';
+  url: string;
+  rows: WyregInspectDocsRow[];
+  nav_links: WyregInspectNavLink[];
+  business_tiles: WyregInspectBusinessTile[];
+  screenshot_base64: string;
+  html_excerpt: string;
+  body_text_excerpt: string;
+  routes_attempted: Array<{ url: string; settled: boolean; reason: string }>;
+}
+
 export class BrowserWorkerError extends Error {
   constructor(message: string, readonly status: number, readonly body: unknown) {
     super(message);
@@ -124,5 +178,34 @@ export class BrowserWorkerClient {
   /** Admin-token-only. Runs a PowerShell command on the Contabo host. Narrow escape hatch. */
   exec(req: ExecRequest): Promise<ExecResponse> {
     return this.request('POST', '/exec', req, (req.timeout_ms ?? 30_000) + 5_000);
+  }
+
+  /**
+   * Log into wyregisteredagent.net on the worker-hosted AdsPower profile and
+   * download every PDF in the documents inbox. The caller decodes each
+   * `buffer_base64` back into a Buffer for Supabase upload.
+   */
+  async pollWyregDocs(
+    opts: { profileId: string; timeoutMs?: number },
+  ): Promise<WyregPollDocsResponse> {
+    const res = await this.submit(
+      { profileId: opts.profileId, portal: 'wyreg_poll_docs' },
+      { timeoutMs: opts.timeoutMs ?? 600_000 },
+    );
+    return res as unknown as WyregPollDocsResponse;
+  }
+
+  /**
+   * Diagnostic snapshot of the authenticated documents page — nav tree,
+   * detected rows, screenshot (base64 PNG). No downloads, no writes.
+   */
+  async inspectWyregDocs(
+    opts: { profileId: string; timeoutMs?: number },
+  ): Promise<WyregInspectDocsResponse> {
+    const res = await this.submit(
+      { profileId: opts.profileId, portal: 'wyreg_inspect_docs' },
+      { timeoutMs: opts.timeoutMs ?? 300_000 },
+    );
+    return res as unknown as WyregInspectDocsResponse;
   }
 }
