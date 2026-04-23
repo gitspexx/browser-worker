@@ -427,7 +427,15 @@ app.post('/exec', auth('admin'), async (req, res) => {
   const id = crypto.randomBytes(4).toString('hex');
   const started = Date.now();
   try {
-    const fullCmd = shell === 'cmd' ? cmd : `powershell -NoProfile -Command "${cmd.replace(/"/g, '\\"')}"`;
+    // PowerShell via -EncodedCommand (UTF-16 LE base64) bypasses all cmd.exe escaping.
+    // cmd shell path stays primitive for rare cases that need it.
+    let fullCmd;
+    if (shell === 'cmd') {
+      fullCmd = cmd;
+    } else {
+      const encoded = Buffer.from(cmd, 'utf16le').toString('base64');
+      fullCmd = `powershell -NoProfile -EncodedCommand ${encoded}`;
+    }
     const { stdout, stderr } = await exec(fullCmd, { cwd, timeout: timeout_ms, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
     res.json({ ok: true, id, duration_ms: Date.now() - started, stdout, stderr });
   } catch (e) {
