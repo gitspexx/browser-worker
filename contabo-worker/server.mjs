@@ -83,6 +83,247 @@ async function withSession(profileId, fn, useAdsPower = true) {
   }
 }
 
+// ── wyreg helpers ───────────────────────────────────────────────────────────
+// Used by wyreg_poll_docs / wyreg_inspect_docs. On AdsPower the Keycloak session
+// persists across runs, so ensureLoggedIn is a single-shot check instead of the
+// retry-on-bounce loop the app used when it was juggling a cookies.json file.
+const WYREG_ACCOUNTS_BASE = 'https://accounts.wyregisteredagent.net';
+const WYREG_KEYCLOAK_URL_RE = /id\.wyregisteredagent\.net|login-actions|protocol\/openid-connect/;
+
+async function wyregDoKeycloakLoginIfPresent(page) {
+  const passwordVisible = await page
+    .locator('#password')
+    .waitFor({ state: 'visible', timeout: 8000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!passwordVisible) return;
+
+  const email = process.env.WYREG_USERNAME || '';
+  const password = process.env.WYREG_PASSWORD || '';
+  if (!email || !password) throw new Error('wyreg login required but WYREG_USERNAME/WYREG_PASSWORD not set on worker');
+
+  // Keystroke typing — React's controlled inputs need real input events to
+  // register and the Sign in button stays disabled until validation fires.
+  await page.locator('#username').click();
+  await page.locator('#username').pressSequentially(email, { delay: 20 });
+  await page.locator('#password').click();
+  await page.locator('#password').pressSequentially(password, { delay: 20 });
+
+  const rememberChecked = await page.locator('#rememberMe').isChecked().catch(() => false);
+  if (!rememberChecked) await page.locator('#rememberMe').check({ force: true }).catch(() => {});
+
+  const btnEnabled = await page.locator('#kc-login:not([disabled])').isVisible({ timeout: 3000 }).catch(() => false);
+  if (btnEnabled) {
+    await page.locator('#kc-login').click();
+  } else {
+    await page.evaluate(() => document.getElementById('kc-form')?.submit());
+  }
+
+  await page.waitForURL(/accounts\.wyregisteredagent\.net/, { timeout: 30000 }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const stillLogin = await page.locator('#password').isVisible().catch(() => false);
+  if (stillLogin) throw new Error('wyreg login failed — check credentials, 2FA, or CAPTCHA');
+}
+
+async function wyregEnsureLoggedIn(page) {
+  await page.goto(`${WYREG_ACCOUNTS_BASE}/#/dashpanel`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await wyregDoKeycloakLoginIfPresent(page);
+
+  // Settle check: if we're not on accounts after login, something failed.
+  for (let i = 0; i < 15; i++) {
+    await page.waitForTimeout(1000);
+    const url = page.url();
+    if (/accounts\.wyregisteredagent\.net/.test(url) && !WYREG_KEYCLOAK_URL_RE.test(url)) return;
+  }
+  throw new Error(`wyreg ensureLoggedIn: did not settle on accounts — final URL ${page.url()}`);
+}
+
+async function wyregGotoDocumentsPage(page) {
+  async function safeEval(fn, fallback) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { return await page.evaluate(fn); }
+      catch (err) {
+        const msg = err.message || String(err);
+        if (!/context was destroyed|Execution context/i.test(msg)) throw err;
+        await page.waitForTimeout(500);
+      }
+    }
+    return fallback;
+  }
+  async function pageLooksLikeDocs() {
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const bodyText = await safeEval(() => document.body.innerText || '', '');
+    const url = page.url();
+    const looksDocs = /documents?|filings?|completed|my documents|no documents/i.test(bodyText);
+    const urlDocs = /document|filing/i.test(url);
+    const is404 = /page not found|\b404\b/i.test(bodyText);
+    return (looksDocs || urlDocs) && !is404;
+  }
+
+  const navClicked = await safeEval(() => {
+    const candidates = Array.from(document.querySelectorAll('a, button, [role="link"], [role="menuitem"]'));
+    const match = candidates.find((el) => /^(documents|my documents|filings|my filings)$/i.test((el.textContent || '').trim()));
+    if (match) { match.click(); return true; }
+    return false;
+  }, false);
+  if (navClicked && await pageLooksLikeDocs()) {
+    console.log(`[wyregGotoDocumentsPage] settled via nav click → ${page.url()}`);
+    return;
+  }
+
+  const routes = [
+    `${WYREG_ACCOUNTS_BASE}/#/documents`,
+    `${WYREG_ACCOUNTS_BASE}/#/dashpanel/documents`,
+    `${WYREG_ACCOUNTS_BASE}/#/my-documents`,
+    `${WYREG_ACCOUNTS_BASE}/#/filings`,
+    `${WYREG_ACCOUNTS_BASE}/#/dashpanel`,
+  ];
+  for (const url of routes) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      if (await pageLooksLikeDocs()) {
+        console.log(`[wyregGotoDocumentsPage] settled on ${url}`);
+        return;
+      }
+    } catch (err) {
+      console.warn(`[wyregGotoDocumentsPage] ${url} failed: ${err.message}`);
+    }
+  }
+  throw new Error(`wyreg gotoDocumentsPage: no documents view found — last URL ${page.url()}`);
+}
+
+async function wyregEnumerateDocRowsOnce(page) {
+  return page.evaluate(() => {
+    const rowSelectors = [
+      '.p-datatable-tbody > tr',
+      '.p-dataview .p-dataview-content > div',
+      '[data-test="document-row"]',
+      'tr[data-doc-id]',
+      'li[data-doc-id]',
+    ];
+    const seen = new Set();
+    const candidateRows = [];
+    for (const sel of rowSelectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (!seen.has(el)) { seen.add(el); candidateRows.push(el); }
+      });
+    }
+    if (candidateRows.length === 0) {
+      document.querySelectorAll('[class*="card"], [class*="row"], [class*="item"], tr, li').forEach((el) => {
+        const text = el.textContent || '';
+        if (/\.pdf\b/i.test(text) && !seen.has(el)) { seen.add(el); candidateRows.push(el); }
+      });
+    }
+    const results = [];
+    candidateRows.forEach((row, idx) => {
+      const rowEl = row;
+      const text = rowEl.innerText || rowEl.textContent || '';
+
+      let filename = '';
+      const pdfLink = Array.from(rowEl.querySelectorAll('a, button')).find((el) => /\.pdf\b/i.test(el.textContent || ''));
+      if (pdfLink) {
+        filename = (pdfLink.textContent || '').trim();
+      } else {
+        const m = text.match(/([A-Za-z0-9._-]+\.pdf)\b/i);
+        if (m) filename = m[1];
+      }
+      if (!filename) {
+        const hasDownload = rowEl.querySelector('a[download], a[href*=".pdf"], button[aria-label*="download" i], button[title*="download" i]');
+        if (!hasDownload) return;
+        const nameEl = rowEl.querySelector('[class*="filename"], [class*="name"], [class*="title"]');
+        filename = nameEl?.textContent?.trim() || `document-${idx + 1}.pdf`;
+      }
+
+      const idAttr =
+        rowEl.getAttribute('data-doc-id') ||
+        rowEl.getAttribute('data-id') ||
+        rowEl.getAttribute('data-row-id') ||
+        rowEl.id ||
+        null;
+      const docId = idAttr || `row-${idx}-${text.slice(0, 32).replace(/\s+/g, '_')}`;
+
+      let entityNameHint = null;
+      const entityMatch = text.match(/([A-Z][A-Za-z0-9 &.,'\-]{1,60}\b(?:LLC|L\.L\.C\.|Inc\.?|Corp\.?|Corporation|Ltd\.?))/);
+      if (entityMatch) entityNameHint = entityMatch[1].trim();
+
+      const dateMatch = text.match(/\b(20\d{2}-[01]\d-[0-3]\d|[01]?\d\/[0-3]?\d\/20\d{2}|[A-Z][a-z]{2,8} \d{1,2},? 20\d{2})\b/);
+      const filingDateHint = dateMatch ? dateMatch[1] : null;
+
+      const orderAttr = rowEl.getAttribute('data-order-id');
+      const orderMatch = !orderAttr ? text.match(/\border[\s#:]*([A-Z0-9-]{5,32})\b/i) : null;
+      const upstreamOrderId = orderAttr || (orderMatch ? orderMatch[1] : null);
+
+      const anchorHref =
+        rowEl.querySelector('a[href*=".pdf"]')?.href ||
+        rowEl.querySelector('a[download]')?.href ||
+        null;
+
+      let clickSelector = null;
+      const clickable = rowEl.querySelector('a[href*=".pdf"], a[download], button[aria-label*="download" i], button[title*="download" i], button[class*="download" i], [data-test*="download"]');
+      if (clickable) {
+        const marker = `wyreg-doc-click-${docId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        clickable.setAttribute('data-wyreg-click', marker);
+        clickSelector = `[data-wyreg-click="${marker}"]`;
+      }
+
+      results.push({
+        docId,
+        filename,
+        entityNameHint,
+        filingDateHint,
+        upstreamOrderId,
+        downloadHref: anchorHref,
+        downloadClickSelector: clickSelector,
+      });
+    });
+    return results;
+  });
+}
+
+async function wyregEnumerateDocRows(page) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { return await wyregEnumerateDocRowsOnce(page); }
+    catch (err) {
+      const msg = err.message || String(err);
+      if (!/context was destroyed|Execution context/i.test(msg)) throw err;
+      await page.waitForTimeout(1000);
+    }
+  }
+  return wyregEnumerateDocRowsOnce(page);
+}
+
+async function wyregDownloadDocRow(page, row) {
+  if (row.downloadHref) {
+    try {
+      const resp = await page.request.get(row.downloadHref);
+      if (resp.ok()) return Buffer.from(await resp.body());
+      console.warn(`[wyregDownloadDocRow] href fetch ${resp.status()} for ${row.filename}`);
+    } catch (err) {
+      console.warn(`[wyregDownloadDocRow] href fetch threw for ${row.filename}: ${err.message}`);
+    }
+  }
+  if (row.downloadClickSelector) {
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 20000 }),
+        page.locator(row.downloadClickSelector).first().click({ force: true }),
+      ]);
+      const stream = await download.createReadStream();
+      if (!stream) return null;
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      return Buffer.concat(chunks);
+    } catch (err) {
+      console.warn(`[wyregDownloadDocRow] click-download failed for ${row.filename}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
 // ── Portal handlers ─────────────────────────────────────────────────────────
 // Each handler: async (page, payload) → result object. Handlers receive a
 // Playwright Page already wired to the profile (AdsPower or bypass).
@@ -304,6 +545,123 @@ const handlers = {
       attached,
       preview: shot,
       note: attached ? 'file attached via input[type=file]; user confirms submit' : 'no file input found — TODO: map upload modal',
+    };
+  },
+
+  // ── wyreg (wyregisteredagent.net) — docs inbox polling + inspection ──────
+  // Ported from bca-app/state-filing-worker wyreg.ts. Credentials come from
+  // WYREG_USERNAME / WYREG_PASSWORD on this host. AdsPower keeps the Keycloak
+  // session warm across runs, so login is a one-shot check instead of the
+  // retry-on-bounce loop the app used when it was re-hydrating cookies itself.
+  async wyreg_poll_docs(page, { jobId } = {}) {
+    const tag = jobId ?? 'poll';
+    await wyregEnsureLoggedIn(page);
+    await wyregGotoDocumentsPage(page);
+    const rows = await wyregEnumerateDocRows(page);
+    console.log(`[wyreg_poll_docs:${tag}] enumerated ${rows.length} candidate rows at ${page.url()}`);
+    const docs = [];
+    for (const row of rows) {
+      const buffer = await wyregDownloadDocRow(page, row);
+      if (!buffer || buffer.length === 0) {
+        console.warn(`[wyreg_poll_docs:${tag}] skipping ${row.filename} — download failed`);
+        continue;
+      }
+      if (buffer.slice(0, 5).toString() !== '%PDF-') {
+        console.warn(`[wyreg_poll_docs:${tag}] skipping ${row.filename} — not a PDF (got ${buffer.slice(0, 20).toString('hex')})`);
+        continue;
+      }
+      docs.push({
+        upstream_doc_id: row.docId,
+        filename: row.filename,
+        upstream_order_id: row.upstreamOrderId,
+        entity_name_hint: row.entityNameHint,
+        filing_date_hint: row.filingDateHint,
+        buffer_base64: buffer.toString('base64'),
+      });
+    }
+    return { portal: 'wyreg_poll_docs', url: page.url(), docs };
+  },
+
+  async wyreg_inspect_docs(page, { jobId } = {}) {
+    const tag = jobId ?? 'inspect';
+    const routes_attempted = [];
+    await wyregEnsureLoggedIn(page);
+    await page.waitForTimeout(2000);
+    const atLogin = await page.locator('#password').isVisible({ timeout: 1000 }).catch(() => false);
+    routes_attempted.push({
+      url: page.url(),
+      settled: !atLogin,
+      reason: atLogin ? 'session expired — landed on Keycloak login' : 'dashpanel loaded via ensureLoggedIn',
+    });
+    for (let i = 0; i < 8; i++) {
+      await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      const bodyOk = await page.evaluate(() => (document.body?.innerText || '').length > 0).catch(() => false);
+      if (bodyOk) break;
+    }
+
+    const rows = await wyregEnumerateDocRows(page).catch(() => []);
+
+    const nav_links = await page.evaluate(() => {
+      const seen = new Set();
+      const out = [];
+      document.querySelectorAll('a, button, [role="link"], [role="menuitem"]').forEach((el) => {
+        const he = el;
+        if (he.offsetParent === null && (he.offsetWidth === 0 || he.offsetHeight === 0)) return;
+        const text = (he.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+        if (!text) return;
+        const href = el.href || null;
+        const key = `${el.tagName}|${text}|${href || ''}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push({ tag: el.tagName.toLowerCase(), text, href, class: (he.className || '').slice(0, 80) });
+      });
+      return out;
+    }).catch(() => []);
+
+    const business_tiles = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('[class*="card"], [class*="tile"], [class*="business"], li, article').forEach((el) => {
+        const he = el;
+        const text = (he.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+        if (!/\b(LLC|L\.L\.C\.|Inc\.?|Corp\.?|Corporation|Ltd\.?)\b/i.test(text)) return;
+        const anchor = el.querySelector('a[href]');
+        out.push({ text, href: anchor?.href || null });
+      });
+      return out.slice(0, 40);
+    }).catch(() => []);
+
+    async function withRetry(label, fn, fallback) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { return await fn(); }
+        catch (err) {
+          const msg = err.message || String(err);
+          console.log(`[wyreg_inspect_docs:${tag}] ${label} attempt ${attempt} failed: ${msg.slice(0, 120)}`);
+          if (!/navigating|context was destroyed|Execution context/i.test(msg)) throw err;
+          await page.waitForTimeout(1500);
+        }
+      }
+      return fallback;
+    }
+
+    const screenshotBuf = await withRetry('screenshot', () => page.screenshot({ fullPage: true }), Buffer.alloc(0));
+    const html = await withRetry('html', () => page.content(), '');
+    const bodyText = await withRetry('body-text', () => page.evaluate(() => document.body?.innerText || ''), '');
+
+    const shotName = `wyreg-inspect-${tag}-${Date.now()}.png`;
+    try { fs.writeFileSync(path.join(OUT, shotName), screenshotBuf); } catch { /* ignore */ }
+
+    return {
+      portal: 'wyreg_inspect_docs',
+      url: page.url(),
+      rows,
+      nav_links,
+      business_tiles,
+      screenshot: shotName,
+      screenshot_base64: screenshotBuf.toString('base64'),
+      html_excerpt: html.slice(0, 40_000),
+      body_text_excerpt: bodyText.slice(0, 8_000),
+      routes_attempted,
     };
   },
 
