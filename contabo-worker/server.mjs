@@ -75,20 +75,6 @@ async function withSession(profileId, fn, useAdsPower = true) {
   const browser = await chromium.connectOverCDP(start.ws.puppeteer);
   const ctx = browser.contexts()[0] ?? (await browser.newContext());
   const page = ctx.pages()[0] ?? (await ctx.newPage());
-  // Chrome attached over CDP doesn't have Playwright's acceptDownloads flag set,
-  // so download events fire but the stream is canceled before Playwright can
-  // consume it. Set browser-wide download behavior explicitly to a known dir.
-  try {
-    const downloadDir = path.join(OUT, '..', 'downloads', profileId);
-    await fs.promises.mkdir(downloadDir, { recursive: true }).catch(() => {});
-    const cdp = await ctx.newCDPSession(page);
-    await cdp.send('Browser.setDownloadBehavior', {
-      behavior: 'allow',
-      downloadPath: downloadDir,
-    }).catch((err) => console.warn(`[withSession] setDownloadBehavior failed: ${err.message}`));
-  } catch (err) {
-    console.warn(`[withSession] download setup failed: ${err.message}`);
-  }
   try {
     return await fn(page);
   } finally {
@@ -531,15 +517,27 @@ async function wyregDownloadDocRow(page, row) {
         console.warn(`[wyregDownloadDocRow] no Download button on detail page for ${row.filename}`);
         return null;
       }
+      // Capture the download URL via the browser's download event, then fetch
+      // with page.request (which inherits session cookies). CDP-attached
+      // Playwright can't reliably drain download streams, but refetching the
+      // URL that triggered the download works because our auth cookies are
+      // already in the context.
       const [download] = await Promise.all([
         page.waitForEvent('download', { timeout: 30000 }),
         downloadBtn.click({ timeout: 8000 }),
       ]);
-      // Wait for Playwright to fully persist the file to disk, then read it
-      // from the path. createReadStream races with page navigation and cancels
-      // mid-stream — download.path() blocks until the download is complete.
-      const buf = await drainDownload(download);
-      return buf;
+      const dlUrl = download.url();
+      await download.cancel().catch(() => {}); // don't care about the browser-side save
+      if (!dlUrl) {
+        console.warn(`[wyregDownloadDocRow] download event had no URL for ${row.filename}`);
+        return null;
+      }
+      const resp = await page.request.get(dlUrl);
+      if (!resp.ok()) {
+        console.warn(`[wyregDownloadDocRow] refetch ${resp.status()} for ${row.filename} at ${dlUrl}`);
+        return null;
+      }
+      return Buffer.from(await resp.body());
     } catch (err) {
       console.warn(`[wyregDownloadDocRow] detail-page download failed for ${row.filename}: ${err.message.slice(0, 120)}`);
     }
