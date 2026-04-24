@@ -695,6 +695,15 @@ const handlers = {
       settled: !atLogin,
       reason: atLogin ? 'session expired — landed on Keycloak login' : 'dashpanel loaded via ensureLoggedIn',
     });
+    // Also try to navigate to the docs inbox so inspect reflects the same page
+    // that poll_docs scrapes. Don't throw on failure — operator still wants the
+    // nav dump either way.
+    try {
+      await wyregGotoDocumentsPage(page);
+      routes_attempted.push({ url: page.url(), settled: true, reason: 'wyregGotoDocumentsPage succeeded' });
+    } catch (err) {
+      routes_attempted.push({ url: page.url(), settled: false, reason: `wyregGotoDocumentsPage failed: ${(err?.message || String(err)).slice(0, 200)}` });
+    }
     for (let i = 0; i < 8; i++) {
       await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
       await page.waitForTimeout(800);
