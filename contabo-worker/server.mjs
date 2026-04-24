@@ -419,12 +419,22 @@ async function wyregEnumerateDocRowsOnce(page) {
         rowEl.querySelector('a[download]')?.href ||
         null;
 
+      // Two possible click targets:
+      //   1. An explicit download control on the row (preferred, rare)
+      //   2. The row itself — wyreg's card layout routes to a Document Details
+      //      page on row-click; that page exposes an actual "Download" button.
       let clickSelector = null;
-      const clickable = rowEl.querySelector('a[href*=".pdf"], a[download], button[aria-label*="download" i], button[title*="download" i], button[class*="download" i], [data-test*="download"]');
-      if (clickable) {
+      let openDetailSelector = null;
+      const explicitDownload = rowEl.querySelector('a[href*=".pdf"], a[download], button[aria-label*="download" i], button[title*="download" i], button[class*="download" i], [data-test*="download"]');
+      if (explicitDownload) {
         const marker = `wyreg-doc-click-${docId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-        clickable.setAttribute('data-wyreg-click', marker);
+        explicitDownload.setAttribute('data-wyreg-click', marker);
         clickSelector = `[data-wyreg-click="${marker}"]`;
+      } else {
+        // Mark the row for row-click-into-details flow
+        const rowMarker = `wyreg-doc-row-${docId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        rowEl.setAttribute('data-wyreg-row', rowMarker);
+        openDetailSelector = `[data-wyreg-row="${rowMarker}"]`;
       }
 
       results.push({
@@ -435,6 +445,7 @@ async function wyregEnumerateDocRowsOnce(page) {
         upstreamOrderId,
         downloadHref: anchorHref,
         downloadClickSelector: clickSelector,
+        openDetailSelector,
       });
     });
     return results;
@@ -454,6 +465,7 @@ async function wyregEnumerateDocRows(page) {
 }
 
 async function wyregDownloadDocRow(page, row) {
+  // Strategy 1: direct PDF href (rare but cleanest)
   if (row.downloadHref) {
     try {
       const resp = await page.request.get(row.downloadHref);
@@ -463,22 +475,77 @@ async function wyregDownloadDocRow(page, row) {
       console.warn(`[wyregDownloadDocRow] href fetch threw for ${row.filename}: ${err.message}`);
     }
   }
+
+  // Strategy 2: explicit download control on the row — click + intercept.
   if (row.downloadClickSelector) {
     try {
       const [download] = await Promise.all([
         page.waitForEvent('download', { timeout: 20000 }),
         page.locator(row.downloadClickSelector).first().click({ force: true }),
       ]);
-      const stream = await download.createReadStream();
-      if (!stream) return null;
-      const chunks = [];
-      for await (const chunk of stream) chunks.push(chunk);
-      return Buffer.concat(chunks);
+      return await drainDownload(download);
     } catch (err) {
       console.warn(`[wyregDownloadDocRow] click-download failed for ${row.filename}: ${err.message}`);
     }
   }
+
+  // Strategy 3: row-click routes to /#/documents/<id> (Document Details page).
+  // That page has a real "Download" button that triggers a download event.
+  if (row.openDetailSelector) {
+    try {
+      const listUrl = page.url();
+      await page.locator(row.openDetailSelector).first().click({ timeout: 8000 });
+      // Wait for navigation away from the list (detail page has its own hash route)
+      const changed = await (async () => {
+        const end = Date.now() + 10000;
+        while (Date.now() < end) {
+          if (page.url() !== listUrl) return true;
+          await page.waitForTimeout(300);
+        }
+        return false;
+      })();
+      if (!changed) {
+        console.warn(`[wyregDownloadDocRow] row click did not navigate for ${row.filename}`);
+        return null;
+      }
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+
+      // Click the "Download" button on the detail page and capture the event.
+      const downloadBtn = page.locator('a, button').filter({ hasText: /^\s*download\s*$/i }).first();
+      if (await downloadBtn.count() === 0) {
+        console.warn(`[wyregDownloadDocRow] no Download button on detail page for ${row.filename}`);
+        await page.goBack().catch(() => {});
+        return null;
+      }
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 20000 }),
+        downloadBtn.click({ timeout: 8000 }),
+      ]);
+      const buf = await drainDownload(download);
+
+      // Navigate back to the list so the next row-click works from the same origin.
+      await page.goBack().catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(800);
+
+      return buf;
+    } catch (err) {
+      console.warn(`[wyregDownloadDocRow] detail-page download failed for ${row.filename}: ${err.message}`);
+      // Try to get back to the list even on error
+      try { await page.goBack(); } catch { /* ignore */ }
+    }
+  }
+
   return null;
+}
+
+async function drainDownload(download) {
+  const stream = await download.createReadStream();
+  if (!stream) return null;
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
 }
 
 // ── Portal handlers ─────────────────────────────────────────────────────────
