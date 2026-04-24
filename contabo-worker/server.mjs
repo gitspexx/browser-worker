@@ -490,12 +490,13 @@ async function wyregDownloadDocRow(page, row) {
   }
 
   // Strategy 3: row-click routes to /#/documents/<id> (Document Details page).
-  // That page has a real "Download" button that triggers a download event.
+  // That page has a real "Download" button. Caller must pre-navigate back to
+  // the list before calling with the next row — the list DOM re-renders on
+  // each list visit so enumerator markers are single-use.
   if (row.openDetailSelector) {
     try {
       const listUrl = page.url();
       await page.locator(row.openDetailSelector).first().click({ timeout: 8000 });
-      // Wait for navigation away from the list (detail page has its own hash route)
       const changed = await (async () => {
         const end = Date.now() + 10000;
         while (Date.now() < end) {
@@ -511,29 +512,22 @@ async function wyregDownloadDocRow(page, row) {
       await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
       await page.waitForTimeout(1500);
 
-      // Click the "Download" button on the detail page and capture the event.
       const downloadBtn = page.locator('a, button').filter({ hasText: /^\s*download\s*$/i }).first();
       if (await downloadBtn.count() === 0) {
         console.warn(`[wyregDownloadDocRow] no Download button on detail page for ${row.filename}`);
-        await page.goBack().catch(() => {});
         return null;
       }
       const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: 20000 }),
+        page.waitForEvent('download', { timeout: 30000 }),
         downloadBtn.click({ timeout: 8000 }),
       ]);
+      // Wait for Playwright to fully persist the file to disk, then read it
+      // from the path. createReadStream races with page navigation and cancels
+      // mid-stream — download.path() blocks until the download is complete.
       const buf = await drainDownload(download);
-
-      // Navigate back to the list so the next row-click works from the same origin.
-      await page.goBack().catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(800);
-
       return buf;
     } catch (err) {
-      console.warn(`[wyregDownloadDocRow] detail-page download failed for ${row.filename}: ${err.message}`);
-      // Try to get back to the list even on error
-      try { await page.goBack(); } catch { /* ignore */ }
+      console.warn(`[wyregDownloadDocRow] detail-page download failed for ${row.filename}: ${err.message.slice(0, 120)}`);
     }
   }
 
@@ -541,11 +535,16 @@ async function wyregDownloadDocRow(page, row) {
 }
 
 async function drainDownload(download) {
-  const stream = await download.createReadStream();
-  if (!stream) return null;
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
+  try {
+    const p = await download.path();
+    if (!p) return null;
+    const buf = await fs.promises.readFile(p);
+    try { await fs.promises.unlink(p); } catch { /* ignore */ }
+    return buf;
+  } catch (err) {
+    console.warn(`[drainDownload] ${err.message}`);
+    return null;
+  }
 }
 
 // ── Portal handlers ─────────────────────────────────────────────────────────
@@ -777,14 +776,44 @@ const handlers = {
   // WYREG_USERNAME / WYREG_PASSWORD on this host. AdsPower keeps the Keycloak
   // session warm across runs, so login is a one-shot check instead of the
   // retry-on-bounce loop the app used when it was re-hydrating cookies itself.
-  async wyreg_poll_docs(page, { jobId } = {}) {
+  async wyreg_poll_docs(page, { jobId, entity_name_filter } = {}) {
     const tag = jobId ?? 'poll';
     await wyregEnsureLoggedIn(page);
     await wyregGotoDocumentsPage(page);
-    const rows = await wyregEnumerateDocRows(page);
-    console.log(`[wyreg_poll_docs:${tag}] enumerated ${rows.length} candidate rows at ${page.url()}`);
+    const listUrl = page.url();
+    const initialRows = await wyregEnumerateDocRows(page);
+    console.log(`[wyreg_poll_docs:${tag}] enumerated ${initialRows.length} candidate rows at ${listUrl}`);
+
+    // Build a stable identity per-row so we can dedupe across re-enumerations:
+    // wyreg rows have no persistent id we can extract, so use
+    // (filename + entityNameHint + filingDateHint) as a fingerprint.
+    const rowFingerprint = (r) => `${r.entityNameHint}|${r.filename}|${r.filingDateHint}`;
+
+    // Optional client-side filter: only pull docs for the named entity (BCAX etc).
+    const matchesFilter = (r) => !entity_name_filter
+      || (r.entityNameHint || '').toLowerCase().includes(String(entity_name_filter).toLowerCase());
+
+    const seen = new Set();
+    const plan = initialRows.filter(matchesFilter).map(rowFingerprint);
+    console.log(`[wyreg_poll_docs:${tag}] plan (${plan.length}): ${plan.slice(0, 5).join(' | ')}${plan.length > 5 ? ' …' : ''}`);
+
     const docs = [];
-    for (const row of rows) {
+    // Each iteration: re-enumerate on the fresh list DOM, pick the first
+    // planned row we haven't processed yet, download, then come back to list.
+    for (let i = 0; i < plan.length; i++) {
+      if (page.url() !== listUrl) {
+        await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(1500);
+      }
+      const fresh = await wyregEnumerateDocRows(page);
+      const row = fresh.find((r) => matchesFilter(r) && !seen.has(rowFingerprint(r)));
+      if (!row) {
+        console.warn(`[wyreg_poll_docs:${tag}] no remaining rows match plan at iter ${i} — stopping`);
+        break;
+      }
+      seen.add(rowFingerprint(row));
+
       const buffer = await wyregDownloadDocRow(page, row);
       if (!buffer || buffer.length === 0) {
         console.warn(`[wyreg_poll_docs:${tag}] skipping ${row.filename} — download failed`);
@@ -794,6 +823,7 @@ const handlers = {
         console.warn(`[wyreg_poll_docs:${tag}] skipping ${row.filename} — not a PDF (got ${buffer.slice(0, 20).toString('hex')})`);
         continue;
       }
+      console.log(`[wyreg_poll_docs:${tag}] downloaded ${row.filename} (${buffer.length} bytes) for ${row.entityNameHint}`);
       docs.push({
         upstream_doc_id: row.docId,
         filename: row.filename,
