@@ -164,6 +164,33 @@ async function wyregGotoDocumentsPage(page) {
     return (looksDocs || urlDocs) && !is404;
   }
 
+  // Strategy 1: wyreg dashpanel shows a stat card labelled "Unread Documents"
+  // with a sibling "View" action that routes to the docs inbox. Find that label,
+  // walk up to its card container, and click the View inside. Works even when
+  // the nav bar has no top-level "Documents" link (as of 2026-04-24).
+  const unreadClicked = await safeEval(() => {
+    const all = Array.from(document.querySelectorAll('*'));
+    const label = all.find((el) => {
+      const t = (el.textContent || '').trim();
+      return /^unread documents/i.test(t) && el.children.length <= 5 && t.length < 60;
+    });
+    if (!label) return false;
+    let card = label;
+    for (let depth = 0; depth < 6 && card; depth++) {
+      const viewBtn = Array.from(card.querySelectorAll('a, button, [role="link"]')).find(
+        (el) => /^view$/i.test((el.textContent || '').trim())
+      );
+      if (viewBtn) { viewBtn.click(); return true; }
+      card = card.parentElement;
+    }
+    return false;
+  }, false);
+  if (unreadClicked && await pageLooksLikeDocs()) {
+    console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View click → ${page.url()}`);
+    return;
+  }
+
+  // Strategy 2: generic nav-bar link whose own text equals "Documents" / "Filings".
   const navClicked = await safeEval(() => {
     const candidates = Array.from(document.querySelectorAll('a, button, [role="link"], [role="menuitem"]'));
     const match = candidates.find((el) => /^(documents|my documents|filings|my filings)$/i.test((el.textContent || '').trim()));
