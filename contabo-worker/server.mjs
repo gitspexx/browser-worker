@@ -793,6 +793,10 @@ const handlers = {
   async wyreg_poll_docs(page, { jobId, entity_name_filter } = {}) {
     const tag = jobId ?? 'poll';
     await wyregEnsureLoggedIn(page);
+    // Dashpanel needs time to render the Unread Documents card before we
+    // try clicking it — otherwise gotoDocumentsPage falls through every
+    // strategy and throws.
+    await page.waitForTimeout(2500);
     await wyregGotoDocumentsPage(page);
     const listUrl = page.url();
     const initialRows = await wyregEnumerateDocRows(page);
