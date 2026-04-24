@@ -164,76 +164,100 @@ async function wyregGotoDocumentsPage(page) {
     return (looksDocs || urlDocs) && !is404;
   }
 
-  // Strict docs-page detector: dashpanel mentions "Completed" for orders so the
-  // old loose regex returned false positives. Require explicit doc-inbox hints.
+  // Strict docs-page detector. Dashpanel itself has an "Unread Documents" stat
+  // card and mentions "Completed" for orders, so the only reliable signal is a
+  // URL that is NOT the dashpanel/-hire-us/-businesses listing AND shows either
+  // a PDF filename or an inbox header column.
+  const NON_DOCS_URL_RE = /\/#\/(dashpanel|hire-us|services|pending-filings|businesses|account)(\/|\?|$)/;
   async function pageIsDocsInbox() {
     await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1200);
     const url = page.url();
+    if (NON_DOCS_URL_RE.test(url) && !/\/businesses\/[^/]+/.test(url)) return false;
     const bodyText = await safeEval(() => document.body.innerText || '', '');
-    const urlHit = /document|filing|inbox|\/report/i.test(url);
     const hasPdf = /\.pdf\b/i.test(bodyText);
-    const hasDocHeader = /(^|\n)\s*(documents|my documents|unread documents|completed filings?)\s*(\n|$)/i.test(bodyText);
+    const hasInboxMarkers = /(filing date|document type|date received|document name|download)/i.test(bodyText);
+    const urlHit = /document|filing|inbox|\/report/i.test(url);
     const is404 = /page not found|\b404\b|sasquatch/i.test(bodyText);
-    return (urlHit || hasPdf || hasDocHeader) && !is404;
+    return (hasPdf || hasInboxMarkers || urlHit) && !is404;
   }
 
-  // Strategy 1: dashpanel's "Unread Documents" stat card with a "View" action
-  // (present when there are unread docs). Most reliable when it shows up.
-  const unreadClicked = await safeEval(() => {
-    const all = Array.from(document.querySelectorAll('*'));
-    const label = all.find((el) => {
-      const t = (el.textContent || '').trim();
-      return /^unread documents/i.test(t) && el.children.length <= 5 && t.length < 60;
-    });
-    if (!label) return false;
-    let card = label;
-    for (let depth = 0; depth < 6 && card; depth++) {
-      const viewBtn = Array.from(card.querySelectorAll('a, button, [role="link"]')).find(
-        (el) => /^view$/i.test((el.textContent || '').trim())
-      );
-      if (viewBtn) { viewBtn.click(); return true; }
-      card = card.parentElement;
+  async function waitForUrlChange(from, timeoutMs = 8000) {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      if (page.url() !== from) return true;
+      await page.waitForTimeout(300);
     }
     return false;
-  }, false);
-  if (unreadClicked && await pageIsDocsInbox()) {
-    console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View → ${page.url()}`);
-    return;
   }
 
-  // Strategy 2: per-business detail page. wyreg has no global documents inbox;
-  // docs live under each business at /#/businesses → click entity → Documents tab.
-  // Go via the /#/businesses listing and open the first business detail.
+  // Strategy 1: dashpanel's "Unread Documents" stat card has a sibling "View"
+  // action. Use Playwright locators (not page.evaluate-based .click) so Vue
+  // v-on handlers fire and routing actually happens.
+  const dashpanelUrl = page.url();
+  try {
+    const unreadCard = page.locator('div, article, section, li').filter({ hasText: /unread documents/i }).filter({ hasText: /documents not yet opened|^\d+$/i }).first();
+    if (await unreadCard.count() > 0) {
+      const viewBtn = unreadCard.locator('a, button, [role="link"]').filter({ hasText: /^\s*view\s*$/i }).first();
+      if (await viewBtn.count() > 0) {
+        await viewBtn.click({ timeout: 5000 });
+        if (await waitForUrlChange(dashpanelUrl, 8000)) {
+          if (await pageIsDocsInbox()) {
+            console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View → ${page.url()}`);
+            return;
+          }
+          console.log(`[wyregGotoDocumentsPage] Unread View click landed at ${page.url()} but not a docs inbox`);
+        } else {
+          console.log(`[wyregGotoDocumentsPage] Unread View click did not change URL from dashpanel`);
+        }
+      } else {
+        console.log(`[wyregGotoDocumentsPage] Unread Documents card found but no View button inside`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[wyregGotoDocumentsPage] Unread click path failed: ${err.message}`);
+  }
+
+  // Strategy 2: per-business detail. wyreg routes docs under /#/businesses/<id>
+  // with a Documents tab. Go via the businesses list and open the first entity.
   try {
     await page.goto(`${WYREG_ACCOUNTS_BASE}/#/businesses`, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1500);
-    const detailClicked = await safeEval(() => {
-      const anchors = Array.from(document.querySelectorAll('a[href*="/businesses/"]'));
-      const first = anchors.find((a) => /\/businesses\/[0-9a-f-]+/i.test(a.getAttribute('href') || ''));
-      if (first) { first.click(); return first.getAttribute('href'); }
-      // Fallback: click the first tile-shaped element whose text contains "LLC"
-      const tiles = Array.from(document.querySelectorAll('[class*="card"], [class*="tile"], li, article'));
-      const tile = tiles.find((el) => /\b(LLC|L\.L\.C\.|Inc\.?|Corp\.?)\b/.test(el.textContent || ''));
-      if (tile) { tile.click(); return 'tile-click'; }
-      return null;
-    }, null);
-    if (detailClicked) {
-      console.log(`[wyregGotoDocumentsPage] clicked into business detail → ${detailClicked}`);
+    const bizListUrl = page.url();
+
+    // Try a real anchor first, then a Playwright text-click on an LLC tile.
+    let clicked = false;
+    const anchor = page.locator('a[href*="#/businesses/"]').filter({ hasNotText: /^\s*view all\s*$/i }).first();
+    if (await anchor.count() > 0) {
+      await anchor.click({ timeout: 5000 });
+      clicked = true;
+    } else {
+      const tile = page.getByText(/\bLLC\b|\bL\.L\.C\.\b|\bInc\.?\b|\bCorp\.?\b/).first();
+      if (await tile.count() > 0) {
+        await tile.click({ timeout: 5000 });
+        clicked = true;
+      }
+    }
+    if (clicked) {
+      await waitForUrlChange(bizListUrl, 8000);
+      console.log(`[wyregGotoDocumentsPage] entered business detail → ${page.url()}`);
       await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
       await page.waitForTimeout(1500);
-      // Click the Documents tab/sub-nav inside the business detail page
-      const docsTabClicked = await safeEval(() => {
-        const cands = Array.from(document.querySelectorAll('a, button, [role="tab"], [role="link"]'));
-        const tab = cands.find((el) => /^\s*documents?\s*$/i.test((el.textContent || '').trim()));
-        if (tab) { tab.click(); return true; }
-        return false;
-      }, false);
-      console.log(`[wyregGotoDocumentsPage] business-detail Documents tab clicked=${docsTabClicked}`);
+
+      // Click the Documents tab/sub-nav
+      const docsTab = page.locator('a, button, [role="tab"], [role="link"]').filter({ hasText: /^\s*documents?\s*$/i }).first();
+      if (await docsTab.count() > 0) {
+        const beforeTab = page.url();
+        await docsTab.click({ timeout: 5000 }).catch(() => {});
+        await waitForUrlChange(beforeTab, 5000);
+        console.log(`[wyregGotoDocumentsPage] Documents tab clicked → ${page.url()}`);
+      } else {
+        console.log(`[wyregGotoDocumentsPage] no Documents tab on business detail`);
+      }
       if (await pageIsDocsInbox()) {
-        console.log(`[wyregGotoDocumentsPage] settled on business-detail docs tab → ${page.url()}`);
+        console.log(`[wyregGotoDocumentsPage] settled on business-detail docs → ${page.url()}`);
         return;
       }
     }
