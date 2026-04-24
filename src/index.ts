@@ -8,4 +8,8 @@ export {
   type ExecRequest,
   type ExecResponse,
   type AdsPowerProfile,
+  type WyregPolledDoc,
+  type WyregPollDocsResponse,
+  type WyregDocRowDescriptor,
+  type WyregInspectDocsResponse,
 } from './client.js';
