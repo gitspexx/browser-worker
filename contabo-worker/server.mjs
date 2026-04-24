@@ -123,7 +123,24 @@ async function wyregDoKeycloakLoginIfPresent(page) {
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(1500);
   const stillLogin = await page.locator('#password').isVisible().catch(() => false);
-  if (stillLogin) throw new Error('wyreg login failed — check credentials, 2FA, or CAPTCHA');
+  if (stillLogin) {
+    // Dump the failing page to C:\worker\screenshots so the operator can see
+    // whether it's a CAPTCHA, 2FA prompt, "Continue as X" screen, or plain error.
+    try {
+      const shotPath = path.join(OUT, 'wyreg-login-fail.png');
+      await page.screenshot({ path: shotPath, fullPage: true });
+      const htmlPath = path.join(OUT, 'wyreg-login-fail.html');
+      const html = await page.content();
+      await fs.promises.writeFile(htmlPath, html);
+      const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+      console.warn(`[wyreg-login-fail] url=${page.url()}`);
+      console.warn(`[wyreg-login-fail] body=${(body || '').slice(0, 600).replace(/\s+/g, ' ')}`);
+      console.warn(`[wyreg-login-fail] shot=${shotPath} html=${htmlPath}`);
+    } catch (err) {
+      console.warn(`[wyreg-login-fail] diagnostic dump failed: ${err.message}`);
+    }
+    throw new Error('wyreg login failed — check credentials, 2FA, or CAPTCHA');
+  }
 }
 
 async function wyregEnsureLoggedIn(page) {
