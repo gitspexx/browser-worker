@@ -192,6 +192,21 @@ async function wyregGotoDocumentsPage(page) {
     return false;
   }
 
+  // After landing on the docs inbox URL, the SPA fetches the doc list async
+  // and shows "Loading..." in the meantime. Wait for that to disappear before
+  // returning so callers don't enumerate an empty skeleton.
+  async function waitForDocsContentLoaded() {
+    await page.waitForFunction(() => {
+      const t = document.body?.innerText || '';
+      const loading = /(^|\n)\s*Loading\.\.\.\s*(\n|$)/i.test(t);
+      if (loading) return false;
+      // Either we see a .pdf filename, a "no documents" empty state, or a
+      // recognisable table/row marker — any is a signal the list resolved.
+      return /\.pdf\b|no documents|date received|filing date|document type/i.test(t);
+    }, { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+
   // Strategy 1: dashpanel's "Unread Documents" stat card has a sibling "View"
   // action. Use Playwright locators (not page.evaluate-based .click) so Vue
   // v-on handlers fire and routing actually happens.
@@ -204,6 +219,7 @@ async function wyregGotoDocumentsPage(page) {
         await viewBtn.click({ timeout: 5000 });
         if (await waitForUrlChange(dashpanelUrl, 8000)) {
           if (await pageIsDocsInbox()) {
+            await waitForDocsContentLoaded();
             console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View → ${page.url()}`);
             return;
           }
@@ -257,6 +273,7 @@ async function wyregGotoDocumentsPage(page) {
         console.log(`[wyregGotoDocumentsPage] no Documents tab on business detail`);
       }
       if (await pageIsDocsInbox()) {
+        await waitForDocsContentLoaded();
         console.log(`[wyregGotoDocumentsPage] settled on business-detail docs → ${page.url()}`);
         return;
       }
@@ -273,6 +290,7 @@ async function wyregGotoDocumentsPage(page) {
     return false;
   }, false);
   if (navClicked && await pageIsDocsInbox()) {
+    await waitForDocsContentLoaded();
     console.log(`[wyregGotoDocumentsPage] settled via nav click → ${page.url()}`);
     return;
   }
@@ -288,6 +306,7 @@ async function wyregGotoDocumentsPage(page) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       if (await pageIsDocsInbox()) {
+        await waitForDocsContentLoaded();
         console.log(`[wyregGotoDocumentsPage] settled on ${url}`);
         return;
       }
