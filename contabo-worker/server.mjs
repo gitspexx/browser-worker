@@ -816,13 +816,17 @@ const handlers = {
     const docs = [];
     // Each iteration: re-enumerate on the fresh list DOM, pick the first
     // planned row we haven't processed yet, download, then come back to list.
+    // Force page.reload on every iteration after the first so Vue actually
+    // re-renders the list (same-hash goto does not).
     for (let i = 0; i < plan.length; i++) {
-      if (page.url() !== listUrl) {
+      if (i > 0 || page.url() !== listUrl) {
         await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(2000);
       }
       const fresh = await wyregEnumerateDocRows(page);
+      console.log(`[wyreg_poll_docs:${tag}] iter ${i}: fresh rows=${fresh.length}, matching=${fresh.filter(matchesFilter).length}, seen=${seen.size}`);
       const row = fresh.find((r) => matchesFilter(r) && !seen.has(rowFingerprint(r)));
       if (!row) {
         console.warn(`[wyreg_poll_docs:${tag}] no remaining rows match plan at iter ${i} — stopping`);
