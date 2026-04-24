@@ -816,14 +816,15 @@ const handlers = {
     const docs = [];
     // Each iteration: re-enumerate on the fresh list DOM, pick the first
     // planned row we haven't processed yet, download, then come back to list.
-    // Force page.reload on every iteration after the first so Vue actually
-    // re-renders the list (same-hash goto does not).
+    // page.reload() on the same hash route does not force Vue to re-render
+    // the list; the reliable path is to round-trip through the dashpanel
+    // and re-invoke the "Unread Documents -> View" click we know works.
     for (let i = 0; i < plan.length; i++) {
-      if (i > 0 || page.url() !== listUrl) {
-        await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      if (i > 0) {
+        await page.goto(`${WYREG_ACCOUNTS_BASE}/#/dashpanel`, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
         await page.waitForTimeout(2000);
+        await wyregGotoDocumentsPage(page);
       }
       const fresh = await wyregEnumerateDocRows(page);
       console.log(`[wyreg_poll_docs:${tag}] iter ${i}: fresh rows=${fresh.length}, matching=${fresh.filter(matchesFilter).length}, seen=${seen.size}`);
