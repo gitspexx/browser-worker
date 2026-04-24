@@ -75,6 +75,20 @@ async function withSession(profileId, fn, useAdsPower = true) {
   const browser = await chromium.connectOverCDP(start.ws.puppeteer);
   const ctx = browser.contexts()[0] ?? (await browser.newContext());
   const page = ctx.pages()[0] ?? (await ctx.newPage());
+  // Chrome attached over CDP doesn't have Playwright's acceptDownloads flag set,
+  // so download events fire but the stream is canceled before Playwright can
+  // consume it. Set browser-wide download behavior explicitly to a known dir.
+  try {
+    const downloadDir = path.join(OUT, '..', 'downloads', profileId);
+    await fs.promises.mkdir(downloadDir, { recursive: true }).catch(() => {});
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+    }).catch((err) => console.warn(`[withSession] setDownloadBehavior failed: ${err.message}`));
+  } catch (err) {
+    console.warn(`[withSession] download setup failed: ${err.message}`);
+  }
   try {
     return await fn(page);
   } finally {
