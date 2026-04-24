@@ -1147,34 +1147,57 @@ const handlers = {
       }
 
       // Step 4: select "Limited Liability Company (LLC)" radio + Continue.
+      // Real IRS selectors captured from /applyein/legalStructure on 2026-04-24:
+      //   radio: input[name="legalStructureInput"][id^="LLClegalStructureInp"]
+      //   continue: <a role="button" aria-label="Continue">Continue</a>
+      // Continue is an anchor styled as a button, so input[type=submit] selectors
+      // don't match — use aria-label directly.
       if (!stoppedEarly) {
         const llcRadio = await firstVisible([
+          'input[type="radio"][id^="LLClegalStructure" i]',
           'input[type="radio"][value*="LLC" i]',
           'input[type="radio"][id*="LLC" i]',
-          'input[type="radio"][name*="legalStructure" i][value*="limited" i]',
-          // Fallback: find by associated label text via JSP naming conventions.
-          'label:has-text("Limited Liability Company") input[type="radio"]',
-          'label:has-text("LLC") >> input[type="radio"]',
+          'label:has-text("Limited Liability Company (LLC)") input[type="radio"]',
         ], 10000);
         if (!llcRadio) {
           stoppedEarly = true;
           stopReason = 'unexpected — no LLC radio on legal-structure page';
         } else {
           await llcRadio.click({ timeout: 8000 }).catch(() => {});
-          // Do NOT fill any other input — only this one toggle, as spec requires.
+          // Give the form a moment to register the selection before advancing.
+          await page.waitForTimeout(500);
           const continueBtn = await firstVisible([
+            'a[aria-label="Continue"]',
+            'a[role="button"][aria-label*="Continue" i]',
+            'button[aria-label="Continue"]',
+            'a:has-text("Continue")',
             'input[type="submit"][value*="Continue" i]',
             'button:has-text("Continue")',
-            'input[type="button"][value*="Continue" i]',
-            'a:has-text("Continue")',
           ], 10000);
           if (!continueBtn) {
             stoppedEarly = true;
             stopReason = 'unexpected — no Continue button after LLC selection';
           } else {
+            const beforeAdvanceUrl = page.url();
             await continueBtn.click({ timeout: 8000 }).catch(() => {});
             await settle();
-            await captureStep(stoppedEarly ? 'stopped' : 'llc-members-question');
+            // Verify we actually moved off Step 1. IRS /applyein/ is a SPA —
+            // URL often stays similar but the step indicator body text flips
+            // from "Legal Structure active" to "Identity active".
+            const advanced = await page.waitForFunction(() => {
+              const t = document.body?.innerText || '';
+              // If we see "Identity active" somewhere that means we moved on.
+              // "Legal Structure active" still being present means we're stuck.
+              return /\bIdentity\s+active\b/i.test(t)
+                && !/\bLegal\s+Structure\s+active\b/i.test(t);
+            }, { timeout: 10000 }).then(() => true).catch(() => false);
+            if (!advanced) {
+              stoppedEarly = true;
+              stopReason = `stuck on Legal Structure after LLC+Continue — URL ${page.url()}`;
+              await captureStep('step1-stuck');
+            } else {
+              await captureStep('step2-identity');
+            }
           }
         }
       }
@@ -1184,7 +1207,7 @@ const handlers = {
       try { await captureStep('error'); } catch { /* ignore */ }
     }
 
-    const step_label = stoppedEarly ? (stopReason || 'unexpected') : 'llc-members-question';
+    const step_label = stoppedEarly ? (stopReason || 'unexpected') : 'step2-identity';
 
     // Dump the final page state. Best-effort — errors are swallowed so the
     // operator still gets whatever we captured.
