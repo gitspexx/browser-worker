@@ -333,6 +333,25 @@ async function wyregEnumerateDocRowsOnce(page) {
         if (!seen.has(el)) { seen.add(el); candidateRows.push(el); }
       });
     }
+    // wyreg's /#/documents page renders each doc as a card containing the
+    // labels Jurisdiction / Type / Received / Status — find those.
+    if (candidateRows.length === 0) {
+      const all = document.querySelectorAll('[class*="card"], [class*="row"], [class*="item"], li, article, div');
+      all.forEach((el) => {
+        if (seen.has(el)) return;
+        const text = (el.textContent || '').trim();
+        // Require ALL of these labels present and the card not be huge (avoid root container)
+        if (/\bJurisdiction\b/i.test(text)
+            && /\bType\b/i.test(text)
+            && /\bReceived\b/i.test(text)
+            && /\bStatus\b/i.test(text)
+            && text.length < 600) {
+          seen.add(el);
+          candidateRows.push(el);
+        }
+      });
+    }
+    // Legacy PDF-filename fallback (keeps old behaviour for other layouts)
     if (candidateRows.length === 0) {
       document.querySelectorAll('[class*="card"], [class*="row"], [class*="item"], tr, li').forEach((el) => {
         const text = el.textContent || '';
@@ -344,6 +363,12 @@ async function wyregEnumerateDocRowsOnce(page) {
       const rowEl = row;
       const text = rowEl.innerText || rowEl.textContent || '';
 
+      // Try to pull a "Type" label value (e.g. "Initial Resolution") — that's the
+      // document kind on wyreg's card layout and becomes our filename stem.
+      let docType = null;
+      const typeMatch = text.match(/\bType\b\s*\n+\s*([^\n]{2,80})/);
+      if (typeMatch) docType = typeMatch[1].trim();
+
       let filename = '';
       const pdfLink = Array.from(rowEl.querySelectorAll('a, button')).find((el) => /\.pdf\b/i.test(el.textContent || ''));
       if (pdfLink) {
@@ -351,6 +376,11 @@ async function wyregEnumerateDocRowsOnce(page) {
       } else {
         const m = text.match(/([A-Za-z0-9._-]+\.pdf)\b/i);
         if (m) filename = m[1];
+      }
+      if (!filename && docType) {
+        // Derive filename from Type when no explicit filename is shown
+        const slug = docType.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        filename = `${slug}.pdf`;
       }
       if (!filename) {
         const hasDownload = rowEl.querySelector('a[download], a[href*=".pdf"], button[aria-label*="download" i], button[title*="download" i]');
@@ -371,8 +401,14 @@ async function wyregEnumerateDocRowsOnce(page) {
       const entityMatch = text.match(/([A-Z][A-Za-z0-9 &.,'\-]{1,60}\b(?:LLC|L\.L\.C\.|Inc\.?|Corp\.?|Corporation|Ltd\.?))/);
       if (entityMatch) entityNameHint = entityMatch[1].trim();
 
-      const dateMatch = text.match(/\b(20\d{2}-[01]\d-[0-3]\d|[01]?\d\/[0-3]?\d\/20\d{2}|[A-Z][a-z]{2,8} \d{1,2},? 20\d{2})\b/);
-      const filingDateHint = dateMatch ? dateMatch[1] : null;
+      // Prefer the value under the "Received" label on wyreg cards.
+      let filingDateHint = null;
+      const recvMatch = text.match(/\bReceived\b\s*\n+\s*([^\n]{3,40})/);
+      if (recvMatch) filingDateHint = recvMatch[1].trim();
+      if (!filingDateHint) {
+        const dateMatch = text.match(/\b(20\d{2}-[01]\d-[0-3]\d|[01]?\d\/[0-3]?\d\/20\d{2}|[A-Z][a-z]{2,8} \d{1,2},? 20\d{2})\b/);
+        if (dateMatch) filingDateHint = dateMatch[1];
+      }
 
       const orderAttr = rowEl.getAttribute('data-order-id');
       const orderMatch = !orderAttr ? text.match(/\border[\s#:]*([A-Z0-9-]{5,32})\b/i) : null;
