@@ -83,6 +83,97 @@ async function withSession(profileId, fn, useAdsPower = true) {
   }
 }
 
+// ── IRS EIN Online Assistant helpers ────────────────────────────────────────
+// The IRS EIN Online Assistant (sa.www4.irs.gov/modiein) is only available
+// Mon–Fri 07:00–22:00 Eastern Time. Per IRS, the "last accepted minute" is
+// 21:59 ET — 22:00 itself is the close. Eastern Time flips between EST and
+// EDT; Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York' }) handles
+// DST for us. Pure helper: no Playwright, no fetch — safe to unit-test.
+//
+// Returns { open, reason, next_open_at } where next_open_at is an ISO UTC
+// string (or null when already open).
+function irsEinOnlineHoursOpen(now = new Date()) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
+  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const weekday = weekdayMap[parts.weekday];
+  // Intl returns "24" for midnight in hour12:false; normalize to 0.
+  let hour = Number(parts.hour);
+  if (hour === 24) hour = 0;
+  const year = Number(parts.year);
+  const month = Number(parts.month);
+  const day = Number(parts.day);
+
+  const isWeekday = weekday >= 1 && weekday <= 5;
+  // Open window: 07:00–21:59 ET. 22:00 is the close.
+  const inHours = hour >= 7 && hour <= 21;
+  if (isWeekday && inHours) {
+    return { open: true, reason: 'open', next_open_at: null };
+  }
+
+  // Encode an ET wall-clock (y, m, d, h) as a UTC ISO by probing the zone's
+  // offset at a naive UTC instant and correcting for it.
+  function etWallClockToUtcIso(y, m, d, h) {
+    const naive = Date.UTC(y, m - 1, d, h, 0, 0);
+    const probe = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    const pp = Object.fromEntries(probe.formatToParts(new Date(naive)).map((p) => [p.type, p.value]));
+    let ph = Number(pp.hour);
+    if (ph === 24) ph = 0;
+    const probed = Date.UTC(Number(pp.year), Number(pp.month) - 1, Number(pp.day), ph, Number(pp.minute));
+    const deltaMs = naive - probed;
+    return new Date(naive + deltaMs).toISOString();
+  }
+
+  function addDays(y, m, d, n) {
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
+  }
+
+  if (!isWeekday) {
+    // Sat (6) → +2 to Mon; Sun (0) → +1 to Mon.
+    const delta = weekday === 6 ? 2 : 1;
+    const nxt = addDays(year, month, day, delta);
+    return {
+      open: false,
+      reason: 'weekend — opens Monday 07:00 ET',
+      next_open_at: etWallClockToUtcIso(nxt.y, nxt.m, nxt.d, 7),
+    };
+  }
+  if (hour < 7) {
+    return {
+      open: false,
+      reason: 'before 07:00 ET — opens at 07:00 ET today',
+      next_open_at: etWallClockToUtcIso(year, month, day, 7),
+    };
+  }
+  // hour >= 22 on a weekday: opens tomorrow, or Monday if today is Friday.
+  const delta = weekday === 5 ? 3 : 1;
+  const nxt = addDays(year, month, day, delta);
+  return {
+    open: false,
+    reason: 'after 22:00 ET — opens at 07:00 ET tomorrow',
+    next_open_at: etWallClockToUtcIso(nxt.y, nxt.m, nxt.d, 7),
+  };
+}
+
 // ── wyreg helpers ───────────────────────────────────────────────────────────
 // Used by wyreg_poll_docs / wyreg_inspect_docs. On AdsPower the Keycloak session
 // persists across runs, so ensureLoggedIn is a single-shot check instead of the
@@ -963,6 +1054,221 @@ const handlers = {
       html_excerpt: html.slice(0, 40_000),
       body_text_excerpt: bodyText.slice(0, 8_000),
       routes_attempted,
+    };
+  },
+
+  // ── IRS EIN Online Assistant: discovery-only inspect handler ─────────────
+  // Walks the public marketing page → /modiein/individual/index.jsp → Begin
+  // Application → legal-structure page → selects LLC → stops on the
+  // number-of-members question. Never fills any text input, never submits.
+  // Screenshots each meaningful step. Returns the final page's form fields,
+  // nav links, HTML/body excerpts, and the operating-hours check so the
+  // operator can see what's on the screen. Phase 2 (dryrun/submit) will
+  // personalize from here.
+  async irs_apply_ein_inspect(page, { jobId } = {}) {
+    const tag = jobId || 'adhoc';
+    const outDir = path.join(OUT, 'irs-ein-inspect', tag);
+    fs.mkdirSync(outDir, { recursive: true });
+    const steps_visited = [];
+    const hours = irsEinOnlineHoursOpen();
+    if (!hours.open) {
+      throw new Error(`IRS EIN online application closed: ${hours.reason}. next_open_at=${hours.next_open_at}`);
+    }
+
+    const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+    async function captureStep(label) {
+      const idx = steps_visited.length;
+      const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+      try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+      steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+    }
+    async function settle() {
+      await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+    // Try locators in sequence; return the first one that's visible. Short
+    // timeout per candidate so we don't sit for 30s on a dead selector.
+    async function firstVisible(selectors, perTimeout = 3000) {
+      for (const sel of selectors) {
+        const loc = page.locator(sel).first();
+        try {
+          await loc.waitFor({ state: 'visible', timeout: perTimeout });
+          return loc;
+        } catch { /* try next */ }
+      }
+      return null;
+    }
+
+    let stoppedEarly = false;
+    let stopReason = null;
+    try {
+      // Step 1: IRS marketing / info page.
+      await page.goto(
+        'https://www.irs.gov/businesses/small-businesses-self-employed/apply-for-an-employer-identification-number-ein-online',
+        { waitUntil: 'domcontentloaded', timeout: 45000 },
+      );
+      await settle();
+      await captureStep('irs-landing');
+
+      // Step 2: click "Apply Online Now" / "Begin Application Now". IRS has
+      // historically shifted between both wordings; match either.
+      const applyLink = await firstVisible([
+        'a:has-text("Apply Online Now")',
+        'a:has-text("Begin Application Now")',
+        'a:has-text("Apply Online")',
+        'a[href*="modiein"]',
+      ], 10000);
+      if (!applyLink) {
+        stoppedEarly = true;
+        stopReason = 'unexpected — no Apply Online Now link on IRS landing';
+      } else {
+        await applyLink.click({ timeout: 8000 }).catch(() => {});
+        await settle();
+        await captureStep('ein-assistant-start');
+      }
+
+      // Step 3: on the assistant start page, click "Begin Application".
+      if (!stoppedEarly) {
+        const beginBtn = await firstVisible([
+          'input[type="submit"][value*="Begin" i]',
+          'button:has-text("Begin Application")',
+          'a:has-text("Begin Application")',
+          'input[type="button"][value*="Begin" i]',
+        ], 10000);
+        if (!beginBtn) {
+          stoppedEarly = true;
+          stopReason = 'unexpected — no Begin Application button on assistant start page';
+        } else {
+          await beginBtn.click({ timeout: 8000 }).catch(() => {});
+          await settle();
+          await captureStep('legal-structure-select');
+        }
+      }
+
+      // Step 4: select "Limited Liability Company (LLC)" radio + Continue.
+      if (!stoppedEarly) {
+        const llcRadio = await firstVisible([
+          'input[type="radio"][value*="LLC" i]',
+          'input[type="radio"][id*="LLC" i]',
+          'input[type="radio"][name*="legalStructure" i][value*="limited" i]',
+          // Fallback: find by associated label text via JSP naming conventions.
+          'label:has-text("Limited Liability Company") input[type="radio"]',
+          'label:has-text("LLC") >> input[type="radio"]',
+        ], 10000);
+        if (!llcRadio) {
+          stoppedEarly = true;
+          stopReason = 'unexpected — no LLC radio on legal-structure page';
+        } else {
+          await llcRadio.click({ timeout: 8000 }).catch(() => {});
+          // Do NOT fill any other input — only this one toggle, as spec requires.
+          const continueBtn = await firstVisible([
+            'input[type="submit"][value*="Continue" i]',
+            'button:has-text("Continue")',
+            'input[type="button"][value*="Continue" i]',
+            'a:has-text("Continue")',
+          ], 10000);
+          if (!continueBtn) {
+            stoppedEarly = true;
+            stopReason = 'unexpected — no Continue button after LLC selection';
+          } else {
+            await continueBtn.click({ timeout: 8000 }).catch(() => {});
+            await settle();
+            await captureStep(stoppedEarly ? 'stopped' : 'llc-members-question');
+          }
+        }
+      }
+    } catch (err) {
+      stoppedEarly = true;
+      stopReason = `unexpected — navigation error: ${(err?.message || String(err)).slice(0, 200)}`;
+      try { await captureStep('error'); } catch { /* ignore */ }
+    }
+
+    const step_label = stoppedEarly ? (stopReason || 'unexpected') : 'llc-members-question';
+
+    // Dump the final page state. Best-effort — errors are swallowed so the
+    // operator still gets whatever we captured.
+    const form_fields = await page.evaluate(() => {
+      function nearestLabel(el) {
+        // <label for=id>
+        if (el.id) {
+          const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+          if (l) return (l.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200) || null;
+        }
+        // Ancestor <label>
+        let cur = el.parentElement;
+        for (let i = 0; i < 5 && cur; i++, cur = cur.parentElement) {
+          if (cur.tagName === 'LABEL') {
+            return (cur.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200) || null;
+          }
+        }
+        // Walk up a few ancestors looking for short text content near the input.
+        cur = el.parentElement;
+        for (let i = 0; i < 3 && cur; i++, cur = cur.parentElement) {
+          const txt = (cur.textContent || '').trim().replace(/\s+/g, ' ');
+          if (txt && txt.length < 240) return txt.slice(0, 200);
+        }
+        return null;
+      }
+      const out = [];
+      document.querySelectorAll('input, select, textarea').forEach((raw) => {
+        const el = raw;
+        const tag = el.tagName.toLowerCase();
+        // Skip hidden inputs — operator doesn't need to eyeball CSRF tokens.
+        const type = el.getAttribute('type');
+        if (tag === 'input' && (type === 'hidden' || type === 'submit' || type === 'button' || type === 'image' || type === 'reset')) return;
+        const entry = {
+          tag,
+          name: el.getAttribute('name'),
+          id: el.getAttribute('id'),
+          type: tag === 'input' ? (type || 'text') : null,
+          label: nearestLabel(el),
+          placeholder: el.getAttribute('placeholder'),
+          value: el.value ?? null,
+        };
+        if (tag === 'select') {
+          entry.options = Array.from(el.options || []).map((o) => ({
+            value: o.value,
+            text: (o.textContent || '').trim().slice(0, 200),
+            selected: !!o.selected,
+          }));
+        }
+        out.push(entry);
+      });
+      return out;
+    }).catch(() => []);
+
+    const nav_links = await page.evaluate(() => {
+      const seen = new Set();
+      const out = [];
+      document.querySelectorAll('a, button, input[type="submit"], input[type="button"]').forEach((raw) => {
+        const el = raw;
+        if (el.offsetParent === null && (el.offsetWidth === 0 || el.offsetHeight === 0)) return;
+        const tag = el.tagName.toLowerCase();
+        const text = (el.value || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+        if (!text) return;
+        const href = el.getAttribute('href') || null;
+        const key = `${tag}|${text}|${href || ''}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push({ tag, text, href });
+      });
+      return out;
+    }).catch(() => []);
+
+    const body_text_excerpt = await page.evaluate(() => (document.body?.innerText || '').slice(0, 8000)).catch(() => '');
+    const html_excerpt = await page.evaluate(() => document.documentElement.outerHTML.slice(0, 40000)).catch(() => '');
+
+    return {
+      portal: 'irs_apply_ein_inspect',
+      url: page.url(),
+      step_label,
+      steps_visited,
+      form_fields,
+      nav_links,
+      body_text_excerpt,
+      html_excerpt,
+      operating_hours: hours,
     };
   },
 
