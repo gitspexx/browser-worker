@@ -164,10 +164,23 @@ async function wyregGotoDocumentsPage(page) {
     return (looksDocs || urlDocs) && !is404;
   }
 
-  // Strategy 1: wyreg dashpanel shows a stat card labelled "Unread Documents"
-  // with a sibling "View" action that routes to the docs inbox. Find that label,
-  // walk up to its card container, and click the View inside. Works even when
-  // the nav bar has no top-level "Documents" link (as of 2026-04-24).
+  // Strict docs-page detector: dashpanel mentions "Completed" for orders so the
+  // old loose regex returned false positives. Require explicit doc-inbox hints.
+  async function pageIsDocsInbox() {
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const url = page.url();
+    const bodyText = await safeEval(() => document.body.innerText || '', '');
+    const urlHit = /document|filing|inbox|\/report/i.test(url);
+    const hasPdf = /\.pdf\b/i.test(bodyText);
+    const hasDocHeader = /(^|\n)\s*(documents|my documents|unread documents|completed filings?)\s*(\n|$)/i.test(bodyText);
+    const is404 = /page not found|\b404\b|sasquatch/i.test(bodyText);
+    return (urlHit || hasPdf || hasDocHeader) && !is404;
+  }
+
+  // Strategy 1: dashpanel's "Unread Documents" stat card with a "View" action
+  // (present when there are unread docs). Most reliable when it shows up.
   const unreadClicked = await safeEval(() => {
     const all = Array.from(document.querySelectorAll('*'));
     const label = all.find((el) => {
@@ -185,34 +198,72 @@ async function wyregGotoDocumentsPage(page) {
     }
     return false;
   }, false);
-  if (unreadClicked && await pageLooksLikeDocs()) {
-    console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View click → ${page.url()}`);
+  if (unreadClicked && await pageIsDocsInbox()) {
+    console.log(`[wyregGotoDocumentsPage] settled via Unread Documents → View → ${page.url()}`);
     return;
   }
 
-  // Strategy 2: generic nav-bar link whose own text equals "Documents" / "Filings".
+  // Strategy 2: per-business detail page. wyreg has no global documents inbox;
+  // docs live under each business at /#/businesses → click entity → Documents tab.
+  // Go via the /#/businesses listing and open the first business detail.
+  try {
+    await page.goto(`${WYREG_ACCOUNTS_BASE}/#/businesses`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const detailClicked = await safeEval(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href*="/businesses/"]'));
+      const first = anchors.find((a) => /\/businesses\/[0-9a-f-]+/i.test(a.getAttribute('href') || ''));
+      if (first) { first.click(); return first.getAttribute('href'); }
+      // Fallback: click the first tile-shaped element whose text contains "LLC"
+      const tiles = Array.from(document.querySelectorAll('[class*="card"], [class*="tile"], li, article'));
+      const tile = tiles.find((el) => /\b(LLC|L\.L\.C\.|Inc\.?|Corp\.?)\b/.test(el.textContent || ''));
+      if (tile) { tile.click(); return 'tile-click'; }
+      return null;
+    }, null);
+    if (detailClicked) {
+      console.log(`[wyregGotoDocumentsPage] clicked into business detail → ${detailClicked}`);
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      // Click the Documents tab/sub-nav inside the business detail page
+      const docsTabClicked = await safeEval(() => {
+        const cands = Array.from(document.querySelectorAll('a, button, [role="tab"], [role="link"]'));
+        const tab = cands.find((el) => /^\s*documents?\s*$/i.test((el.textContent || '').trim()));
+        if (tab) { tab.click(); return true; }
+        return false;
+      }, false);
+      console.log(`[wyregGotoDocumentsPage] business-detail Documents tab clicked=${docsTabClicked}`);
+      if (await pageIsDocsInbox()) {
+        console.log(`[wyregGotoDocumentsPage] settled on business-detail docs tab → ${page.url()}`);
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn(`[wyregGotoDocumentsPage] business-detail path failed: ${err.message}`);
+  }
+
+  // Strategy 3: generic nav-bar link whose own text equals "Documents" / "Filings".
   const navClicked = await safeEval(() => {
     const candidates = Array.from(document.querySelectorAll('a, button, [role="link"], [role="menuitem"]'));
     const match = candidates.find((el) => /^(documents|my documents|filings|my filings)$/i.test((el.textContent || '').trim()));
     if (match) { match.click(); return true; }
     return false;
   }, false);
-  if (navClicked && await pageLooksLikeDocs()) {
+  if (navClicked && await pageIsDocsInbox()) {
     console.log(`[wyregGotoDocumentsPage] settled via nav click → ${page.url()}`);
     return;
   }
 
+  // Strategy 4: speculative direct routes (most are sasquatch 404s but cheap).
   const routes = [
     `${WYREG_ACCOUNTS_BASE}/#/documents`,
     `${WYREG_ACCOUNTS_BASE}/#/dashpanel/documents`,
     `${WYREG_ACCOUNTS_BASE}/#/my-documents`,
     `${WYREG_ACCOUNTS_BASE}/#/filings`,
-    `${WYREG_ACCOUNTS_BASE}/#/dashpanel`,
   ];
   for (const url of routes) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      if (await pageLooksLikeDocs()) {
+      if (await pageIsDocsInbox()) {
         console.log(`[wyregGotoDocumentsPage] settled on ${url}`);
         return;
       }
