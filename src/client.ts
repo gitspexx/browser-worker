@@ -244,8 +244,19 @@ export interface IrsEinSubmitResponse {
   /** Assigned EIN string in XX-XXXXXXX format; null only if extraction failed
    *  (in that case operator must read the EIN off the screenshot). */
   ein: string | null;
-  /** CP 575 confirmation PDF base64. Null if IRS didn't expose the link. */
+  /** CP 575 confirmation PDF base64. Null if IRS didn't expose the link in
+   *  a way the worker could capture (always check ein_assignment_dump for
+   *  manual retrieval). The worker also persists the PDF to disk on Contabo
+   *  at C:\\worker\\screenshots\\irs-ein\\<jobId>\\cp575.pdf as a defense-in-depth backup. */
   cp575_pdf_base64: string | null;
+  /** Postmortem dump of EIN Assignment page anchors / buttons / body text.
+   *  Always returned. If cp575_pdf_base64 is null, use this to find the
+   *  confirmation-letter link manually. */
+  ein_assignment_dump?: {
+    anchors: Array<{ href: string | null; text: string; ariaLabel: string | null; onclick: string | null; target: string | null; id: string | null; class: string | null }>;
+    buttons: Array<{ text: string; ariaLabel: string | null; onclick: string | null; id: string | null }>;
+    body_text_excerpt: string;
+  };
   operating_hours: IrsEinOperatingHours;
 }
 
