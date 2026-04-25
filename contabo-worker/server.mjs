@@ -1230,7 +1230,24 @@ const handlers = {
             } else {
               console.warn('[inspect:step1] stateInputControl not found — Continue may fail validation');
             }
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(800);
+
+            // After member count + state are filled, IRS reveals a 3rd
+            // required sub-field on the same page: "Why are you applying for
+            // an EIN?" radio (reasonForApplyingInputControl). Pick "Started
+            // a new business" for inspect — never submitted, just to advance.
+            const reasonLabel = await firstVisible([
+              'label[for="NEW_BUSINESSreasonForApplyingInputControlid"]',
+              'label[for^="NEW_BUSINESSreasonForApplying" i]',
+              'label:has-text("Started a new business"):not(:has(*))',
+            ], 4000);
+            const reasonRadio = await firstVisible([
+              'input[type="radio"][id^="NEW_BUSINESSreasonForApplying" i]',
+              'input[type="radio"][value="NEW_BUSINESS"]',
+            ], 4000);
+            if (reasonLabel) await reasonLabel.click().catch(() => {});
+            if (reasonRadio) await reasonRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+            await page.waitForTimeout(600);
           }
 
           const continueBtn = !stoppedEarly ? await firstVisible([
