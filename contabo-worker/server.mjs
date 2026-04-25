@@ -267,102 +267,113 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   await beginBtn.click();
   await settle();
 
-  // ── Step 1: Legal Structure → LLC ─────────────────────────────────────────
+  // ── Step 1: Legal Structure ──────────────────────────────────────────────
+  // Single-page progressive disclosure: clicking LLC reveals member-count +
+  // state; filling those reveals reason-for-applying; only then does Continue
+  // advance to Step 2. All selectors below are VERIFIED against live IRS
+  // 2026-04-25 inspect runs.
   if (!await waitForStepActive('Legal Structure', 15000)) {
     throw new Error('fillIrsEinForm: did not land on Legal Structure step');
   }
-  // Click the <label> (not the input) to fire React onChange.
+  // 1a. Click LLC label (input click does NOT fire React onChange).
   const llcLabel = await firstVisible([
-    'label:has-text("Limited Liability Company (LLC)")',
     'label[for="LLClegalStructureInputid"]',
+    'label:has-text("Limited Liability Company (LLC)")',
     'label[for^="LLClegalStructure" i]',
   ], 8000);
   if (!llcLabel) throw new Error('fillIrsEinForm[step1]: LLC label not found');
   await llcLabel.click();
-  // Belt-and-suspenders: also force-check the underlying input.
   const llcRadio = page.locator('input[type="radio"][value="LLC"]').first();
   await llcRadio.check({ force: true, timeout: 3000 }).catch(() => {});
   await page.waitForTimeout(800);
   if (!await llcRadio.isChecked().catch(() => false)) {
-    throw new Error('fillIrsEinForm[step1]: LLC radio did not toggle (React onChange not firing)');
+    throw new Error('fillIrsEinForm[step1]: LLC radio did not toggle');
   }
-  await captureStep('step1-llc-selected');
+
+  // 1b. Members of LLC (text input).
+  const memberCount = Number(payload.business?.llc_members_count ?? 1);
+  if (!Number.isFinite(memberCount) || memberCount < 1) {
+    throw new Error('fillIrsEinForm[step1]: business.llc_members_count must be >= 1');
+  }
+  const membersInput = await firstVisible(['input[name="membersOfLlcInput"]', 'input#membersOfLlcInput'], 6000);
+  if (!membersInput) throw new Error('fillIrsEinForm[step1]: membersOfLlcInput not found');
+  await membersInput.fill(String(memberCount));
+
+  // 1c. State of physical location (select).
+  const step1StateSelect = await firstVisible(['select[name="stateInputControl"]', 'select#stateInputControl'], 6000);
+  if (!step1StateSelect) throw new Error('fillIrsEinForm[step1]: stateInputControl not found');
+  const physicalState = payload.business?.mailing_address?.state || payload.business?.state_of_formation || 'WY';
+  await step1StateSelect.selectOption(physicalState).catch(async () => {
+    const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+    const fullName = stateNames[physicalState] || physicalState;
+    await step1StateSelect.selectOption({ label: fullName });
+  });
+  await page.waitForTimeout(800);
+
+  // 1d. Reason for applying (radio). Map app reason codes to IRS option ids.
+  // Verified IRS option ids: NEW_BUSINESS, HIRED_EMPLOYEES, BANKING_NEEDS,
+  // CHANGING_LEGAL_STRUCTURE, PURCHASED_BUSINESS.
+  const reasonMap = {
+    started_new_business: 'NEW_BUSINESS',
+    'started-new-business': 'NEW_BUSINESS',
+    hired_employees: 'HIRED_EMPLOYEES',
+    'hired-employees': 'HIRED_EMPLOYEES',
+    banking_purposes: 'BANKING_NEEDS',
+    'banking-purposes': 'BANKING_NEEDS',
+    changed_organization: 'CHANGING_LEGAL_STRUCTURE',
+    purchased_business: 'PURCHASED_BUSINESS',
+  };
+  const reasonCode = reasonMap[payload.business?.reason_for_applying] || 'NEW_BUSINESS';
+  const reasonLabel = await firstVisible([
+    `label[for="${reasonCode}reasonForApplyingInputControlid"]`,
+    `label[for^="${reasonCode}reasonForApplying" i]`,
+  ], 4000);
+  const reasonRadio = await firstVisible([
+    `input[type="radio"][value="${reasonCode}"]`,
+    `input[type="radio"][id^="${reasonCode}reasonForApplying" i]`,
+  ], 4000);
+  if (reasonLabel) await reasonLabel.click().catch(() => {});
+  if (reasonRadio) await reasonRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  await captureStep('step1-llc-filled');
   await clickContinue('step1');
   if (!await waitForStepActive('Identity', 15000)) {
     throw new Error('fillIrsEinForm[step1→step2]: did not advance to Identity step');
   }
 
-  // ── Step 2: Identity (responsible party + LLC member count) ──────────────
-  // TODO(monday): tune selectors against form_fields from inspect run.
-  // Expected fields (per IRS public EIN form):
-  //   - Number of LLC members (radio "1" / "2 or more" — single-member vs
-  //     multi-member changes downstream tax classification questions)
-  //   - Responsible party first name (text input)
-  //   - Responsible party last name (text input)
-  //   - Responsible party SSN (text, 9 digits, may auto-format XXX-XX-XXXX)
-  //   - "Are you the responsible party?" Yes radio (we ARE the RP for now)
-  //   - Title (sometimes a text input, sometimes a dropdown)
+  // ── Step 2: Identity (responsible party) ─────────────────────────────────
+  // Verified selectors from 2026-04-25 inspect:
+  //   responsibleSsn, responsibleFirstName, responsibleMiddleName,
+  //   responsibleLastName, responsibleSuffix (select),
+  //   entityRoleRadioInput (yesentityRoleRadioInputid / no...).
   await captureStep('step2-identity-arrived');
 
-  // 2a. LLC member count.
-  const memberCount = String(payload.business?.llc_members_count ?? 1);
-  const memberCountLabel = await firstVisible([
-    `label:has-text("${memberCount === '1' ? '1' : '2 or more'}"):not(:has(*))`,
-    `label[for*="memberCount" i][for*="${memberCount}" i]`,
-    `label:has-text("${memberCount} member")`,
-  ], 6000);
-  if (memberCountLabel) {
-    await memberCountLabel.click().catch(() => {});
-    await page.waitForTimeout(400);
-  } else {
-    // TODO(monday): no member-count selector matched; inspect dump will show
-    // the real field. This may not be required on every IRS variant.
-    console.warn('[fillIrsEinForm:step2] LLC member-count radio not found, continuing anyway');
+  await page.locator('input[name="responsibleFirstName"]').fill(payload.responsibleParty.first_name);
+  await page.locator('input[name="responsibleLastName"]').fill(payload.responsibleParty.last_name);
+  if (payload.responsibleParty.middle_initial) {
+    await page.locator('input[name="responsibleMiddleName"]').fill(payload.responsibleParty.middle_initial).catch(() => {});
   }
-
-  // 2b. Responsible party first name.
-  const firstNameInput = await firstVisible([
-    'input[name*="responsibleParty" i][name*="first" i]',
-    'input[id*="firstName" i]',
-    'input[name="firstName"]',
-    // TODO(monday): real selector likely camelCase JSP-style — confirm Monday.
-  ], 6000);
-  if (!firstNameInput) throw new Error('fillIrsEinForm[step2]: first-name input not found');
-  await firstNameInput.fill(payload.responsibleParty.first_name);
-
-  // 2c. Last name.
-  const lastNameInput = await firstVisible([
-    'input[name*="responsibleParty" i][name*="last" i]',
-    'input[id*="lastName" i]',
-    'input[name="lastName"]',
-  ], 6000);
-  if (!lastNameInput) throw new Error('fillIrsEinForm[step2]: last-name input not found');
-  await lastNameInput.fill(payload.responsibleParty.last_name);
-
-  // 2d. SSN. IRS expects 9 digits; some forms auto-format with dashes.
-  const ssnInput = await firstVisible([
-    'input[name*="ssn" i]',
-    'input[name*="socialSecurity" i]',
-    'input[id*="ssn" i]',
-    'input[id*="socialSecurity" i]',
-    'input[type="password"][autocomplete*="ssn" i]',
-  ], 6000);
-  if (!ssnInput) throw new Error('fillIrsEinForm[step2]: SSN input not found');
+  if (payload.responsibleParty.suffix) {
+    await page.locator('select[name="responsibleSuffix"]').selectOption(payload.responsibleParty.suffix).catch(() => {});
+  }
   const ssnDigits = String(payload.responsibleParty.ssn_or_itin).replace(/\D/g, '');
   if (ssnDigits.length !== 9) throw new Error('fillIrsEinForm[step2]: SSN must be 9 digits');
-  await ssnInput.fill(ssnDigits);
+  await page.locator('input[name="responsibleSsn"]').fill(ssnDigits);
 
-  // 2e. "Are you the responsible party?" — answer Yes (we don't support
-  // third-party-designee submissions for now; caller handles that variant).
-  {
-    const yesLabel = await firstVisible([
-      'label:has-text("Yes"):not(:has(*))',
-      'label[for*="responsibleParty" i][for*="yes" i]',
-      'label[for*="isResponsibleParty" i][for*="yes" i]',
-    ], 4000);
-    if (yesLabel) await yesLabel.click().catch(() => {});
-  }
+  // Role: "I am one of the owners, members, or the managing member of this LLC."
+  const ownerLabel = await firstVisible([
+    'label[for="yesentityRoleRadioInputid"]',
+    'label:has-text("one of the owners, members, or the managing member")',
+  ], 4000);
+  const ownerRadio = await firstVisible([
+    'input[type="radio"][id="yesentityRoleRadioInputid"]',
+    'input[type="radio"][name="entityRoleRadioInput"][value="yes"]',
+  ], 4000);
+  if (ownerLabel) await ownerLabel.click().catch(() => {});
+  if (ownerRadio) await ownerRadio.check({ force: true, timeout: 3000 }).catch(() => {});
 
+  await page.waitForTimeout(600);
   await captureStep('step2-identity-filled');
   await clickContinue('step2');
   if (!await waitForStepActive('Addresses', 15000)) {
@@ -442,24 +453,8 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   //   - Type of business / NAICS (select or autocomplete)
   await captureStep('step4-additional-arrived');
 
-  // 4a. Reason for applying.
-  const reasonLabel = (() => {
-    const reasonMap = {
-      started_new_business: 'Started a new business',
-      banking_purposes: 'Banking purposes',
-      hired_employees: 'Hired employees',
-      compliance_irs: 'Compliance with IRS withholding regulations',
-      changed_organization: 'Changed type of organization',
-      purchased_business: 'Purchased going business',
-    };
-    const code = (payload.business.reason_for_applying || '').replace(/-/g, '_');
-    return reasonMap[code] || 'Started a new business';
-  })();
-  const reasonRadioLabel = await firstVisible([
-    `label:has-text("${reasonLabel}")`,
-    `label[for*="reason" i]:has-text("${reasonLabel.split(' ')[0]}")`,
-  ], 6000);
-  if (reasonRadioLabel) await reasonRadioLabel.click().catch(() => {});
+  // 4a. (deleted) Reason for applying — actually lives on Step 1, already
+  //     captured there. Step 4 doesn't ask again.
 
   // 4b. Business start date (formed_on).
   // TODO(monday): may be a single date picker, or 3 separate selects (month/day/year).
