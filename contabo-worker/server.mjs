@@ -437,6 +437,33 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
     if (phoneInput) await phoneInput.fill(businessPhone).catch(() => {});
   }
 
+  // "Do you have an address different from the above where you want your mail
+  // to be sent?" — answer No (same as physical) for BCAX-style flows.
+  // The label click pattern fires React onChange; ID convention mirrors Step 2's
+  // entityRoleRadioInput (yesentityRoleRadioInputid / noentityRoleRadioInputid).
+  {
+    const useDifferentMailing = !!payload.business?.physical_address; // explicit opt-in
+    const targetValue = useDifferentMailing ? 'yes' : 'no';
+    const noLabel = await firstVisible([
+      `label[for="${targetValue}differentMailingRadioInputid"]`,
+      `label[for="${targetValue}mailingDifferentRadioInputid"]`,
+      `label[for*="${targetValue}" i][for*="differentMailing" i]`,
+      `label[for*="${targetValue}" i][for*="mailing" i]`,
+    ], 4000);
+    const noRadio = await firstVisible([
+      `input[type="radio"][id*="${targetValue}" i][id*="differentMailing" i]`,
+      `input[type="radio"][id*="${targetValue}" i][id*="mailing" i]`,
+      `input[type="radio"][name*="differentMailing" i][value="${targetValue}"]`,
+      `input[type="radio"][name*="mailingDifferent" i][value="${targetValue}"]`,
+    ], 4000);
+    if (noLabel) await noLabel.click().catch(() => {});
+    if (noRadio) await noRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+    if (!noLabel && !noRadio) {
+      console.warn('[fillIrsEinForm:step3] mailing-different radio not found — Continue may fail');
+    }
+    await page.waitForTimeout(500);
+  }
+
   await captureStep('step3-addresses-filled');
   await clickContinue('step3');
   if (!await waitForStepActive('Additional Details', 15000)) {
