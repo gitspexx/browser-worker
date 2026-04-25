@@ -438,73 +438,60 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
     throw new Error(`fillIrsEinForm[step3→step4]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 2000)}`);
   }
 
-  // ── Step 4: Additional Details ────────────────────────────────────────────
-  // TODO(monday): tune selectors. Expected:
-  //   - Reason for applying (radio): "Started a new business" usually
-  //   - Business start date (date input — sometimes 3 separate selects M/D/Y)
-  //   - Closing month of accounting year (select 1-12, default 12 = December)
-  //   - Number of expected employees in next 12 months (number input)
-  //   - First wages paid date (or "no employees" radio)
-  //   - Type of business / NAICS (select or autocomplete)
+  // ── Step 4: LLC Details + tax-obligation Yes/No screening ────────────────
+  // VERIFIED selectors from 2026-04-25 dryrun #6 form_fields dump.
+  // This page is misleadingly titled "Additional Details" but it actually
+  // collects: legal name (re-confirm), DBA, county, state, state-of-articles,
+  // start month/year, and 5 Yes/No tax-obligation screening questions.
+  // NAICS / accounting close month / reason for applying live on Step 5+
+  // (a separate page rendered AFTER this one — handled below).
   await captureStep('step4-additional-arrived');
 
-  // 4a. (deleted) Reason for applying — actually lives on Step 1, already
-  //     captured there. Step 4 doesn't ask again.
-
-  // 4b. Business start date (formed_on).
-  // TODO(monday): may be a single date picker, or 3 separate selects (month/day/year).
-  const formedOn = new Date(payload.business.formation_date);
-  const startDateInput = await firstVisible([
-    'input[name*="startDate" i]',
-    'input[type="date"]',
-    'input[name*="businessStart" i]',
-  ], 4000);
-  if (startDateInput) {
-    await startDateInput.fill(payload.business.formation_date).catch(() => {});
-  }
-  // If 3 selects, this loop handles it.
-  for (const part of ['month', 'day', 'year']) {
-    const sel = page.locator(`select[name*="${part}" i]`).first();
-    if (await sel.count() > 0) {
-      const val = part === 'month' ? String(formedOn.getMonth() + 1)
-                : part === 'day' ? String(formedOn.getDate())
-                : String(formedOn.getFullYear());
-      await sel.selectOption(val).catch(() => {});
-    }
+  // 4a. Legal name (re-confirm) + optional DBA.
+  await page.locator('input[name="legalNameInput"]').fill(payload.business.legal_name).catch(() => {});
+  if (payload.business.trade_name) {
+    await page.locator('input[name="dbaNameInput"]').fill(payload.business.trade_name).catch(() => {});
   }
 
-  // 4c. Closing month of accounting year (default December).
-  const closingMonth = String(payload.business.accounting_year_close_month || 12);
-  const closingMonthSel = await firstVisible([
-    'select[name*="closing" i]',
-    'select[name*="fiscalYear" i]',
-    'select[id*="closing" i]',
-  ], 4000);
-  if (closingMonthSel) {
-    await closingMonthSel.selectOption(closingMonth).catch(async () => {
-      // Try by label name e.g. "December".
-      const monthNames = ['', 'January','February','March','April','May','June','July','August','September','October','November','December'];
-      await closingMonthSel.selectOption({ label: monthNames[Number(closingMonth)] }).catch(() => {});
+  // 4b. County of LLC's location (text).
+  await page.locator('input[name="countyInput"]').fill(payload.business.county || 'Sheridan');
+
+  // 4c. State of LLC + State where Articles of Organization were filed.
+  const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+  const stateCode = payload.business.state_of_formation || payload.business.mailing_address.state || 'WY';
+  for (const sel of ['stateInput', 'StateFiledArticlesOrganizationInput']) {
+    await page.locator(`select[name="${sel}"]`).selectOption(stateCode).catch(async () => {
+      await page.locator(`select[name="${sel}"]`).selectOption({ label: stateNames[stateCode] || stateCode });
     });
   }
 
-  // 4d. Expected employees + wages.
-  const employeesInput = await firstVisible([
-    'input[name*="employee" i][type="number"]',
-    'input[name*="employee" i]',
-    'input[id*="employee" i]',
-  ], 4000);
-  if (employeesInput) await employeesInput.fill(payload.business.expects_employees ? '1' : '0').catch(() => {});
+  // 4d. Business start month + year. The form filed BCAX 2026-04-23.
+  const formedOn = new Date(payload.business.formation_date);
+  const monthNum = formedOn.getUTCMonth() + 1;
+  const yearStr = String(formedOn.getUTCFullYear());
+  const monthLabels = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December'];
+  await page.locator('select[name="startDateMonthInput"]').selectOption(String(monthNum)).catch(async () => {
+    await page.locator('select[name="startDateMonthInput"]').selectOption({ label: monthLabels[monthNum] });
+  });
+  await page.locator('input[name="startDateYearInput"]').fill(yearStr);
 
-  // 4e. NAICS / business activity.
-  // TODO(monday): IRS sometimes uses a category select then sub-category.
-  const naicsInput = await firstVisible([
-    'input[name*="naics" i]',
-    'select[name*="businessActivity" i]',
-    'input[id*="naics" i]',
-  ], 4000);
-  if (naicsInput && payload.business.naics_code) {
-    await naicsInput.fill(payload.business.naics_code).catch(() => {});
+  // 4e. Tax-obligation Yes/No radios. For BCAX (a vanilla management
+  // consulting / holding entity with no employees) the answer is No to all.
+  // Caller can override via payload.business.tax_obligations.
+  const taxFlags = {
+    highwayVehiclesInput: payload.business?.tax_obligations?.highway_vehicles === true,
+    gamblingWagerInput:   payload.business?.tax_obligations?.gambling_wagers === true,
+    fileForm720Input:     payload.business?.tax_obligations?.file_form_720 === true,
+    atfInput:             payload.business?.tax_obligations?.atf === true,
+    hasEmployeesInput:    payload.business?.expects_employees === true,
+  };
+  for (const [field, isYes] of Object.entries(taxFlags)) {
+    const target = isYes ? 'yes' : 'no';
+    const lab = await firstVisible([`label[for="${target}${field}id"]`], 3000);
+    if (lab) await lab.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${target}${field}id"]`).check({ force: true, timeout: 2500 }).catch(() => {});
+    await page.waitForTimeout(120);
   }
 
   await captureStep('step4-additional-filled');
