@@ -467,7 +467,22 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   await captureStep('step3-addresses-filled');
   await clickContinue('step3');
   if (!await waitForStepActive('Additional Details', 15000)) {
-    throw new Error('fillIrsEinForm[step3→step4]: did not advance to Additional Details step');
+    // Diagnostic: dump form_fields so we see which radio/select wasn't toggled.
+    const ff = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 100) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
+    const errBanner = await page.evaluate(() => {
+      const e = document.querySelector('.input-error-message, [class*="error"]');
+      return e?.textContent?.trim().slice(0, 300) || null;
+    }).catch(() => null);
+    throw new Error(`fillIrsEinForm[step3→step4]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 2000)}`);
   }
 
   // ── Step 4: Additional Details ────────────────────────────────────────────
