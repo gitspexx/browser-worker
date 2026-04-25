@@ -538,7 +538,16 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
       ], 4000);
       if (lab) await lab.click().catch(() => {});
       await page.locator(`input[type="radio"][id="${target}otherConsultingRadioInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(800);
+
+      // Yes opens a free-text "What type of consulting?" field
+      // (otherConsultingTypeTextInput). Fill with a sensible default for
+      // BCAX-style management consulting; caller can override.
+      if (consultsYes) {
+        const consultingType = payload.business?.consulting_type || 'Management consulting';
+        await page.locator('input[name="otherConsultingTypeTextInput"]').fill(consultingType).catch(() => {});
+        await page.waitForTimeout(400);
+      }
     }
   }
 
