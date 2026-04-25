@@ -93,85 +93,90 @@ async function withSession(profileId, fn, useAdsPower = true) {
 // Returns { open, reason, next_open_at } where next_open_at is an ISO UTC
 // string (or null when already open).
 function irsEinOnlineHoursOpen(now = new Date()) {
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short',
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
-  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-  const weekday = weekdayMap[parts.weekday];
-  // Intl returns "24" for midnight in hour12:false; normalize to 0.
-  let hour = Number(parts.hour);
-  if (hour === 24) hour = 0;
-  const year = Number(parts.year);
-  const month = Number(parts.month);
-  const day = Number(parts.day);
+  // IRS EIN Online Assistant schedule (per irs.gov, current as of 2026-04):
+  //   Mon–Fri: 6:00 a.m. – 1:00 a.m. (next day) ET
+  //   Sat:     6:00 a.m. – 9:00 p.m.            ET
+  //   Sun:     6:00 p.m. – 12:00 a.m.           ET
+  //
+  // Encoded as: at any (weekday, hour) point in ET, are we open right now?
+  // Plus: next-open computation when closed, by stepping forward hour by hour
+  // (cheap; the function is rarely called while closed).
 
-  const isWeekday = weekday >= 1 && weekday <= 5;
-  // Open window: 07:00–21:59 ET. 22:00 is the close.
-  const inHours = hour >= 7 && hour <= 21;
-  if (isWeekday && inHours) {
-    return { open: true, reason: 'open', next_open_at: null };
-  }
-
-  // Encode an ET wall-clock (y, m, d, h) as a UTC ISO by probing the zone's
-  // offset at a naive UTC instant and correcting for it.
-  function etWallClockToUtcIso(y, m, d, h) {
-    const naive = Date.UTC(y, m - 1, d, h, 0, 0);
-    const probe = new Intl.DateTimeFormat('en-US', {
+  function etPartsAt(d) {
+    const fmt = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/New_York',
+      weekday: 'short',
       hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
     });
-    const pp = Object.fromEntries(probe.formatToParts(new Date(naive)).map((p) => [p.type, p.value]));
-    let ph = Number(pp.hour);
-    if (ph === 24) ph = 0;
-    const probed = Date.UTC(Number(pp.year), Number(pp.month) - 1, Number(pp.day), ph, Number(pp.minute));
-    const deltaMs = naive - probed;
-    return new Date(naive + deltaMs).toISOString();
-  }
-
-  function addDays(y, m, d, n) {
-    const dt = new Date(Date.UTC(y, m - 1, d));
-    dt.setUTCDate(dt.getUTCDate() + n);
-    return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
-  }
-
-  if (!isWeekday) {
-    // Sat (6) → +2 to Mon; Sun (0) → +1 to Mon.
-    const delta = weekday === 6 ? 2 : 1;
-    const nxt = addDays(year, month, day, delta);
+    const parts = Object.fromEntries(fmt.formatToParts(d).map((p) => [p.type, p.value]));
+    const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    let h = Number(parts.hour);
+    if (h === 24) h = 0;
     return {
-      open: false,
-      reason: 'weekend — opens Monday 07:00 ET',
-      next_open_at: etWallClockToUtcIso(nxt.y, nxt.m, nxt.d, 7),
+      weekday: weekdayMap[parts.weekday],
+      hour: h,
+      year: Number(parts.year),
+      month: Number(parts.month),
+      day: Number(parts.day),
     };
   }
-  if (hour < 7) {
-    return {
-      open: false,
-      reason: 'before 07:00 ET — opens at 07:00 ET today',
-      next_open_at: etWallClockToUtcIso(year, month, day, 7),
-    };
+  function isOpenAt(weekday, hour) {
+    // Mon-Fri main window: 06:00–23:59 (continues into next day until 01:00).
+    if (weekday >= 1 && weekday <= 5 && hour >= 6) return true;
+    // Tue-Sat 00:00–00:59 — bleed-over from the previous Mon-Fri day.
+    if (weekday >= 2 && weekday <= 6 && hour < 1) return true;
+    // Saturday own window: 06:00–20:59 (closes at 21:00).
+    if (weekday === 6 && hour >= 6 && hour < 21) return true;
+    // Sunday own window: 18:00–23:59.
+    if (weekday === 0 && hour >= 18) return true;
+    return false;
   }
-  // hour >= 22 on a weekday: opens tomorrow, or Monday if today is Friday.
-  const delta = weekday === 5 ? 3 : 1;
-  const nxt = addDays(year, month, day, delta);
-  return {
-    open: false,
-    reason: 'after 22:00 ET — opens at 07:00 ET tomorrow',
-    next_open_at: etWallClockToUtcIso(nxt.y, nxt.m, nxt.d, 7),
-  };
+
+  const cur = etPartsAt(now);
+  if (isOpenAt(cur.weekday, cur.hour)) {
+    return { open: true, reason: 'open', next_open_at: null };
+  }
+
+  // Closed. Step forward hour by hour (max 168 = full week) to find next open.
+  let probe = new Date(now);
+  let nextOpen = null;
+  for (let i = 0; i < 168; i++) {
+    probe = new Date(probe.getTime() + 60 * 60 * 1000);
+    const p = etPartsAt(probe);
+    if (isOpenAt(p.weekday, p.hour)) { nextOpen = p; break; }
+  }
+  let next_open_at = null;
+  if (nextOpen) {
+    // Convert the ET (year, month, day, hour) wall-clock back to UTC.
+    const naive = Date.UTC(nextOpen.year, nextOpen.month - 1, nextOpen.day, nextOpen.hour, 0, 0);
+    const probeRound = etPartsAt(new Date(naive));
+    const probed = Date.UTC(probeRound.year, probeRound.month - 1, probeRound.day, probeRound.hour, 0, 0);
+    next_open_at = new Date(naive + (naive - probed)).toISOString();
+  }
+
+  // Human-friendly reason.
+  const reasonMap = (() => {
+    const wd = cur.weekday;
+    const h = cur.hour;
+    if (wd === 0) {
+      if (h < 18) return 'Sunday before 18:00 ET — opens at 18:00 ET today';
+      return 'Sunday after 24:00 ET'; // unreachable
+    }
+    if (wd === 6) {
+      if (h >= 21) return 'Saturday after 21:00 ET — opens Sunday 18:00 ET';
+      if (h >= 1 && h < 6) return 'Saturday before 06:00 ET — opens at 06:00 ET today';
+      return 'Saturday closed';
+    }
+    // Mon-Fri here means 01:00–05:59 (closed gap)
+    if (h >= 1 && h < 6) return `weekday early hours — opens at 06:00 ET today`;
+    return 'closed';
+  })();
+  return { open: false, reason: reasonMap, next_open_at };
 }
 
 // ── wyreg helpers ───────────────────────────────────────────────────────────
