@@ -510,7 +510,21 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   await captureStep('step4-additional-filled');
   await clickContinue('step4');
   if (!await waitForStepActive('Review.{0,3}Submit', 15000)) {
-    throw new Error('fillIrsEinForm[step4→review]: did not advance to Review step');
+    const ff = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select, textarea').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 100) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
+    const errBanner = await page.evaluate(() => {
+      const e = document.querySelector('.input-error-message, [class*="error-message"]');
+      return e?.textContent?.trim().slice(0, 300) || null;
+    }).catch(() => null);
+    throw new Error(`fillIrsEinForm[step4→review]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 3500)}`);
   }
 
   // ── Review & Submit ───────────────────────────────────────────────────────
