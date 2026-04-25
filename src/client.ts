@@ -192,19 +192,29 @@ export interface IrsEinBusinessDetails {
 export interface IrsEinDryRunRequest {
   profileId: string;
   jobId?: string;
-  responsibleParty: IrsEinResponsibleParty;
-  business: IrsEinBusinessDetails;
+  /** Caller-generated token (UUID). Echo it back to applyEinSubmit only after
+   *  the operator has reviewed the dryrun screenshots — the worker does not
+   *  enforce the gate, the app side does. */
+  confirmation_token: string;
+  payload: {
+    responsibleParty: IrsEinResponsibleParty;
+    business: IrsEinBusinessDetails;
+  };
 }
 
 // phase 2
 export interface IrsEinDryRunResponse {
-  ok: boolean;
+  ok?: boolean;
   portal: 'irs_apply_ein_dryrun';
   url: string;
-  /** Opaque token the submit handler re-hydrates to resume on the review page. */
+  phase: 'review';
   confirmation_token: string;
-  review_page_screenshot: string;
-  review_page_body_text_excerpt: string;
+  steps_visited: Array<{ step_label: string; url: string; screenshot_path: string }>;
+  /** Server-side path to the Review page screenshot. Caller (state-filing-worker)
+   *  fetches via /screenshot/:name or via direct file read on a shared volume. */
+  review_screenshot_path?: string;
+  /** Best-effort label/value pairs scraped from the Review page (dl/table). */
+  review_snapshot: Record<string, Array<[string, string]>>;
   operating_hours: IrsEinOperatingHours;
 }
 
@@ -212,21 +222,30 @@ export interface IrsEinDryRunResponse {
 export interface IrsEinSubmitRequest {
   profileId: string;
   jobId?: string;
-  /** From a prior dryrun response; worker resumes on the review page. */
+  /** Must match the operator-approved dryrun token. */
   confirmation_token: string;
+  /** Same payload that was used for the dryrun. IRS sessions don't survive
+   *  between calls (each call is a fresh AdsPower attach), so submit must
+   *  re-fill the form from scratch using the verified data. */
+  payload: {
+    responsibleParty: IrsEinResponsibleParty;
+    business: IrsEinBusinessDetails;
+  };
 }
 
 // phase 2
 export interface IrsEinSubmitResponse {
-  ok: boolean;
+  ok?: boolean;
   portal: 'irs_apply_ein_submit';
   url: string;
-  /** The assigned EIN, e.g. "12-3456789". Null if IRS flagged the application. */
+  phase: 'submitted';
+  confirmation_token: string;
+  steps_visited: Array<{ step_label: string; url: string; screenshot_path: string }>;
+  /** Assigned EIN string in XX-XXXXXXX format; null only if extraction failed
+   *  (in that case operator must read the EIN off the screenshot). */
   ein: string | null;
-  /** CP 575 confirmation PDF base64 (IRS serves this immediately on success). */
+  /** CP 575 confirmation PDF base64. Null if IRS didn't expose the link. */
   cp575_pdf_base64: string | null;
-  /** IRS's confirmation-page text (empty if we couldn't reach it). */
-  confirmation_page_body_text_excerpt: string;
   operating_hours: IrsEinOperatingHours;
 }
 
@@ -345,18 +364,46 @@ export class BrowserWorkerClient {
   }
 
   /**
-   * Phase 2: fill the assistant up to the Review page but DO NOT submit.
-   * Not yet implemented — surface exists so callers can wire the type.
+   * Phase 2: fill the IRS EIN Assistant from Step 1 to the Review page and
+   * STOP there (no submit, no SSN-quota burn). Caller supplies a
+   * confirmation_token (UUID is fine) which the operator must echo back to
+   * applyEinSubmit to authorize the live submission.
+   *
+   * Selectors for Steps 2-4 are in active discovery — see worker handler
+   * fillIrsEinForm TODO markers. Until tuning lands, calls may fail with
+   * `fillIrsEinForm[stepN]: <selector> not found` errors that show which
+   * specific input couldn't be located. Iterate selectors against the
+   * inspect handler's form_fields output.
    */
-  async applyEinDryRun(_req: IrsEinDryRunRequest, _opts: { timeoutMs?: number } = {}): Promise<IrsEinDryRunResponse> {
-    throw new Error('applyEinDryRun: not yet implemented (phase 2)');
+  async applyEinDryRun(req: IrsEinDryRunRequest, opts: { timeoutMs?: number } = {}): Promise<IrsEinDryRunResponse> {
+    const { profileId, jobId, confirmation_token, payload } = req as IrsEinDryRunRequest & {
+      confirmation_token: string;
+      payload: { responsibleParty: IrsEinResponsibleParty; business: IrsEinBusinessDetails };
+    };
+    if (!confirmation_token) throw new Error('applyEinDryRun: confirmation_token required');
+    return this.submit(
+      { profileId, portal: 'irs_apply_ein_dryrun', jobId, confirmation_token, payload },
+      { timeoutMs: opts.timeoutMs ?? 5 * 60_000 },
+    ) as unknown as Promise<IrsEinDryRunResponse>;
   }
 
   /**
-   * Phase 2: resume from a dryrun's confirmation_token and click Submit.
-   * Not yet implemented — surface exists so callers can wire the type.
+   * Phase 2: re-fill the assistant end to end and click Submit. Returns the
+   * issued EIN + CP 575 PDF base64. The caller MUST verify the
+   * confirmation_token came from a fresh, operator-approved dryrun before
+   * calling this — IRS allows ONE EIN per responsible-party SSN per day,
+   * and a bad submit is locked in.
    */
-  async applyEinSubmit(_req: IrsEinSubmitRequest, _opts: { timeoutMs?: number } = {}): Promise<IrsEinSubmitResponse> {
-    throw new Error('applyEinSubmit: not yet implemented (phase 2)');
+  async applyEinSubmit(req: IrsEinSubmitRequest, opts: { timeoutMs?: number } = {}): Promise<IrsEinSubmitResponse> {
+    const { profileId, jobId, confirmation_token, payload } = req as IrsEinSubmitRequest & {
+      confirmation_token: string;
+      payload: { responsibleParty: IrsEinResponsibleParty; business: IrsEinBusinessDetails };
+    };
+    if (!confirmation_token) throw new Error('applyEinSubmit: confirmation_token required');
+    if (!payload) throw new Error('applyEinSubmit: payload required (must match the dryrun payload)');
+    return this.submit(
+      { profileId, portal: 'irs_apply_ein_submit', jobId, confirmation_token, payload },
+      { timeoutMs: opts.timeoutMs ?? 5 * 60_000 },
+    ) as unknown as Promise<IrsEinSubmitResponse>;
   }
 }
