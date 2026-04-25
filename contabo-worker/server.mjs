@@ -1197,6 +1197,42 @@ const handlers = {
             stopReason = 'unexpected — LLC label/radio click did not toggle the radio (React onChange not firing)';
             await captureStep('llc-click-no-effect');
           }
+
+          // Selecting LLC reveals two MORE required fields on the same page:
+          //   - membersOfLlcInput (text): "How many member(s) are in the LLC?"
+          //   - stateInputControl (select): physical-location state
+          // Both must be filled before Continue advances. For the inspect
+          // handler we use safe defaults (1 member, Wyoming) — these are
+          // never submitted to IRS, just used to advance to Step 2 so we
+          // can dump its form structure.
+          if (!stoppedEarly) {
+            await page.waitForTimeout(800);
+            const membersInput = await firstVisible([
+              'input[name="membersOfLlcInput"]',
+              'input#membersOfLlcInput',
+              'input[id*="member" i][type="text"]',
+            ], 6000);
+            if (membersInput) {
+              await membersInput.fill('1').catch(() => {});
+            } else {
+              console.warn('[inspect:step1] membersOfLlcInput not found — Continue may fail validation');
+            }
+            const stateSelect = await firstVisible([
+              'select[name="stateInputControl"]',
+              'select#stateInputControl',
+              'select[name*="state" i]',
+            ], 6000);
+            if (stateSelect) {
+              // Try common Wyoming codes; IRS forms vary on value format.
+              await stateSelect.selectOption('WY').catch(async () => {
+                await stateSelect.selectOption({ label: 'Wyoming' }).catch(() => {});
+              });
+            } else {
+              console.warn('[inspect:step1] stateInputControl not found — Continue may fail validation');
+            }
+            await page.waitForTimeout(500);
+          }
+
           const continueBtn = !stoppedEarly ? await firstVisible([
             'a[aria-label="Continue"]',
             'a[role="button"][aria-label*="Continue" i]',
