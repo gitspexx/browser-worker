@@ -658,9 +658,19 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   if (!await waitForStepActive('EIN Assignment', 30000)) {
     throw new Error('fillIrsEinForm[submit→ein]: did not reach EIN Assignment page (submit may have failed)');
   }
-  await captureStep('ein-assignment');
+  // High-resolution screenshot of the EIN Assignment page — works as visual
+  // proof of the EIN even if PDF capture fails downstream.
+  const einAssignmentShot = path.join(outDir, `step-${steps_visited.length}-ein-assignment.png`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await page.screenshot({ path: einAssignmentShot, fullPage: true }); break; }
+    catch (err) {
+      console.warn(`[fillIrsEinForm:ein-assignment] screenshot attempt ${attempt} failed: ${err.message}`);
+      await page.waitForTimeout(500);
+    }
+  }
+  steps_visited.push({ step_label: 'ein-assignment', url: page.url(), screenshot_path: einAssignmentShot });
 
-  // Extract the EIN string from the page.
+  // Extract the EIN string from the page (XX-XXXXXXX format).
   const ein = await page.evaluate(() => {
     const t = document.body?.innerText || '';
     const m = t.match(/\b(\d{2}-\d{7})\b/);
@@ -668,31 +678,149 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   }).catch(() => null);
   if (!ein) throw new Error('fillIrsEinForm: EIN number not extractable from EIN Assignment page');
 
-  // Download the CP 575 PDF. IRS exposes a "Click here" link for the
-  // confirmation letter — capture the download event + base64-encode.
-  // TODO(monday): tune the selector for the confirmation-letter link.
+  // ── CP 575 PDF capture — bulletproofed multi-strategy ────────────────────
+  // The IRS confirmation letter is delivered via one of three patterns
+  // (varies across browsers / IRS deployments / day):
+  //   1. <a href="...pdf"> — direct anchor with PDF href
+  //   2. <a onclick="..."> — JS-triggered, fires download event
+  //   3. <a target="_blank"> — opens PDF in a new tab/popup
+  // We listen for ALL THREE before clicking, then pick whichever fires.
+  // Always dump the page state for postmortem so we never lose info.
   let cp575_pdf_base64 = null;
+  const ein_assignment_dump = await page.evaluate(() => {
+    const out = { anchors: [], buttons: [], onclicks: [], body_text_excerpt: '' };
+    document.querySelectorAll('a').forEach((a) => {
+      const text = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (!text && !a.getAttribute('href')) return;
+      out.anchors.push({
+        href: a.getAttribute('href'),
+        text,
+        ariaLabel: a.getAttribute('aria-label'),
+        onclick: a.getAttribute('onclick'),
+        target: a.getAttribute('target'),
+        id: a.id || null,
+        class: ((a.getAttribute('class') || '').slice(0, 80)) || null,
+      });
+    });
+    document.querySelectorAll('button').forEach((b) => {
+      const text = (b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (!text) return;
+      out.buttons.push({
+        text,
+        ariaLabel: b.getAttribute('aria-label'),
+        onclick: b.getAttribute('onclick'),
+        id: b.id || null,
+      });
+    });
+    out.body_text_excerpt = (document.body?.innerText || '').slice(0, 4000);
+    return out;
+  }).catch(() => ({ anchors: [], buttons: [], onclicks: [], body_text_excerpt: '' }));
+
+  // Persist the dump as JSON sidecar so it's recoverable even if the response
+  // is truncated or lost in transit.
   try {
-    const cp575Link = await firstVisible([
+    fs.writeFileSync(path.join(outDir, 'ein-assignment-dump.json'), JSON.stringify(ein_assignment_dump, null, 2));
+  } catch { /* ignore */ }
+
+  try {
+    // Multi-selector strategy. Order: most-specific to most-generic. The
+    // 2026-04-25 BCAX run found that none of the original 4 selectors
+    // matched — hence the much broader list now.
+    const candidates = [
       'a[aria-label*="confirmation letter" i]',
+      'a[aria-label*="EIN confirmation" i]',
+      'a[aria-label*="Click here" i]',
+      'a:has-text("CLICK HERE for Your EIN Confirmation Letter (PDF)")',
+      'a:has-text("Click here for your EIN Confirmation Letter")',
       'a:has-text("CP 575")',
       'a:has-text("Confirmation Letter")',
+      'a:has-text("Download your EIN")',
+      'a:has-text("Click here")',
+      'button:has-text("Confirmation Letter")',
+      'button:has-text("Download")',
       'a[href*=".pdf" i]',
-    ], 8000);
+      'a[target="_blank"][href]',
+      // last-ditch: any anchor whose text contains "letter"
+      'a:has-text("letter")',
+    ];
+    const cp575Link = await firstVisible(candidates, 8000);
     if (cp575Link) {
-      const dlUrl = await cp575Link.getAttribute('href');
-      if (dlUrl) {
-        const resp = await page.request.get(dlUrl);
-        if (resp.ok()) {
-          const buf = Buffer.from(await resp.body());
-          if (buf.slice(0, 5).toString() === '%PDF-') {
-            cp575_pdf_base64 = buf.toString('base64');
-          }
+      // Set up download AND popup listeners BEFORE click — IRS may use
+      // either pattern depending on browser config.
+      const downloadPromise = page.waitForEvent('download', { timeout: 18000 }).catch(() => null);
+      const popupPromise = page.context().waitForEvent('page', { timeout: 12000 }).catch(() => null);
+
+      // Try clicking; any of the three sources may produce the PDF.
+      await cp575Link.click({ timeout: 5000 }).catch(() => {});
+
+      // 1. Direct download event
+      const download = await downloadPromise;
+      if (download) {
+        const dlUrl = download.url();
+        await download.cancel().catch(() => {});
+        if (dlUrl) {
+          try {
+            const resp = await page.request.get(dlUrl);
+            if (resp.ok()) {
+              const buf = Buffer.from(await resp.body());
+              if (buf.slice(0, 5).toString() === '%PDF-') {
+                cp575_pdf_base64 = buf.toString('base64');
+              }
+            }
+          } catch (err) { console.warn(`[cp575] refetch failed: ${err.message}`); }
         }
       }
+
+      // 2. Popup/new-tab pattern
+      if (!cp575_pdf_base64) {
+        const popup = await popupPromise;
+        if (popup) {
+          await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+          const popupUrl = popup.url();
+          if (popupUrl && popupUrl !== 'about:blank') {
+            try {
+              const resp = await page.request.get(popupUrl);
+              if (resp.ok()) {
+                const buf = Buffer.from(await resp.body());
+                if (buf.slice(0, 5).toString() === '%PDF-') {
+                  cp575_pdf_base64 = buf.toString('base64');
+                }
+              }
+            } catch (err) { console.warn(`[cp575] popup refetch failed: ${err.message}`); }
+          }
+          await popup.close().catch(() => {});
+        }
+      }
+
+      // 3. Direct href fallback
+      if (!cp575_pdf_base64) {
+        const href = await cp575Link.getAttribute('href').catch(() => null);
+        if (href && href !== '#' && !href.startsWith('javascript:')) {
+          try {
+            const url = href.startsWith('http') ? href : new URL(href, page.url()).toString();
+            const resp = await page.request.get(url);
+            if (resp.ok()) {
+              const buf = Buffer.from(await resp.body());
+              if (buf.slice(0, 5).toString() === '%PDF-') {
+                cp575_pdf_base64 = buf.toString('base64');
+              }
+            }
+          } catch (err) { console.warn(`[cp575] href fallback failed: ${err.message}`); }
+        }
+      }
+    } else {
+      console.warn('[cp575] no candidate link/button matched on EIN Assignment page');
     }
   } catch (err) {
     console.warn(`[fillIrsEinForm] CP 575 download failed: ${err.message}`);
+  }
+
+  // Persist the PDF locally too (defense-in-depth — if response transmission
+  // drops the base64, we have a copy on disk to recover).
+  if (cp575_pdf_base64) {
+    try {
+      fs.writeFileSync(path.join(outDir, 'cp575.pdf'), Buffer.from(cp575_pdf_base64, 'base64'));
+    } catch { /* ignore */ }
   }
 
   return {
@@ -701,6 +829,7 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
     steps_visited,
     ein,
     cp575_pdf_base64,
+    ein_assignment_dump,  // always returned — operator can use this to manually retrieve PDF if automated capture failed
   };
 }
 
