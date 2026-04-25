@@ -1153,31 +1153,57 @@ const handlers = {
       // Continue is an anchor styled as a button, so input[type=submit] selectors
       // don't match — use aria-label directly.
       if (!stoppedEarly) {
+        // IRS /applyein/ uses a custom React radio component where clicking
+        // the input element does NOT update component state — only clicking
+        // the LABEL or a styled wrapper fires the onChange. Try label first,
+        // fall back to forcing a check on the underlying input.
+        const llcLabel = await firstVisible([
+          'label:has-text("Limited Liability Company (LLC)")',
+          'label[for="LLClegalStructureInputid"]',
+          'label[for^="LLClegalStructure" i]',
+        ], 8000);
         const llcRadio = await firstVisible([
           'input[type="radio"][id^="LLClegalStructure" i]',
+          'input[type="radio"][value="LLC"]',
           'input[type="radio"][value*="LLC" i]',
-          'input[type="radio"][id*="LLC" i]',
-          'label:has-text("Limited Liability Company (LLC)") input[type="radio"]',
-        ], 10000);
-        if (!llcRadio) {
+        ], 5000);
+        if (!llcLabel && !llcRadio) {
           stoppedEarly = true;
-          stopReason = 'unexpected — no LLC radio on legal-structure page';
+          stopReason = 'unexpected — no LLC radio or label on legal-structure page';
         } else {
-          await llcRadio.click({ timeout: 8000 }).catch(() => {});
+          // Prefer label click — fires React onChange. Fall through to .check
+          // on the input as a belt-and-suspenders fallback.
+          if (llcLabel) {
+            await llcLabel.click({ timeout: 8000 }).catch(() => {});
+          }
+          if (llcRadio) {
+            await llcRadio.check({ force: true, timeout: 5000 }).catch(() => {});
+          }
           // Give the form a moment to register the selection before advancing.
-          await page.waitForTimeout(500);
-          const continueBtn = await firstVisible([
+          await page.waitForTimeout(800);
+          // Verify the radio actually became checked — if not, abort early
+          // with a clear message instead of clicking Continue and getting
+          // a "Selection is required" error.
+          const radioChecked = llcRadio
+            ? await llcRadio.isChecked().catch(() => false)
+            : await page.locator('input[type="radio"][value="LLC"]').first().isChecked().catch(() => false);
+          if (!radioChecked) {
+            stoppedEarly = true;
+            stopReason = 'unexpected — LLC label/radio click did not toggle the radio (React onChange not firing)';
+            await captureStep('llc-click-no-effect');
+          }
+          const continueBtn = !stoppedEarly ? await firstVisible([
             'a[aria-label="Continue"]',
             'a[role="button"][aria-label*="Continue" i]',
             'button[aria-label="Continue"]',
             'a:has-text("Continue")',
             'input[type="submit"][value*="Continue" i]',
             'button:has-text("Continue")',
-          ], 10000);
-          if (!continueBtn) {
+          ], 10000) : null;
+          if (!stoppedEarly && !continueBtn) {
             stoppedEarly = true;
             stopReason = 'unexpected — no Continue button after LLC selection';
-          } else {
+          } else if (!stoppedEarly && continueBtn) {
             const beforeAdvanceUrl = page.url();
             await continueBtn.click({ timeout: 8000 }).catch(() => {});
             await settle();
