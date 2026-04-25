@@ -179,6 +179,660 @@ function irsEinOnlineHoursOpen(now = new Date()) {
   return { open: false, reason: reasonMap, next_open_at };
 }
 
+// ── IRS EIN form filler (shared by dryrun + submit) ────────────────────────
+// Walks /applyein/ from start to either the Review page (stopAtReview=true)
+// or all the way through Submit + EIN Assignment (stopAtReview=false).
+//
+// SELECTOR STATUS as of 2026-04-24 inspection:
+//   * Step 1 (Legal Structure → LLC + Continue) — VERIFIED. Click the
+//     <label> for Limited Liability Company (input click does not fire
+//     React onChange). Continue is <a role="button" aria-label="Continue">.
+//   * Steps 2 (Identity), 3 (Addresses), 4 (Additional Details), Review &
+//     Submit, EIN Assignment — UNVERIFIED. Selectors below are educated
+//     guesses against IRS EIN documentation and the same React pattern
+//     (label-not-input clicks, aria-label="Continue"). They MUST be tuned
+//     against a Monday inspect run before live use. TODO markers flag the
+//     uncertain selectors.
+//
+// Payload contract (matches IrsEinDryRunRequest in @spexx/browser-worker):
+//   {
+//     responsibleParty: {
+//       first_name, middle_initial?, last_name, suffix?, ssn_or_itin, title?
+//     }
+//     business: {
+//       legal_name, trade_name?, mailing_address: {street, street2?, city, state, zip},
+//       physical_address?, county, state_of_formation, llc_members_count,
+//       formation_date (yyyy-mm-dd), reason_for_applying, accounting_year_close_month,
+//       expects_employees, naics_code?, business_purpose?, phone?
+//     }
+//   }
+async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
+  const steps_visited = [];
+  const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+  async function captureStep(label) {
+    const idx = steps_visited.length;
+    const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+    try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+    steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+  }
+  async function settle() {
+    await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  async function firstVisible(selectors, perTimeout = 3000) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      try { await loc.waitFor({ state: 'visible', timeout: perTimeout }); return loc; }
+      catch { /* try next */ }
+    }
+    return null;
+  }
+  async function clickContinue(stepName) {
+    const btn = await firstVisible([
+      'a[aria-label="Continue"]',
+      'a[role="button"][aria-label*="Continue" i]',
+      'button[aria-label="Continue"]',
+      'a:has-text("Continue")',
+    ], 8000);
+    if (!btn) throw new Error(`fillIrsEinForm[${stepName}]: Continue button not found`);
+    await btn.click({ timeout: 8000 });
+    await settle();
+  }
+  // Verify a step has advanced by checking the IRS step indicator.
+  // Body text shows "<step> active" for the current step. After advance the
+  // current step's "active" goes away and the next step's appears.
+  async function waitForStepActive(stepLabel, timeoutMs = 12000) {
+    const re = new RegExp(`\\b${stepLabel.replace(/\s+/g, '\\s+')}\\s+active\\b`, 'i');
+    const ok = await page.waitForFunction((reSrc) => {
+      const t = document.body?.innerText || '';
+      return new RegExp(reSrc, 'i').test(t);
+    }, re.source, { timeout: timeoutMs }).then(() => true).catch(() => false);
+    return ok;
+  }
+
+  // Step 0: open the assistant.
+  await page.goto('https://sa.www4.irs.gov/applyein/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await settle();
+  await captureStep('assistant-start');
+  // Click "Begin Application" to enter the wizard.
+  const beginBtn = await firstVisible([
+    'a[aria-label="Begin Application"]',
+    'a[role="button"]:has-text("Begin Application")',
+    'a:has-text("Begin Application")',
+    'input[type="submit"][value*="Begin" i]',
+    'button:has-text("Begin")',
+  ], 8000);
+  if (!beginBtn) throw new Error('fillIrsEinForm: Begin Application not found');
+  await beginBtn.click();
+  await settle();
+
+  // ── Step 1: Legal Structure ──────────────────────────────────────────────
+  // Single-page progressive disclosure: clicking LLC reveals member-count +
+  // state; filling those reveals reason-for-applying; only then does Continue
+  // advance to Step 2. All selectors below are VERIFIED against live IRS
+  // 2026-04-25 inspect runs.
+  if (!await waitForStepActive('Legal Structure', 15000)) {
+    throw new Error('fillIrsEinForm: did not land on Legal Structure step');
+  }
+  // 1a. Click LLC label (input click does NOT fire React onChange).
+  const llcLabel = await firstVisible([
+    'label[for="LLClegalStructureInputid"]',
+    'label:has-text("Limited Liability Company (LLC)")',
+    'label[for^="LLClegalStructure" i]',
+  ], 8000);
+  if (!llcLabel) throw new Error('fillIrsEinForm[step1]: LLC label not found');
+  await llcLabel.click();
+  const llcRadio = page.locator('input[type="radio"][value="LLC"]').first();
+  await llcRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  if (!await llcRadio.isChecked().catch(() => false)) {
+    throw new Error('fillIrsEinForm[step1]: LLC radio did not toggle');
+  }
+
+  // 1b. Members of LLC (text input).
+  const memberCount = Number(payload.business?.llc_members_count ?? 1);
+  if (!Number.isFinite(memberCount) || memberCount < 1) {
+    throw new Error('fillIrsEinForm[step1]: business.llc_members_count must be >= 1');
+  }
+  const membersInput = await firstVisible(['input[name="membersOfLlcInput"]', 'input#membersOfLlcInput'], 6000);
+  if (!membersInput) throw new Error('fillIrsEinForm[step1]: membersOfLlcInput not found');
+  await membersInput.fill(String(memberCount));
+
+  // 1c. State of physical location (select).
+  const step1StateSelect = await firstVisible(['select[name="stateInputControl"]', 'select#stateInputControl'], 6000);
+  if (!step1StateSelect) throw new Error('fillIrsEinForm[step1]: stateInputControl not found');
+  const physicalState = payload.business?.mailing_address?.state || payload.business?.state_of_formation || 'WY';
+  await step1StateSelect.selectOption(physicalState).catch(async () => {
+    const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+    const fullName = stateNames[physicalState] || physicalState;
+    await step1StateSelect.selectOption({ label: fullName });
+  });
+  await page.waitForTimeout(800);
+
+  // 1d. Reason for applying (radio). Map app reason codes to IRS option ids.
+  // Verified IRS option ids: NEW_BUSINESS, HIRED_EMPLOYEES, BANKING_NEEDS,
+  // CHANGING_LEGAL_STRUCTURE, PURCHASED_BUSINESS.
+  const reasonMap = {
+    started_new_business: 'NEW_BUSINESS',
+    'started-new-business': 'NEW_BUSINESS',
+    hired_employees: 'HIRED_EMPLOYEES',
+    'hired-employees': 'HIRED_EMPLOYEES',
+    banking_purposes: 'BANKING_NEEDS',
+    'banking-purposes': 'BANKING_NEEDS',
+    changed_organization: 'CHANGING_LEGAL_STRUCTURE',
+    purchased_business: 'PURCHASED_BUSINESS',
+  };
+  const reasonCode = reasonMap[payload.business?.reason_for_applying] || 'NEW_BUSINESS';
+  const reasonLabel = await firstVisible([
+    `label[for="${reasonCode}reasonForApplyingInputControlid"]`,
+    `label[for^="${reasonCode}reasonForApplying" i]`,
+  ], 4000);
+  const reasonRadio = await firstVisible([
+    `input[type="radio"][value="${reasonCode}"]`,
+    `input[type="radio"][id^="${reasonCode}reasonForApplying" i]`,
+  ], 4000);
+  if (reasonLabel) await reasonLabel.click().catch(() => {});
+  if (reasonRadio) await reasonRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  await captureStep('step1-llc-filled');
+  await clickContinue('step1');
+  if (!await waitForStepActive('Identity', 15000)) {
+    throw new Error('fillIrsEinForm[step1→step2]: did not advance to Identity step');
+  }
+
+  // ── Step 2: Identity (responsible party) ─────────────────────────────────
+  // Verified selectors from 2026-04-25 inspect:
+  //   responsibleSsn, responsibleFirstName, responsibleMiddleName,
+  //   responsibleLastName, responsibleSuffix (select),
+  //   entityRoleRadioInput (yesentityRoleRadioInputid / no...).
+  await captureStep('step2-identity-arrived');
+
+  await page.locator('input[name="responsibleFirstName"]').fill(payload.responsibleParty.first_name);
+  await page.locator('input[name="responsibleLastName"]').fill(payload.responsibleParty.last_name);
+  if (payload.responsibleParty.middle_initial) {
+    await page.locator('input[name="responsibleMiddleName"]').fill(payload.responsibleParty.middle_initial).catch(() => {});
+  }
+  if (payload.responsibleParty.suffix) {
+    await page.locator('select[name="responsibleSuffix"]').selectOption(payload.responsibleParty.suffix).catch(() => {});
+  }
+  const ssnDigits = String(payload.responsibleParty.ssn_or_itin).replace(/\D/g, '');
+  if (ssnDigits.length !== 9) throw new Error('fillIrsEinForm[step2]: SSN must be 9 digits');
+  await page.locator('input[name="responsibleSsn"]').fill(ssnDigits);
+
+  // Role: "I am one of the owners, members, or the managing member of this LLC."
+  const ownerLabel = await firstVisible([
+    'label[for="yesentityRoleRadioInputid"]',
+    'label:has-text("one of the owners, members, or the managing member")',
+  ], 4000);
+  const ownerRadio = await firstVisible([
+    'input[type="radio"][id="yesentityRoleRadioInputid"]',
+    'input[type="radio"][name="entityRoleRadioInput"][value="yes"]',
+  ], 4000);
+  if (ownerLabel) await ownerLabel.click().catch(() => {});
+  if (ownerRadio) await ownerRadio.check({ force: true, timeout: 3000 }).catch(() => {});
+
+  await page.waitForTimeout(600);
+  await captureStep('step2-identity-filled');
+  await clickContinue('step2');
+  if (!await waitForStepActive('Addresses', 15000)) {
+    throw new Error('fillIrsEinForm[step2→step3]: did not advance to Addresses step');
+  }
+
+  // ── Step 3: Addresses ─────────────────────────────────────────────────────
+  // Verified selectors from 2026-04-25 dryrun #4 form_fields dump:
+  //   physicalStreet, physicalCity, physicalZipCode (text)
+  //   physicalState (select, 2-letter codes)
+  //   thePhone (text, digits only — IRS hint: "Must contain only digits")
+  //   otherAddress radio: yesotherAddressid / nootherAddressid
+  //     ("Do you have an address different from the above where you want
+  //      your mail to be sent?")
+  await captureStep('step3-addresses-arrived');
+
+  const addr = payload.business.mailing_address;
+  await page.locator('input[name="physicalStreet"]').fill(addr.street);
+  await page.locator('input[name="physicalCity"]').fill(addr.city);
+  await page.locator('input[name="physicalZipCode"]').fill(addr.zip);
+  await page.locator('select[name="physicalState"]').selectOption(addr.state).catch(async () => {
+    const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+    const fullName = stateNames[addr.state] || addr.state;
+    await page.locator('select[name="physicalState"]').selectOption({ label: fullName });
+  });
+
+  // IRS phone hint: "Must contain only digits; do not enter extensions".
+  if (payload.business.phone) {
+    const phoneDigits = String(payload.business.phone).replace(/\D/g, '');
+    await page.locator('input[name="thePhone"]').fill(phoneDigits).catch(() => {});
+  }
+
+  // Mailing-different radio. payload.business.physical_address is set when
+  // the operator wants a separate mailing address; absence => same as above.
+  const useDifferentMailing = !!payload.business?.physical_address;
+  const otherTarget = useDifferentMailing ? 'yes' : 'no';
+  const otherLabel = await firstVisible([
+    `label[for="${otherTarget}otherAddressid"]`,
+  ], 4000);
+  if (otherLabel) await otherLabel.click().catch(() => {});
+  await page.locator(`input[type="radio"][id="${otherTarget}otherAddressid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  await captureStep('step3-addresses-filled');
+  await clickContinue('step3');
+  if (!await waitForStepActive('Additional Details', 15000)) {
+    // Diagnostic: dump form_fields so we see which radio/select wasn't toggled.
+    const ff = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 100) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
+    const errBanner = await page.evaluate(() => {
+      const e = document.querySelector('.input-error-message, [class*="error"]');
+      return e?.textContent?.trim().slice(0, 300) || null;
+    }).catch(() => null);
+    throw new Error(`fillIrsEinForm[step3→step4]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 2000)}`);
+  }
+
+  // ── Step 4: LLC Details + tax-obligation Yes/No screening ────────────────
+  // VERIFIED selectors from 2026-04-25 dryrun #6 form_fields dump.
+  // This page is misleadingly titled "Additional Details" but it actually
+  // collects: legal name (re-confirm), DBA, county, state, state-of-articles,
+  // start month/year, and 5 Yes/No tax-obligation screening questions.
+  // NAICS / accounting close month / reason for applying live on Step 5+
+  // (a separate page rendered AFTER this one — handled below).
+  await captureStep('step4-additional-arrived');
+
+  // 4a. Legal name (re-confirm) + optional DBA.
+  await page.locator('input[name="legalNameInput"]').fill(payload.business.legal_name).catch(() => {});
+  if (payload.business.trade_name) {
+    await page.locator('input[name="dbaNameInput"]').fill(payload.business.trade_name).catch(() => {});
+  }
+
+  // 4b. County of LLC's location (text).
+  await page.locator('input[name="countyInput"]').fill(payload.business.county || 'Sheridan');
+
+  // 4c. State of LLC + State where Articles of Organization were filed.
+  const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+  const stateCode = payload.business.state_of_formation || payload.business.mailing_address.state || 'WY';
+  for (const sel of ['stateInput', 'StateFiledArticlesOrganizationInput']) {
+    await page.locator(`select[name="${sel}"]`).selectOption(stateCode).catch(async () => {
+      await page.locator(`select[name="${sel}"]`).selectOption({ label: stateNames[stateCode] || stateCode });
+    });
+  }
+
+  // 4d. Business start month + year. The form filed BCAX 2026-04-23.
+  const formedOn = new Date(payload.business.formation_date);
+  const monthNum = formedOn.getUTCMonth() + 1;
+  const yearStr = String(formedOn.getUTCFullYear());
+  const monthLabels = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December'];
+  await page.locator('select[name="startDateMonthInput"]').selectOption(String(monthNum)).catch(async () => {
+    await page.locator('select[name="startDateMonthInput"]').selectOption({ label: monthLabels[monthNum] });
+  });
+  await page.locator('input[name="startDateYearInput"]').fill(yearStr);
+
+  // 4e. Tax-obligation Yes/No radios. For BCAX (a vanilla management
+  // consulting / holding entity with no employees) the answer is No to all.
+  // Caller can override via payload.business.tax_obligations.
+  const taxFlags = {
+    highwayVehiclesInput: payload.business?.tax_obligations?.highway_vehicles === true,
+    gamblingWagerInput:   payload.business?.tax_obligations?.gambling_wagers === true,
+    fileForm720Input:     payload.business?.tax_obligations?.file_form_720 === true,
+    atfInput:             payload.business?.tax_obligations?.atf === true,
+    hasEmployeesInput:    payload.business?.expects_employees === true,
+  };
+  for (const [field, isYes] of Object.entries(taxFlags)) {
+    const target = isYes ? 'yes' : 'no';
+    const lab = await firstVisible([`label[for="${target}${field}id"]`], 3000);
+    if (lab) await lab.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${target}${field}id"]`).check({ force: true, timeout: 2500 }).catch(() => {});
+    await page.waitForTimeout(120);
+  }
+
+  await captureStep('step4-additional-filled');
+  await clickContinue('step4');
+
+  // ── Step 4b: Business Category (NAICS-lite) ──────────────────────────────
+  // Verified from dryrun #7: a single-page radio with 15 hardcoded categories:
+  //   ACCOMMODATIONS, CONSTRUCTION, FINANCE, FOOD_SERVICE, HEALTH_CARE,
+  //   INSURANCE, MANUFACTURING, REAL_ESTATE, RENTAL_LEASING, RETAIL,
+  //   SOCIAL_ASSISTANCE, TRANSPORTATION, WAREHOUSING, WHOLESALE, OTHER.
+  // For BCAX (management consulting + holding) → OTHER. The caller can
+  // pass a different mapping via payload.business.irs_category.
+  const irsCategory = (payload.business?.irs_category || 'OTHER').toUpperCase();
+  const catLabel = await firstVisible([
+    `label[for="${irsCategory}entityBusinessCategoryInputid"]`,
+  ], 6000);
+  if (catLabel) await catLabel.click().catch(() => {});
+  await page.locator(`input[type="radio"][id="${irsCategory}entityBusinessCategoryInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // When OTHER is selected, a sub-question "Tell us more about your Other
+  // activities" appears with options:
+  //   CONSULTING, MANUFACTURING, ORGANIZATION (religious/civic etc),
+  //   RENTAL, REPAIR, GOODS_SELLER, SERVICE, OTHER.
+  // For BCAX (management consulting + holding) → CONSULTING.
+  if (irsCategory === 'OTHER') {
+    const subKey = (payload.business?.irs_other_activity || 'CONSULTING').toUpperCase();
+    const subLabel = await firstVisible([
+      `label[for="${subKey}otherInputid"]`,
+    ], 4000);
+    if (subLabel) await subLabel.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${subKey}otherInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    // When CONSULTING is selected, IRS asks one more nested Yes/No:
+    //   "Do you provide operating advice and assistance to businesses and
+    //    other organizations?" (name=otherConsultingRadioInput).
+    // For management consulting + holding: YES.
+    if (subKey === 'CONSULTING') {
+      const consultsYes = payload.business?.provides_operating_advice !== false;
+      const target = consultsYes ? 'yes' : 'no';
+      const lab = await firstVisible([
+        `label[for="${target}otherConsultingRadioInputid"]`,
+      ], 4000);
+      if (lab) await lab.click().catch(() => {});
+      await page.locator(`input[type="radio"][id="${target}otherConsultingRadioInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(800);
+
+      // Yes opens a free-text "What type of consulting?" field
+      // (otherConsultingTypeTextInput). Fill with a sensible default for
+      // BCAX-style management consulting; caller can override.
+      if (consultsYes) {
+        const consultingType = payload.business?.consulting_type || 'Management consulting';
+        await page.locator('input[name="otherConsultingTypeTextInput"]').fill(consultingType).catch(() => {});
+        await page.waitForTimeout(400);
+      }
+    }
+  }
+
+  await captureStep('step4b-category-selected');
+  await clickContinue('step4b');
+  await page.waitForTimeout(2000);
+  // The next sub-page may ask for a free-text description when OTHER is
+  // selected; handler in the next-page block.
+
+  if (!await waitForStepActive('Review.{0,3}Submit', 15000)) {
+    const ff = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select, textarea').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 100) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
+    const errBanner = await page.evaluate(() => {
+      const e = document.querySelector('.input-error-message, [class*="error-message"]');
+      return e?.textContent?.trim().slice(0, 300) || null;
+    }).catch(() => null);
+    throw new Error(`fillIrsEinForm[step4→review]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 10000)}`);
+  }
+
+  // ── Review & Submit ───────────────────────────────────────────────────────
+  await captureStep('review-page');
+  // Capture a structured snapshot of the review for the operator to verify.
+  const review_snapshot = await page.evaluate(() => {
+    const out = {};
+    // IRS review page typically lists field-label / field-value pairs in dl
+    // or table layout. Grab them best-effort.
+    document.querySelectorAll('dl, table').forEach((node) => {
+      const pairs = [];
+      const dts = node.querySelectorAll('dt, th');
+      const dds = node.querySelectorAll('dd, td');
+      const len = Math.min(dts.length, dds.length);
+      for (let i = 0; i < len; i++) {
+        const k = (dts[i].textContent || '').trim().slice(0, 100);
+        const v = (dds[i].textContent || '').trim().slice(0, 200);
+        if (k && v) pairs.push([k, v]);
+      }
+      if (pairs.length > 0) {
+        out[node.tagName.toLowerCase() + '_' + (Object.keys(out).length)] = pairs;
+      }
+    });
+    return out;
+  }).catch(() => ({}));
+
+  // Pick EIN Confirmation Letter delivery method on the Review page —
+  // do this BEFORE stopAtReview so the dryrun verifies the click worked
+  // (review_form_fields should show DIGITAL checked=True).
+  // Verified selectors from dryrun #13:
+  //   name="confirmationLetterRadioInput"
+  //   id="DIGITALconfirmationLetterRadioInputid" / "MAILconfirmationLetterRadioInputid"
+  {
+    const wantMail = payload.business?.deliver_letter_by_mail === true;
+    const target = wantMail ? 'MAIL' : 'DIGITAL';
+    const lab = await firstVisible([`label[for="${target}confirmationLetterRadioInputid"]`], 4000);
+    if (lab) await lab.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${target}confirmationLetterRadioInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  if (stopAtReview) {
+    // Dump form_fields on the Review page so callers can see the
+    // delivery-method radio (digital vs mail) name before submit.
+    const review_form_fields = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select, textarea').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 200) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
+    return {
+      phase: 'review',
+      url: page.url(),
+      steps_visited,
+      review_snapshot,
+      review_form_fields,
+      review_screenshot_path: steps_visited[steps_visited.length - 1]?.screenshot_path,
+    };
+  }
+
+  // ── Final Submit ──────────────────────────────────────────────────────────
+  // Delivery-method radio was already picked above (before stopAtReview),
+  // so dryrun verified it. Just click Submit EIN Request now.
+  // Submit EIN Request button. The IRS uses an <a role="button"> here
+  // (visible label "Submit EIN Request"); aria-label may differ.
+  const submitBtn = await firstVisible([
+    'a[aria-label="Submit EIN Request"]',
+    'a[aria-label*="Submit EIN" i]',
+    'a:has-text("Submit EIN Request")',
+    'button:has-text("Submit EIN Request")',
+    'a[aria-label="Submit"]',
+    'a[aria-label*="Submit" i]',
+    'button[aria-label="Submit"]',
+    'a:has-text("Submit")',
+  ], 8000);
+  if (!submitBtn) throw new Error('fillIrsEinForm[review→submit]: Submit button not found');
+  await submitBtn.click({ timeout: 8000 });
+  await settle();
+  if (!await waitForStepActive('EIN Assignment', 30000)) {
+    throw new Error('fillIrsEinForm[submit→ein]: did not reach EIN Assignment page (submit may have failed)');
+  }
+  // High-resolution screenshot of the EIN Assignment page — works as visual
+  // proof of the EIN even if PDF capture fails downstream.
+  const einAssignmentShot = path.join(outDir, `step-${steps_visited.length}-ein-assignment.png`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await page.screenshot({ path: einAssignmentShot, fullPage: true }); break; }
+    catch (err) {
+      console.warn(`[fillIrsEinForm:ein-assignment] screenshot attempt ${attempt} failed: ${err.message}`);
+      await page.waitForTimeout(500);
+    }
+  }
+  steps_visited.push({ step_label: 'ein-assignment', url: page.url(), screenshot_path: einAssignmentShot });
+
+  // Extract the EIN string from the page (XX-XXXXXXX format).
+  const ein = await page.evaluate(() => {
+    const t = document.body?.innerText || '';
+    const m = t.match(/\b(\d{2}-\d{7})\b/);
+    return m ? m[1] : null;
+  }).catch(() => null);
+  if (!ein) throw new Error('fillIrsEinForm: EIN number not extractable from EIN Assignment page');
+
+  // ── CP 575 PDF capture — bulletproofed multi-strategy ────────────────────
+  // The IRS confirmation letter is delivered via one of three patterns
+  // (varies across browsers / IRS deployments / day):
+  //   1. <a href="...pdf"> — direct anchor with PDF href
+  //   2. <a onclick="..."> — JS-triggered, fires download event
+  //   3. <a target="_blank"> — opens PDF in a new tab/popup
+  // We listen for ALL THREE before clicking, then pick whichever fires.
+  // Always dump the page state for postmortem so we never lose info.
+  let cp575_pdf_base64 = null;
+  const ein_assignment_dump = await page.evaluate(() => {
+    const out = { anchors: [], buttons: [], onclicks: [], body_text_excerpt: '' };
+    document.querySelectorAll('a').forEach((a) => {
+      const text = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (!text && !a.getAttribute('href')) return;
+      out.anchors.push({
+        href: a.getAttribute('href'),
+        text,
+        ariaLabel: a.getAttribute('aria-label'),
+        onclick: a.getAttribute('onclick'),
+        target: a.getAttribute('target'),
+        id: a.id || null,
+        class: ((a.getAttribute('class') || '').slice(0, 80)) || null,
+      });
+    });
+    document.querySelectorAll('button').forEach((b) => {
+      const text = (b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (!text) return;
+      out.buttons.push({
+        text,
+        ariaLabel: b.getAttribute('aria-label'),
+        onclick: b.getAttribute('onclick'),
+        id: b.id || null,
+      });
+    });
+    out.body_text_excerpt = (document.body?.innerText || '').slice(0, 4000);
+    return out;
+  }).catch(() => ({ anchors: [], buttons: [], onclicks: [], body_text_excerpt: '' }));
+
+  // Persist the dump as JSON sidecar so it's recoverable even if the response
+  // is truncated or lost in transit.
+  try {
+    fs.writeFileSync(path.join(outDir, 'ein-assignment-dump.json'), JSON.stringify(ein_assignment_dump, null, 2));
+  } catch { /* ignore */ }
+
+  try {
+    // Multi-selector strategy. Order: most-specific to most-generic. The
+    // 2026-04-25 BCAX run found that none of the original 4 selectors
+    // matched — hence the much broader list now.
+    const candidates = [
+      'a[aria-label*="confirmation letter" i]',
+      'a[aria-label*="EIN confirmation" i]',
+      'a[aria-label*="Click here" i]',
+      'a:has-text("CLICK HERE for Your EIN Confirmation Letter (PDF)")',
+      'a:has-text("Click here for your EIN Confirmation Letter")',
+      'a:has-text("CP 575")',
+      'a:has-text("Confirmation Letter")',
+      'a:has-text("Download your EIN")',
+      'a:has-text("Click here")',
+      'button:has-text("Confirmation Letter")',
+      'button:has-text("Download")',
+      'a[href*=".pdf" i]',
+      'a[target="_blank"][href]',
+      // last-ditch: any anchor whose text contains "letter"
+      'a:has-text("letter")',
+    ];
+    const cp575Link = await firstVisible(candidates, 8000);
+    if (cp575Link) {
+      // Set up download AND popup listeners BEFORE click — IRS may use
+      // either pattern depending on browser config.
+      const downloadPromise = page.waitForEvent('download', { timeout: 18000 }).catch(() => null);
+      const popupPromise = page.context().waitForEvent('page', { timeout: 12000 }).catch(() => null);
+
+      // Try clicking; any of the three sources may produce the PDF.
+      await cp575Link.click({ timeout: 5000 }).catch(() => {});
+
+      // 1. Direct download event
+      const download = await downloadPromise;
+      if (download) {
+        const dlUrl = download.url();
+        await download.cancel().catch(() => {});
+        if (dlUrl) {
+          try {
+            const resp = await page.request.get(dlUrl);
+            if (resp.ok()) {
+              const buf = Buffer.from(await resp.body());
+              if (buf.slice(0, 5).toString() === '%PDF-') {
+                cp575_pdf_base64 = buf.toString('base64');
+              }
+            }
+          } catch (err) { console.warn(`[cp575] refetch failed: ${err.message}`); }
+        }
+      }
+
+      // 2. Popup/new-tab pattern
+      if (!cp575_pdf_base64) {
+        const popup = await popupPromise;
+        if (popup) {
+          await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+          const popupUrl = popup.url();
+          if (popupUrl && popupUrl !== 'about:blank') {
+            try {
+              const resp = await page.request.get(popupUrl);
+              if (resp.ok()) {
+                const buf = Buffer.from(await resp.body());
+                if (buf.slice(0, 5).toString() === '%PDF-') {
+                  cp575_pdf_base64 = buf.toString('base64');
+                }
+              }
+            } catch (err) { console.warn(`[cp575] popup refetch failed: ${err.message}`); }
+          }
+          await popup.close().catch(() => {});
+        }
+      }
+
+      // 3. Direct href fallback
+      if (!cp575_pdf_base64) {
+        const href = await cp575Link.getAttribute('href').catch(() => null);
+        if (href && href !== '#' && !href.startsWith('javascript:')) {
+          try {
+            const url = href.startsWith('http') ? href : new URL(href, page.url()).toString();
+            const resp = await page.request.get(url);
+            if (resp.ok()) {
+              const buf = Buffer.from(await resp.body());
+              if (buf.slice(0, 5).toString() === '%PDF-') {
+                cp575_pdf_base64 = buf.toString('base64');
+              }
+            }
+          } catch (err) { console.warn(`[cp575] href fallback failed: ${err.message}`); }
+        }
+      }
+    } else {
+      console.warn('[cp575] no candidate link/button matched on EIN Assignment page');
+    }
+  } catch (err) {
+    console.warn(`[fillIrsEinForm] CP 575 download failed: ${err.message}`);
+  }
+
+  // Persist the PDF locally too (defense-in-depth — if response transmission
+  // drops the base64, we have a copy on disk to recover).
+  if (cp575_pdf_base64) {
+    try {
+      fs.writeFileSync(path.join(outDir, 'cp575.pdf'), Buffer.from(cp575_pdf_base64, 'base64'));
+    } catch { /* ignore */ }
+  }
+
+  return {
+    phase: 'submitted',
+    url: page.url(),
+    steps_visited,
+    ein,
+    cp575_pdf_base64,
+    ein_assignment_dump,  // always returned — operator can use this to manually retrieve PDF if automated capture failed
+  };
+}
+
 // ── wyreg helpers ───────────────────────────────────────────────────────────
 // Used by wyreg_poll_docs / wyreg_inspect_docs. On AdsPower the Keycloak session
 // persists across runs, so ensureLoggedIn is a single-shot check instead of the
@@ -1376,6 +2030,52 @@ const handlers = {
       body_text_excerpt,
       html_excerpt,
       operating_hours: hours,
+    };
+  },
+
+  // ─── irs_apply_ein_dryrun ───────────────────────────────────────────────
+  // Fill the IRS EIN Assistant from Step 1 through Step 4, stopping on the
+  // Review & Submit page. Returns a confirmation_token (caller-side opaque
+  // value to pair with a future irs_apply_ein_submit), screenshots of every
+  // step, and the visible Review page summary so an operator can verify
+  // before triggering the live submit. NEVER clicks the final Submit.
+  async irs_apply_ein_dryrun(page, { payload, confirmation_token, jobId } = {}) {
+    const tag = jobId || confirmation_token || 'dryrun';
+    const outDir = path.join(OUT, 'irs-ein', tag);
+    fs.mkdirSync(outDir, { recursive: true });
+    const hours = irsEinOnlineHoursOpen();
+    if (!hours.open) throw new Error(`IRS EIN online closed: ${hours.reason}`);
+    if (!payload) throw new Error('irs_apply_ein_dryrun: payload required');
+    if (!confirmation_token) throw new Error('irs_apply_ein_dryrun: confirmation_token required (generate caller-side, return to operator for the submit step)');
+    const result = await fillIrsEinForm(page, payload, { stopAtReview: true, outDir, tag });
+    return {
+      portal: 'irs_apply_ein_dryrun',
+      confirmation_token,
+      operating_hours: hours,
+      ...result,
+    };
+  },
+
+  // ─── irs_apply_ein_submit ───────────────────────────────────────────────
+  // Re-fill the form end to end and click Submit. Returns the EIN string
+  // and CP 575 PDF as base64. The IRS allows one EIN per responsible-party
+  // SSN per 24h window — the caller MUST gate this behind a fresh dryrun
+  // confirmation_token + operator approval. Worker does not enforce that
+  // gate: app side (state-filing-worker) does.
+  async irs_apply_ein_submit(page, { payload, confirmation_token, jobId } = {}) {
+    const tag = jobId || confirmation_token || 'submit';
+    const outDir = path.join(OUT, 'irs-ein', tag);
+    fs.mkdirSync(outDir, { recursive: true });
+    const hours = irsEinOnlineHoursOpen();
+    if (!hours.open) throw new Error(`IRS EIN online closed: ${hours.reason}`);
+    if (!payload) throw new Error('irs_apply_ein_submit: payload required');
+    if (!confirmation_token) throw new Error('irs_apply_ein_submit: confirmation_token required (must match the dryrun token the operator approved)');
+    const result = await fillIrsEinForm(page, payload, { stopAtReview: false, outDir, tag });
+    return {
+      portal: 'irs_apply_ein_submit',
+      confirmation_token,
+      operating_hours: hours,
+      ...result,
     };
   },
 
