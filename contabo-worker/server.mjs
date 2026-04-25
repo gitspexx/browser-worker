@@ -548,7 +548,7 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
       const e = document.querySelector('.input-error-message, [class*="error-message"]');
       return e?.textContent?.trim().slice(0, 300) || null;
     }).catch(() => null);
-    throw new Error(`fillIrsEinForm[step4→review]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 3500)}`);
+    throw new Error(`fillIrsEinForm[step4→review]: did not advance. err_banner=${errBanner} fields=${JSON.stringify(ff).slice(0, 10000)}`);
   }
 
   // ── Review & Submit ───────────────────────────────────────────────────────
