@@ -510,7 +510,23 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   ], 6000);
   if (catLabel) await catLabel.click().catch(() => {});
   await page.locator(`input[type="radio"][id="${irsCategory}entityBusinessCategoryInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(1200);
+
+  // When OTHER is selected, a sub-question "Tell us more about your Other
+  // activities" appears with options:
+  //   CONSULTING, MANUFACTURING, ORGANIZATION (religious/civic etc),
+  //   RENTAL, REPAIR, GOODS_SELLER, SERVICE, OTHER.
+  // For BCAX (management consulting + holding) → CONSULTING.
+  if (irsCategory === 'OTHER') {
+    const subKey = (payload.business?.irs_other_activity || 'CONSULTING').toUpperCase();
+    const subLabel = await firstVisible([
+      `label[for="${subKey}otherInputid"]`,
+    ], 4000);
+    if (subLabel) await subLabel.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${subKey}otherInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
   await captureStep('step4b-category-selected');
   await clickContinue('step4b');
   await page.waitForTimeout(2000);
