@@ -599,6 +599,21 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
     return out;
   }).catch(() => ({}));
 
+  // Pick EIN Confirmation Letter delivery method on the Review page —
+  // do this BEFORE stopAtReview so the dryrun verifies the click worked
+  // (review_form_fields should show DIGITAL checked=True).
+  // Verified selectors from dryrun #13:
+  //   name="confirmationLetterRadioInput"
+  //   id="DIGITALconfirmationLetterRadioInputid" / "MAILconfirmationLetterRadioInputid"
+  {
+    const wantMail = payload.business?.deliver_letter_by_mail === true;
+    const target = wantMail ? 'MAIL' : 'DIGITAL';
+    const lab = await firstVisible([`label[for="${target}confirmationLetterRadioInputid"]`], 4000);
+    if (lab) await lab.click().catch(() => {});
+    await page.locator(`input[type="radio"][id="${target}confirmationLetterRadioInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
   if (stopAtReview) {
     // Dump form_fields on the Review page so callers can see the
     // delivery-method radio (digital vs mail) name before submit.
@@ -623,34 +638,8 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   }
 
   // ── Final Submit ──────────────────────────────────────────────────────────
-  // Before clicking the Submit EIN Request button, IRS requires picking one
-  // of two delivery methods for the EIN Confirmation Letter:
-  //   - Receive letter digitally in the next step (instant CP 575 PDF)
-  //   - Receive letter by mail (4 weeks)
-  // Default = digital (override via payload.business.deliver_letter_by_mail).
-  const wantMail = payload.business?.deliver_letter_by_mail === true;
-  // Selector convention: same Yes/No-style as Step 2/3 — try common id forms.
-  const deliveryGuesses = wantMail ? [
-    'label[for*="mail" i][for*="deliveryMethod" i]',
-    'label[for*="Mail" i][for*="confirmation" i]',
-    'input[type="radio"][value*="mail" i][name*="deliver" i]',
-    'input[type="radio"][value*="MAIL" i]',
-  ] : [
-    'label[for*="digital" i]',
-    'label[for*="Digital" i][for*="deliveryMethod" i]',
-    'input[type="radio"][value*="DIGITAL" i]',
-    'input[type="radio"][value*="digital" i][name*="deliver" i]',
-    'input[type="radio"][id*="online" i]',
-    'input[type="radio"][value*="online" i]',
-  ];
-  const deliveryEl = await firstVisible(deliveryGuesses, 4000);
-  if (deliveryEl) {
-    await deliveryEl.click().catch(() => {});
-    await page.waitForTimeout(500);
-  } else {
-    console.warn('[fillIrsEinForm:review] delivery-method radio not found by selector — Submit may fail with required-field error');
-  }
-
+  // Delivery-method radio was already picked above (before stopAtReview),
+  // so dryrun verified it. Just click Submit EIN Request now.
   // Submit EIN Request button. The IRS uses an <a role="button"> here
   // (visible label "Submit EIN Request"); aria-label may differ.
   const submitBtn = await firstVisible([
