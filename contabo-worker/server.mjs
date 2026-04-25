@@ -600,11 +600,24 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   }).catch(() => ({}));
 
   if (stopAtReview) {
+    // Dump form_fields on the Review page so callers can see the
+    // delivery-method radio (digital vs mail) name before submit.
+    const review_form_fields = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('input, select, textarea').forEach((el) => {
+        const t = el.getAttribute('type') || el.tagName.toLowerCase();
+        if (t === 'hidden' || t === 'submit' || t === 'button') return;
+        const lab = el.id ? document.querySelector(`label[for="${el.id.replace(/"/g, '\"')}"]`)?.textContent?.trim().slice(0, 200) : null;
+        out.push({ tag: el.tagName.toLowerCase(), name: el.getAttribute('name'), id: el.getAttribute('id'), type: t, value: el.value, checked: el.checked, label: lab });
+      });
+      return out;
+    }).catch(() => []);
     return {
       phase: 'review',
       url: page.url(),
       steps_visited,
       review_snapshot,
+      review_form_fields,
       review_screenshot_path: steps_visited[steps_visited.length - 1]?.screenshot_path,
     };
   }
