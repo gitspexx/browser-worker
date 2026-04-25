@@ -496,6 +496,27 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
 
   await captureStep('step4-additional-filled');
   await clickContinue('step4');
+
+  // ── Step 4b: Business Category (NAICS-lite) ──────────────────────────────
+  // Verified from dryrun #7: a single-page radio with 15 hardcoded categories:
+  //   ACCOMMODATIONS, CONSTRUCTION, FINANCE, FOOD_SERVICE, HEALTH_CARE,
+  //   INSURANCE, MANUFACTURING, REAL_ESTATE, RENTAL_LEASING, RETAIL,
+  //   SOCIAL_ASSISTANCE, TRANSPORTATION, WAREHOUSING, WHOLESALE, OTHER.
+  // For BCAX (management consulting + holding) → OTHER. The caller can
+  // pass a different mapping via payload.business.irs_category.
+  const irsCategory = (payload.business?.irs_category || 'OTHER').toUpperCase();
+  const catLabel = await firstVisible([
+    `label[for="${irsCategory}entityBusinessCategoryInputid"]`,
+  ], 6000);
+  if (catLabel) await catLabel.click().catch(() => {});
+  await page.locator(`input[type="radio"][id="${irsCategory}entityBusinessCategoryInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await captureStep('step4b-category-selected');
+  await clickContinue('step4b');
+  await page.waitForTimeout(2000);
+  // The next sub-page may ask for a free-text description when OTHER is
+  // selected; handler in the next-page block.
+
   if (!await waitForStepActive('Review.{0,3}Submit', 15000)) {
     const ff = await page.evaluate(() => {
       const out = [];
