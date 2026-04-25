@@ -381,88 +381,41 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   }
 
   // ── Step 3: Addresses ─────────────────────────────────────────────────────
-  // TODO(monday): tune selectors. Expected:
-  //   - Mailing/business address: street1, street2, city, state (select), zip
-  //   - Physical address same as mailing: Yes/No radio
-  //   - Phone number
+  // Verified selectors from 2026-04-25 dryrun #4 form_fields dump:
+  //   physicalStreet, physicalCity, physicalZipCode (text)
+  //   physicalState (select, 2-letter codes)
+  //   thePhone (text, digits only — IRS hint: "Must contain only digits")
+  //   otherAddress radio: yesotherAddressid / nootherAddressid
+  //     ("Do you have an address different from the above where you want
+  //      your mail to be sent?")
   await captureStep('step3-addresses-arrived');
 
   const addr = payload.business.mailing_address;
-  const streetInput = await firstVisible([
-    'input[name*="street" i]:not([name*="2"])',
-    'input[name*="addressLine1" i]',
-    'input[id*="street" i]',
-  ], 6000);
-  if (!streetInput) throw new Error('fillIrsEinForm[step3]: street input not found');
-  await streetInput.fill(addr.street);
+  await page.locator('input[name="physicalStreet"]').fill(addr.street);
+  await page.locator('input[name="physicalCity"]').fill(addr.city);
+  await page.locator('input[name="physicalZipCode"]').fill(addr.zip);
+  await page.locator('select[name="physicalState"]').selectOption(addr.state).catch(async () => {
+    const stateNames = { WY: 'Wyoming', DE: 'Delaware', FL: 'Florida', CA: 'California', NY: 'New York', TX: 'Texas' };
+    const fullName = stateNames[addr.state] || addr.state;
+    await page.locator('select[name="physicalState"]').selectOption({ label: fullName });
+  });
 
-  const cityInput = await firstVisible([
-    'input[name*="city" i]',
-    'input[id*="city" i]',
-  ], 6000);
-  if (!cityInput) throw new Error('fillIrsEinForm[step3]: city input not found');
-  await cityInput.fill(addr.city);
-
-  const zipInput = await firstVisible([
-    'input[name*="zip" i]',
-    'input[name*="postal" i]',
-    'input[id*="zip" i]',
-  ], 6000);
-  if (!zipInput) throw new Error('fillIrsEinForm[step3]: zip input not found');
-  await zipInput.fill(addr.zip);
-
-  // State is typically a <select>. Use selectOption with the 2-letter code.
-  const stateSelect = await firstVisible([
-    'select[name*="state" i]',
-    'select[id*="state" i]',
-  ], 6000);
-  if (stateSelect) {
-    await stateSelect.selectOption(addr.state).catch(async () => {
-      // Some IRS forms index by full state name; try that as fallback.
-      await stateSelect.selectOption({ label: addr.state }).catch(() => {});
-    });
-  } else {
-    // TODO(monday): if state is a custom React Select, use a label-click pattern.
-    console.warn('[fillIrsEinForm:step3] state select not found — may need React-Select handling');
+  // IRS phone hint: "Must contain only digits; do not enter extensions".
+  if (payload.business.phone) {
+    const phoneDigits = String(payload.business.phone).replace(/\D/g, '');
+    await page.locator('input[name="thePhone"]').fill(phoneDigits).catch(() => {});
   }
 
-  // Phone (some IRS forms put it on the address page)
-  const businessPhone = payload.business.phone;
-  if (businessPhone) {
-    const phoneInput = await firstVisible([
-      'input[name*="phone" i]',
-      'input[type="tel"]',
-      'input[id*="phone" i]',
-    ], 4000);
-    if (phoneInput) await phoneInput.fill(businessPhone).catch(() => {});
-  }
-
-  // "Do you have an address different from the above where you want your mail
-  // to be sent?" — answer No (same as physical) for BCAX-style flows.
-  // The label click pattern fires React onChange; ID convention mirrors Step 2's
-  // entityRoleRadioInput (yesentityRoleRadioInputid / noentityRoleRadioInputid).
-  {
-    const useDifferentMailing = !!payload.business?.physical_address; // explicit opt-in
-    const targetValue = useDifferentMailing ? 'yes' : 'no';
-    const noLabel = await firstVisible([
-      `label[for="${targetValue}differentMailingRadioInputid"]`,
-      `label[for="${targetValue}mailingDifferentRadioInputid"]`,
-      `label[for*="${targetValue}" i][for*="differentMailing" i]`,
-      `label[for*="${targetValue}" i][for*="mailing" i]`,
-    ], 4000);
-    const noRadio = await firstVisible([
-      `input[type="radio"][id*="${targetValue}" i][id*="differentMailing" i]`,
-      `input[type="radio"][id*="${targetValue}" i][id*="mailing" i]`,
-      `input[type="radio"][name*="differentMailing" i][value="${targetValue}"]`,
-      `input[type="radio"][name*="mailingDifferent" i][value="${targetValue}"]`,
-    ], 4000);
-    if (noLabel) await noLabel.click().catch(() => {});
-    if (noRadio) await noRadio.check({ force: true, timeout: 3000 }).catch(() => {});
-    if (!noLabel && !noRadio) {
-      console.warn('[fillIrsEinForm:step3] mailing-different radio not found — Continue may fail');
-    }
-    await page.waitForTimeout(500);
-  }
+  // Mailing-different radio. payload.business.physical_address is set when
+  // the operator wants a separate mailing address; absence => same as above.
+  const useDifferentMailing = !!payload.business?.physical_address;
+  const otherTarget = useDifferentMailing ? 'yes' : 'no';
+  const otherLabel = await firstVisible([
+    `label[for="${otherTarget}otherAddressid"]`,
+  ], 4000);
+  if (otherLabel) await otherLabel.click().catch(() => {});
+  await page.locator(`input[type="radio"][id="${otherTarget}otherAddressid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(500);
 
   await captureStep('step3-addresses-filled');
   await clickContinue('step3');
