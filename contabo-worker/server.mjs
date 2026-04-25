@@ -525,6 +525,21 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
     if (subLabel) await subLabel.click().catch(() => {});
     await page.locator(`input[type="radio"][id="${subKey}otherInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
     await page.waitForTimeout(800);
+
+    // When CONSULTING is selected, IRS asks one more nested Yes/No:
+    //   "Do you provide operating advice and assistance to businesses and
+    //    other organizations?" (name=otherConsultingRadioInput).
+    // For management consulting + holding: YES.
+    if (subKey === 'CONSULTING') {
+      const consultsYes = payload.business?.provides_operating_advice !== false;
+      const target = consultsYes ? 'yes' : 'no';
+      const lab = await firstVisible([
+        `label[for="${target}otherConsultingRadioInputid"]`,
+      ], 4000);
+      if (lab) await lab.click().catch(() => {});
+      await page.locator(`input[type="radio"][id="${target}otherConsultingRadioInputid"]`).check({ force: true, timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(600);
+    }
   }
 
   await captureStep('step4b-category-selected');
