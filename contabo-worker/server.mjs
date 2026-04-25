@@ -610,15 +610,45 @@ async function fillIrsEinForm(page, payload, { stopAtReview, outDir, tag }) {
   }
 
   // ── Final Submit ──────────────────────────────────────────────────────────
-  // The Review page Continue is also typically aria-label="Continue" but
-  // the next page (EIN Assignment) only loads after a real form submit.
-  // TODO(monday): final-submit button may be aria-label="Submit" instead.
+  // Before clicking the Submit EIN Request button, IRS requires picking one
+  // of two delivery methods for the EIN Confirmation Letter:
+  //   - Receive letter digitally in the next step (instant CP 575 PDF)
+  //   - Receive letter by mail (4 weeks)
+  // Default = digital (override via payload.business.deliver_letter_by_mail).
+  const wantMail = payload.business?.deliver_letter_by_mail === true;
+  // Selector convention: same Yes/No-style as Step 2/3 — try common id forms.
+  const deliveryGuesses = wantMail ? [
+    'label[for*="mail" i][for*="deliveryMethod" i]',
+    'label[for*="Mail" i][for*="confirmation" i]',
+    'input[type="radio"][value*="mail" i][name*="deliver" i]',
+    'input[type="radio"][value*="MAIL" i]',
+  ] : [
+    'label[for*="digital" i]',
+    'label[for*="Digital" i][for*="deliveryMethod" i]',
+    'input[type="radio"][value*="DIGITAL" i]',
+    'input[type="radio"][value*="digital" i][name*="deliver" i]',
+    'input[type="radio"][id*="online" i]',
+    'input[type="radio"][value*="online" i]',
+  ];
+  const deliveryEl = await firstVisible(deliveryGuesses, 4000);
+  if (deliveryEl) {
+    await deliveryEl.click().catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    console.warn('[fillIrsEinForm:review] delivery-method radio not found by selector — Submit may fail with required-field error');
+  }
+
+  // Submit EIN Request button. The IRS uses an <a role="button"> here
+  // (visible label "Submit EIN Request"); aria-label may differ.
   const submitBtn = await firstVisible([
+    'a[aria-label="Submit EIN Request"]',
+    'a[aria-label*="Submit EIN" i]',
+    'a:has-text("Submit EIN Request")',
+    'button:has-text("Submit EIN Request")',
     'a[aria-label="Submit"]',
     'a[aria-label*="Submit" i]',
     'button[aria-label="Submit"]',
     'a:has-text("Submit")',
-    'a[aria-label="Continue"]',  // fallback: same Continue pattern
   ], 8000);
   if (!submitBtn) throw new Error('fillIrsEinForm[review→submit]: Submit button not found');
   await submitBtn.click({ timeout: 8000 });
