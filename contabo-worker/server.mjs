@@ -2476,6 +2476,71 @@ handlers.mercury_open_business_account = async function (page, payload = {}) {
   }
 };
 
+// ── WhatsApp Web (personal account, paired once via QR on a dedicated AdsPower profile) ──
+// Sends a message to a phone number through web.whatsapp.com. Phone is normalized
+// to digits-only (no leading +). Caller MUST run this against an AdsPower profile
+// where the user has scanned the QR code on their phone at least once.
+handlers.wa_send = async function (page, { to, body, claimId }) {
+  if (!to) throw new Error('wa_send: "to" is required');
+  if (!body) throw new Error('wa_send: "body" is required');
+  const digits = String(to).replace(/\D/g, '');
+  if (digits.length < 7) throw new Error(`wa_send: invalid phone "${to}"`);
+
+  const url = `https://web.whatsapp.com/send?phone=${digits}&text=${encodeURIComponent(body)}`;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(5000);
+
+  // Detect "phone not on WhatsApp" modal across locales.
+  const notOnWa = page.getByText(/isn.?t on WhatsApp|no\s+es\s+un\s+usuario|invalid|inv[aá]lido|Could not contact|n[uú]mero/i);
+  if (await notOnWa.first().isVisible().catch(() => false)) {
+    const errShot = path.join(OUT, `${claimId || 'wa'}-wa-error.png`);
+    await page.screenshot({ path: errShot, fullPage: true });
+    // Be a bit forgiving — only throw if we ALSO can't find a message input.
+    const inputProbe = await page.locator('div[contenteditable="true"]').count();
+    if (inputProbe === 0) {
+      throw new Error(`wa_send: phone ${digits} not on WhatsApp (or chat failed to open)`);
+    }
+  }
+
+  // Locate the message-input contenteditable. WA Web ships several selector variants.
+  const input = page.locator(
+    'footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], div[contenteditable="true"][title="Type a message" i]',
+  ).last();
+  await input.waitFor({ state: 'visible', timeout: 30000 });
+
+  // The text is prefilled from the URL on most loads, but not all. If empty, type it.
+  const currentText = await input.innerText().catch(() => '');
+  if (!currentText || currentText.trim().length < 3) {
+    await input.click();
+    await page.keyboard.type(body, { delay: 6 });
+    await page.waitForTimeout(400);
+  }
+
+  // Click send. Most stable selector across versions: span[data-icon="send"].
+  const sendBtn = page.locator(
+    'span[data-icon="send"], button[aria-label="Send" i], button[data-tab="11"], [data-testid="send"]',
+  ).first();
+  await sendBtn.waitFor({ state: 'visible', timeout: 15000 });
+  await sendBtn.click();
+
+  // Confirm: wait until input is empty again (a strong signal the message left).
+  try {
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('footer div[contenteditable="true"]');
+        return el && (el.innerText || '').trim().length === 0;
+      },
+      { timeout: 10000 },
+    );
+  } catch { /* fall through; screenshot will reveal */ }
+  await page.waitForTimeout(1500);
+
+  const shot = path.join(OUT, `${claimId || 'wa'}-wa-sent.png`);
+  await page.screenshot({ path: shot, fullPage: true });
+
+  return { portal: 'wa_send', to: digits, sent_at: new Date().toISOString(), screenshot: shot };
+};
+
 // ── App ─────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
