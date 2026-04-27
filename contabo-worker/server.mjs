@@ -1297,6 +1297,376 @@ const handlers = {
     }
     return { portal: 'govbr', error: `unknown govbr action: ${action}` };
   },
+
+  // ── Wise: open another business account under an existing membership ─────
+  // Requires the AdsPower profile to be already logged into Wise as the
+  // membership owner. Walks Steps 1–7 of the "Open another business account"
+  // flow deterministically. Stops at Step 8 (director ID + docs) and returns
+  // the captured state so the caller can either complete it manually or
+  // dispatch the upload step in a follow-up call once docs are attached.
+  //
+  // Payload shape:
+  //   { jobId, entity: {
+  //       company_type: 'LLC' | 'Inc' | ...
+  //       legal_name, dba?: string,
+  //       ein,
+  //       address: { street, city, state, zip, country: 'US' }
+  //       trading_address: { street, city, state, zip, country },
+  //       industry: { sector, industry, size },
+  //       website, wise_plan: 'advanced'|'basic', wise_purpose: 'both'|... }
+  //     stop_after_step?: 7   // default 7; for dryrun set to 1..7 to inspect
+  //   }
+  async wise_open_business_account(page, payload = {}) {
+    const tag = payload.jobId || 'adhoc';
+    const entity = payload.entity || {};
+    const stopAfter = payload.stop_after_step ?? 7;
+    const outDir = path.join(OUT, 'wise-open-business', tag);
+    fs.mkdirSync(outDir, { recursive: true });
+    const steps_visited = [];
+    const errors = [];
+
+    const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+    async function captureStep(label) {
+      const idx = steps_visited.length;
+      const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+      try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+      steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+    }
+    async function settle() {
+      await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+    async function firstVisible(selectors, perTimeout = 3000) {
+      for (const sel of selectors) {
+        const loc = typeof sel === 'function' ? sel() : page.locator(sel).first();
+        try {
+          await loc.waitFor({ state: 'visible', timeout: perTimeout });
+          return loc;
+        } catch { /* try next */ }
+      }
+      return null;
+    }
+    // Wise uses combobox-like custom selects. Strategy: click the combobox by
+    // its accessible label, then click an option whose text matches.
+    async function pickFromCombobox(labelRe, optionText) {
+      const candidates = [
+        () => page.getByRole('combobox', { name: labelRe }),
+        () => page.getByLabel(labelRe),
+        `label:has-text("${optionText}")`,
+      ];
+      const combo = await firstVisible(candidates, 4000);
+      if (!combo) throw new Error(`combobox with label ${labelRe} not visible`);
+      await combo.click({ timeout: 5000 });
+      await page.waitForTimeout(300);
+      // Type to filter the dropdown if it accepts text
+      try { await combo.fill(optionText); } catch { /* not all comboboxes accept fill */ }
+      await page.waitForTimeout(300);
+      const opt = await firstVisible([
+        `[role="option"]:has-text("${optionText}")`,
+        `li:has-text("${optionText}")`,
+        `button:has-text("${optionText}")`,
+      ], 4000);
+      if (!opt) throw new Error(`option "${optionText}" not visible after opening ${labelRe}`);
+      await opt.click({ timeout: 5000 });
+    }
+    async function fillByLabel(labelRe, value) {
+      const inp = await firstVisible([
+        () => page.getByLabel(labelRe),
+        `input[aria-label*="${labelRe.source ?? labelRe}" i]`,
+      ], 4000);
+      if (!inp) throw new Error(`input ${labelRe} not visible`);
+      await inp.fill(String(value ?? ''));
+    }
+    async function clickPrimary(textRe) {
+      const btn = await firstVisible([
+        () => page.getByRole('button', { name: textRe }),
+        `button:has-text("${textRe.source ?? textRe}")`,
+      ], 5000);
+      if (!btn) throw new Error(`primary button ${textRe} not visible`);
+      await btn.click({ timeout: 5000 });
+    }
+
+    // Verify session is alive on Wise — bail early if not.
+    await page.goto('https://wise.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await settle();
+    const onLogin = /\/login|\/(?:registration|auth)/.test(page.url());
+    if (onLogin) {
+      throw new Error(`Wise session expired — log in manually on AdsPower profile, then re-run job ${tag}`);
+    }
+    await captureStep('home');
+
+    // Entry point: "Open another business account" is reachable from the profile
+    // switcher dropdown. URL is reasonably stable.
+    await page.goto('https://wise.com/registration?type=business', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await settle();
+    await captureStep('registration-entry');
+
+    try {
+      // ── Step 1: country ───────────────────────────────────────────────────
+      const country = entity.address?.country === 'US' ? 'United States' : entity.address?.country;
+      await pickFromCombobox(/where is your business located/i, country);
+      await clickPrimary(/Continue/i);
+      await settle();
+      await captureStep('after-step-1-country');
+      if (stopAfter < 2) return ok();
+
+      // ── Step 2: company type, legal name, EIN ─────────────────────────────
+      const companyTypeText = entity.company_type === 'LLC'
+        ? 'Limited Liability Company (LLC)'
+        : entity.company_type === 'Inc'
+          ? 'For-Profit Corporation (Inc)'
+          : entity.company_type;
+      await pickFromCombobox(/company type/i, companyTypeText);
+      await fillByLabel(/Registered business name/i, entity.legal_name);
+      if (entity.dba) await fillByLabel(/Trading Business Name/i, entity.dba);
+      await fillByLabel(/EIN number/i, entity.ein);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-2-business-details');
+      if (stopAfter < 3) return ok();
+
+      // ── Step 3: registered address ────────────────────────────────────────
+      // Country is usually pre-selected from step 1; only re-pick if mismatch.
+      await fillByLabel(/^Address$/i, entity.address?.street);
+      await fillByLabel(/^City$/i, entity.address?.city);
+      if (entity.address?.state) {
+        await pickFromCombobox(/^State$/i, entity.address.state).catch(async () => {
+          await fillByLabel(/^State$/i, entity.address.state);
+        });
+      }
+      await fillByLabel(/ZIP code|Postal code/i, entity.address?.zip);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-3-address');
+      if (stopAfter < 4) return ok();
+
+      // ── Step 4: industry ──────────────────────────────────────────────────
+      await pickFromCombobox(/Business sector/i, entity.industry?.sector);
+      await pickFromCombobox(/^Industry$/i, entity.industry?.industry);
+      await pickFromCombobox(/Size of your business/i, entity.industry?.size);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-4-industry');
+      if (stopAfter < 5) return ok();
+
+      // ── Step 5: website ───────────────────────────────────────────────────
+      await fillByLabel(/Business website|social media|e-commerce link/i, entity.website);
+      await clickPrimary(/^Continue$/i);
+      await settle();
+      await captureStep('after-step-5-website');
+      if (stopAfter < 6) return ok();
+
+      // ── Step 6: plan ──────────────────────────────────────────────────────
+      // Click "Get Advanced" or "Get Basic" depending on the entity preference.
+      const planLabel = entity.wise_plan === 'basic' ? /Get Basic/i : /Get Advanced/i;
+      await clickPrimary(planLabel);
+      await settle();
+      await captureStep('after-step-6-plan');
+      if (stopAfter < 7) return ok();
+
+      // ── Step 7: purpose ───────────────────────────────────────────────────
+      const purposeLabel = {
+        both: 'Both paying suppliers and contractors, and receiving money for goods and services',
+        receiving: 'Receiving money for services / products',
+        paying: 'Paying suppliers / contractors / employees',
+        intra_company: 'Making intra-company transfers',
+      }[entity.wise_purpose ?? 'both'];
+      await pickFromCombobox(/using Wise for/i, purposeLabel);
+      await clickPrimary(/Continue|Save and continue/i);
+      await settle();
+      await captureStep('after-step-7-purpose');
+
+      // Step 8+ (director identity, source of funds, $31 card payment, doc
+      // upload, ToS, final review) is intentionally not implemented yet —
+      // capture the current state and return so the operator can finish, OR
+      // we extend this handler in a follow-up after the BCAX dryrun.
+      await captureStep('paused-at-step-8-todo');
+      return ok();
+    } catch (e) {
+      errors.push({ step: steps_visited.length, message: e.message, stack: e.stack?.split('\n').slice(0, 4).join('\n') });
+      await captureStep(`error-${e.message.slice(0, 30)}`);
+      return ok();
+    }
+
+    function ok() {
+      return {
+        portal: 'wise_open_business_account',
+        job_id: tag,
+        completed_steps: steps_visited.length,
+        steps_visited,
+        stopped_at_step: steps_visited[steps_visited.length - 1]?.step_label,
+        errors,
+        // Phase 2: parse the wise URL once a profile is created — the URL
+        // becomes /home/<membershipId>/<businessProfileId>.
+        wise_profile_id: parseWiseProfileIdFromUrl(page.url()),
+      };
+    }
+  },
+};
+
+// Best-effort: extract the new business profile id from the post-creation URL
+// (Wise routes to /home/<membershipId>/<businessProfileId>/...). Returns null
+// if we're not on a recognizable URL yet.
+function parseWiseProfileIdFromUrl(url) {
+  try {
+    const m = String(url).match(/\/home\/(P\d+)\/(\d+)/);
+    return m ? m[2] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Best-effort: extract Mercury account id from URL like /accounts/<id>/...
+function parseMercuryAccountIdFromUrl(url) {
+  try {
+    const m = String(url).match(/\/accounts\/([a-zA-Z0-9_-]+)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Add Mercury handler to the same handlers object.
+handlers.mercury_open_business_account = async function (page, payload = {}) {
+  const tag = payload.jobId || 'adhoc';
+  const entity = payload.entity || {};
+  const stopAfterStep = payload.stop_after_step ?? 99; // run until human-needed step
+  const outDir = path.join(OUT, 'mercury-open-business', tag);
+  fs.mkdirSync(outDir, { recursive: true });
+  const steps_visited = [];
+  const errors = [];
+
+  const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+  async function captureStep(label) {
+    const idx = steps_visited.length;
+    const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+    try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+    steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+  }
+  async function settle() {
+    await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+  async function firstVisible(selectors, perTimeout = 3000) {
+    for (const sel of selectors) {
+      const loc = typeof sel === 'function' ? sel() : page.locator(sel).first();
+      try {
+        await loc.waitFor({ state: 'visible', timeout: perTimeout });
+        return loc;
+      } catch { /* try next */ }
+    }
+    return null;
+  }
+  async function fillByLabel(labelRe, value) {
+    const inp = await firstVisible([
+      () => page.getByLabel(labelRe),
+      `input[aria-label*="${labelRe.source ?? labelRe}" i]`,
+      `input[name*="${labelRe.source ?? labelRe}" i]`,
+    ], 4000);
+    if (!inp) throw new Error(`input ${labelRe} not visible`);
+    await inp.fill(String(value ?? ''));
+  }
+  async function clickPrimary(textRe) {
+    const btn = await firstVisible([
+      () => page.getByRole('button', { name: textRe }),
+      `button:has-text("${textRe.source ?? textRe}")`,
+    ], 5000);
+    if (!btn) throw new Error(`primary button ${textRe} not visible`);
+    await btn.click({ timeout: 5000 });
+  }
+
+  // Verify Mercury session is alive — bail if at /login.
+  await page.goto('https://app.mercury.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await settle();
+  if (/\/login|\/signin|\/auth/.test(page.url())) {
+    throw new Error(`Mercury session expired — log in manually on AdsPower profile, then re-run job ${tag}`);
+  }
+  await captureStep('home');
+
+  try {
+    // Mercury entry point for "open another account" — exact URL TBD during
+    // first dryrun. Try the most likely paths.
+    const entryCandidates = [
+      'https://app.mercury.com/accounts/new',
+      'https://app.mercury.com/onboarding/business',
+      'https://app.mercury.com/team/onboard-new-entity',
+    ];
+    for (const url of entryCandidates) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await settle();
+      if (!/404|not.found/i.test(await page.title().catch(() => ''))) break;
+    }
+    await captureStep('mercury-onboarding-entry');
+
+    // Steps below are best-effort placeholders. The real Mercury onboarding
+    // flow varies — capture screenshots during the BCAX dryrun and drop in
+    // the right selectors. Until then, the handler walks as far as it can
+    // and stops at the first unrecognized form.
+    if (stopAfterStep < 1) return ok();
+
+    // Likely first ask: legal entity name
+    await fillByLabel(/legal name|business name|company name/i, entity.legal_name).catch(() => {});
+    await fillByLabel(/EIN|tax id/i, entity.ein).catch(() => {});
+    await captureStep('legal-name-and-ein');
+    if (stopAfterStep < 2) return ok();
+
+    await clickPrimary(/Continue|Next/i).catch(() => {});
+    await settle();
+    await captureStep('after-step-1');
+
+    // Address
+    await fillByLabel(/address|street/i, entity.address?.street).catch(() => {});
+    await fillByLabel(/city/i, entity.address?.city).catch(() => {});
+    await fillByLabel(/state/i, entity.address?.state).catch(() => {});
+    await fillByLabel(/zip|postal/i, entity.address?.zip).catch(() => {});
+    await captureStep('address-filled');
+    if (stopAfterStep < 3) return ok();
+
+    await clickPrimary(/Continue|Next/i).catch(() => {});
+    await settle();
+    await captureStep('after-address');
+
+    // Director identity, source of funds, expected volume — these are the
+    // human-needed steps (selfie/ID upload, YubiKey, 1Password). Worker
+    // captures the screen and returns; user finishes manually OR in a
+    // follow-up after we decode the rest.
+    await captureStep('paused-awaiting-human');
+    return ok();
+  } catch (e) {
+    errors.push({ step: steps_visited.length, message: e.message });
+    await captureStep(`error-${e.message.slice(0, 30)}`);
+    return ok();
+  }
+
+  function ok() {
+    return {
+      portal: 'mercury_open_business_account',
+      job_id: tag,
+      completed_steps: steps_visited.length,
+      steps_visited,
+      stopped_at_step: steps_visited[steps_visited.length - 1]?.step_label,
+      errors,
+      mercury_account_id: parseMercuryAccountIdFromUrl(page.url()),
+      // Mercury sometimes returns a magic link for director liveness/selfie
+      // mid-flow. We surface anything that looks like a verification URL so
+      // the BCA app can forward it to the customer.
+      possible_kyc_url: extractKycLinkFromBody(),
+    };
+
+    function extractKycLinkFromBody() {
+      // Quick best-effort scan: read text content for an https link that
+      // mentions "verify" or "kyc". Enough to bootstrap the forwarding flow.
+      try {
+        const text = ''; // future: await page.evaluate(...)
+        const m = text.match(/https?:\/\/[^\s)"']+(verify|kyc|identity)[^\s)"']*/i);
+        return m ? m[0] : null;
+      } catch {
+        return null;
+      }
+    }
+  }
 };
 
 // ── App ─────────────────────────────────────────────────────────────────────
