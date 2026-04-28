@@ -1276,11 +1276,23 @@ const handlers = {
   async govbr(page, { claimId, action, body, companyName, bookingRef, desiredOutcome }) {
     const dashboard = 'https://www.consumidor.gov.br/pages/principal/';
     if (action === 'read_status') {
-      await page.goto('https://www.consumidor.gov.br/pages/reclamacao/minhas/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // After consumidor.gov.br UI rebuild (2026-04 onward), authenticated
+      // user's reclamação inbox lives at /pages/reclamacao/consumidor/consultar/
+      // (was /pages/reclamacao/minhas/ — now 404). Requires fresh session
+      // cookies; refresh via Cookie-Editor → /api/portals/credentials/govbr/from-cookie-editor
+      await page.goto('https://consumidor.gov.br/pages/reclamacao/consumidor/consultar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(3500);
       const shot = path.join(OUT, `${claimId}-govbr-status.png`);
       await page.screenshot({ path: shot, fullPage: true });
-      const rows = await page.locator('table tr').allInnerTexts().catch(() => []);
-      return { portal: 'govbr', action, preview: shot, rows: rows.slice(0, 20) };
+      const html = await page.content();
+      // Check for login redirect (session dead)
+      const loggedOut = /login\.obrigatorio|Acesso como Consumidor|Entrar com gov\.br/.test(html) && !/Minhas|reclamac/i.test(html);
+      if (loggedOut) {
+        return { portal: 'govbr', action, preview: shot, error: 'session expired — re-paste cookies via Cookie-Editor' };
+      }
+      // Try multiple selectors: rows, list items, cards
+      const rows = await page.locator('table tr, .reclamacao-item, [class*="reclamacao"], [class*="card"]').allInnerTexts().catch(() => []);
+      return { portal: 'govbr', action, preview: shot, url: page.url(), rows: rows.slice(0, 30) };
     }
     if (action === 'submit_new' || !action) {
       await page.goto('https://www.consumidor.gov.br/pages/reclamacao/nova/', { waitUntil: 'domcontentloaded', timeout: 60000 });
