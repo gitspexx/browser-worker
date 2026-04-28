@@ -2508,12 +2508,15 @@ handlers.wa_send = async function (page, { to, body, claimId }) {
   // session for this send. WA permits the bumped session to come back; this
   // is non-destructive ping-pong, not a logout.
   try {
+    // Match across known WA Web variants: legacy button text "Use here" /
+    // "Usar aqui" / "Utiliser ici", or the current "Connecting..." green
+    // primary button inside a [role=dialog] that pairs with a "Close" button.
     const useHere = page.locator(
-      'button:has-text("Use here"), button:has-text("Usar aqui"), button:has-text("Usar aquí"), button:has-text("Utiliser ici"), [role="button"]:has-text("Use here")',
+      'button:has-text("Use here"), button:has-text("Usar aqui"), button:has-text("Usar aquí"), button:has-text("Utiliser ici"), button:has-text("Connecting"), button:has-text("Conectando"), [role="dialog"] button:not(:has-text("Close")):not(:has-text("Cancel")):not(:has-text("Cerrar")):not(:has-text("Annuler"))',
     ).first();
-    if (await useHere.isVisible({ timeout: 4000 }).catch(() => false)) {
+    if (await useHere.isVisible({ timeout: 5000 }).catch(() => false)) {
       await useHere.click();
-      await page.waitForTimeout(3500);
+      await page.waitForTimeout(4000);
     }
   } catch {}
 
