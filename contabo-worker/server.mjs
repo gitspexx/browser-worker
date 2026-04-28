@@ -2502,6 +2502,21 @@ handlers.wa_send = async function (page, { to, body, claimId }) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(5000);
 
+  // If the user has WA Web open elsewhere (laptop, phone-linked-desktop), the
+  // worker's session gets bumped to a "WhatsApp is open in another window"
+  // modal with a "Use here" / "Usar aqui" button. Click it so we take the
+  // session for this send. WA permits the bumped session to come back; this
+  // is non-destructive ping-pong, not a logout.
+  try {
+    const useHere = page.locator(
+      'button:has-text("Use here"), button:has-text("Usar aqui"), button:has-text("Usar aquí"), button:has-text("Utiliser ici"), [role="button"]:has-text("Use here")',
+    ).first();
+    if (await useHere.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await useHere.click();
+      await page.waitForTimeout(3500);
+    }
+  } catch {}
+
   // Detect "phone not on WhatsApp" modal across locales.
   const notOnWa = page.getByText(/isn.?t on WhatsApp|no\s+es\s+un\s+usuario|invalid|inv[aá]lido|Could not contact|n[uú]mero/i);
   if (await notOnWa.first().isVisible().catch(() => false)) {
