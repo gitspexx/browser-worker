@@ -2234,14 +2234,16 @@ const handlers = {
   //       trading_address: { street, city, state, zip, country },
   //       industry: { sector, industry, size },
   //       website, wise_plan: 'advanced'|'basic', wise_purpose: 'both'|... }
-  //     stop_after_step?: 8   // default 8; for dryrun set to 1..8 to inspect
+  //     stop_after_step?: 9   // default 9; for dryrun set to 1..9 to inspect
   //     director?: { firstMiddle, last, dobDay, dobMonth, dobYear, residenceCountry }
+  //     payment?: { saved_card_last4: '9855', cvc: '688' }   // Step 9 ($31 advanced plan)
   //   }
   async wise_open_business_account(page, payload = {}) {
     const tag = payload.jobId || 'adhoc';
     const entity = payload.entity || {};
     const director = payload.director || null;
-    const stopAfter = payload.stop_after_step ?? 8;
+    const payment = payload.payment || null;
+    const stopAfter = payload.stop_after_step ?? 9;
     const outDir = path.join(OUT, 'wise-open-business', tag);
     fs.mkdirSync(outDir, { recursive: true });
     const steps_visited = [];
@@ -2428,10 +2430,36 @@ const handlers = {
         return ok();
       }
 
-      // Step 9+ (source of funds, $31 card payment, doc upload, ToS, final
-      // review) requires manual data we don't have automated yet. Capture and
-      // return so the operator can finish in the AdsPower window.
-      await captureStep('paused-at-step-9-source-of-funds-or-payment');
+      if (stopAfter < 9) return ok();
+
+      // ── Step 9: Payment ($31 advanced plan one-time fee) ──────────────────
+      // Wise screen: "Pay with your card" — Saved cards / New card tabs, list
+      // of cards w/ radio + CVC input on the selected one, "Pay 31 USD" button.
+      // Worker only handles the SAVED CARD path (no PCI in our pipeline).
+      if (payment?.saved_card_last4 && payment?.cvc) {
+        // Click the row for the matching last4
+        const cardRow = await firstVisible([
+          `label:has-text("${payment.saved_card_last4}")`,
+          `*:has-text("Ending in ${payment.saved_card_last4}")`,
+          `[role="radio"]:has-text("${payment.saved_card_last4}")`,
+        ], 5000);
+        if (!cardRow) throw new Error(`saved card ending ${payment.saved_card_last4} not visible on Wise payment page`);
+        await cardRow.click({ timeout: 5000 });
+        await page.waitForTimeout(400);
+        // Fill CVC — input appears after the radio is selected
+        await fillByLabel(/security code|CVC|CVV/i, payment.cvc);
+        await captureStep('step-9-payment-filled');
+        await clickPrimary(/Pay\s*31\s*USD|Pay/i);
+        await settle();
+        await captureStep('after-step-9-payment-submitted');
+      } else {
+        await captureStep('paused-at-step-9-no-payment-payload');
+        return ok();
+      }
+
+      // Step 10+ (post-payment Done screen, ToS acceptance, KYC selfie if not
+      // captured earlier) — capture final state and return.
+      await captureStep('done-or-pending-final');
       return ok();
     } catch (e) {
       errors.push({ step: steps_visited.length, message: e.message, stack: e.stack?.split('\n').slice(0, 4).join('\n') });
