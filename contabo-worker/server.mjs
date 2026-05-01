@@ -3143,9 +3143,19 @@ app.post('/redeploy', auth(), (req, res) => {
   const PWSH = process.env.PWSH_EXE
     || 'C:\\Program Files\\PowerShell\\7\\pwsh.exe';
 
+  // Capture stdout/stderr to a debug log so we can see WHY the child exits
+  // when Start-Transcript hasn't kicked in yet. fs is already imported at top.
+  const debugLog = `${REDEPLOY_LOGS_DIR}\\redeploy-spawn-${Date.now()}.log`;
+  let outFd, errFd;
+  try {
+    fs.mkdirSync(REDEPLOY_LOGS_DIR, { recursive: true });
+    outFd = fs.openSync(debugLog, 'a');
+    errFd = fs.openSync(debugLog, 'a');
+  } catch (e) { /* fall back to ignore */ }
+
   const child = spawn(PWSH, args, {
     detached: true,
-    stdio: 'ignore',
+    stdio: (outFd && errFd) ? ['ignore', outFd, errFd] : 'ignore',
     windowsHide: true,
   });
   child.unref();
