@@ -1,7 +1,7 @@
 import express from 'express';
 import { chromium } from 'playwright';
-import fs from 'fs';
-import path from 'path';
+import fs, { readFileSync, readdirSync, statSync } from 'fs';
+import path, { join } from 'path';
 import { spawn, exec as execCb } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
@@ -2212,6 +2212,48 @@ app.post('/exec', auth('admin'), async (req, res) => {
     res.json({ ok: true, id, duration_ms: Date.now() - started, stdout, stderr });
   } catch (e) {
     res.status(500).json({ ok: false, id, duration_ms: Date.now() - started, error: e.message, stdout: e.stdout, stderr: e.stderr, code: e.code });
+  }
+});
+
+// ─── /redeploy: spawn detached PowerShell so worker can restart itself ──────
+const REDEPLOY_BOOTSTRAP = process.env.REDEPLOY_BOOTSTRAP_PATH
+  || 'C:\\spexx-cloud-ops\\contabo\\bootstrap.ps1';
+const REDEPLOY_LOGS_DIR  = process.env.REDEPLOY_LOGS_DIR
+  || 'C:\\spexx-state\\logs';
+
+app.post('/redeploy', auth(), (req, res) => {
+  const args = ['-ExecutionPolicy', 'Bypass', '-File', REDEPLOY_BOOTSTRAP];
+  if (req.body?.service) { args.push('-Service', String(req.body.service)); }
+  if (req.body?.phase)   { args.push('-Phase',   String(req.body.phase));   }
+
+  const child = spawn('powershell.exe', args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+
+  res.status(202).json({
+    accepted: true,
+    pid: child.pid,
+    bootstrap: REDEPLOY_BOOTSTRAP,
+    logsDir: REDEPLOY_LOGS_DIR,
+  });
+});
+
+app.get('/redeploy/status', auth(), (_req, res) => {
+  try {
+    const files = readdirSync(REDEPLOY_LOGS_DIR)
+      .filter(f => /^bootstrap-\d{8}-\d{6}\.log$/.test(f))
+      .map(f => ({ f, mtime: statSync(join(REDEPLOY_LOGS_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (!files.length) return res.json({ latest: null });
+    const latest = files[0].f;
+    const body = readFileSync(join(REDEPLOY_LOGS_DIR, latest), 'utf8');
+    const tail = body.split(/\r?\n/).slice(-50).join('\n');
+    res.json({ latest, mtime: new Date(files[0].mtime).toISOString(), tail });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
