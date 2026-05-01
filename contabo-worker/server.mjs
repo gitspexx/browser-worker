@@ -3136,7 +3136,14 @@ app.post('/redeploy', auth(), (req, res) => {
   if (req.body?.service) { args.push('-Service', String(req.body.service)); }
   if (req.body?.phase)   { args.push('-Phase',   String(req.body.phase));   }
 
-  const child = spawn('powershell.exe', args, {
+  // bootstrap.ps1 has `#requires -Version 7.0` so we need PowerShell 7+ here.
+  // The system-wide MSI installs to a known absolute path; preferring it over
+  // `pwsh.exe` (PATH lookup) avoids any PATH inheritance surprises when this
+  // worker runs as SYSTEM via NSSM.
+  const PWSH = process.env.PWSH_EXE
+    || 'C:\\Program Files\\PowerShell\\7\\pwsh.exe';
+
+  const child = spawn(PWSH, args, {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
