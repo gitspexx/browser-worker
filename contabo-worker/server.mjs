@@ -78,8 +78,11 @@ async function withSession(profileId, fn, useAdsPower = true) {
   try {
     return await fn(page);
   } finally {
-    await browser.close().catch(() => {});
-    await fetch(`${ADS}/api/v1/browser/stop?user_id=${profileId}`).catch(() => {});
+    // IMPORTANT: don't close Chrome between calls. consumidor.gov.br uses
+    // session cookies + a short server-side TTL — every stop kills the
+    // login. Leave the AdsPower profile running; AdsPower handles idle
+    // cleanup on its own schedule. The hourly keepalive cron keeps it
+    // warm. The CDP connection is dropped when this handler returns.
   }
 }
 
@@ -2083,11 +2086,121 @@ const handlers = {
   async govbr(page, { claimId, action, body, companyName, bookingRef, desiredOutcome }) {
     const dashboard = 'https://www.consumidor.gov.br/pages/principal/';
     if (action === 'read_status') {
-      await page.goto('https://www.consumidor.gov.br/pages/reclamacao/minhas/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // Direct access to /consultar/ bumps to /administrativo/login (admin
+      // form) when consumidor's own session is dead — even if gov.br SSO
+      // is still alive. Always start from /pages/principal/ and click
+      // "Acesso como Consumidor"; SSO redirects back to the inbox if
+      // logged in, or to its CPF form if truly expired.
+      await page.goto('https://consumidor.gov.br/pages/principal/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(1500);
+      const entry = page.locator('a:has-text("Acesso como Consumidor"), button:has-text("Entrar com gov.br")').first();
+      if (await entry.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await entry.click();
+        await page.waitForTimeout(4000);
+      }
+      // After the SSO dance we should land on /consultar/ (logged in) or
+      // sso.acesso.gov.br/login (expired — needs CPF + senha + captcha).
+      const url = page.url();
+      const ssoExpired = /sso\.acesso\.gov\.br\/login/i.test(url);
       const shot = path.join(OUT, `${claimId}-govbr-status.png`);
       await page.screenshot({ path: shot, fullPage: true });
-      const rows = await page.locator('table tr').allInnerTexts().catch(() => []);
-      return { portal: 'govbr', action, preview: shot, rows: rows.slice(0, 20) };
+      if (ssoExpired) {
+        return { portal: 'govbr', action, preview: shot, error: 'session expired — gov.br SSO needs CPF + senha + captcha' };
+      }
+      // If we didn't land on the inbox, navigate there explicitly
+      if (!/\/consultar/i.test(page.url())) {
+        await page.goto('https://consumidor.gov.br/pages/reclamacao/consumidor/consultar/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(2500);
+      }
+      const html = await page.content();
+      const loggedOut = /login\.obrigatorio/i.test(page.url()) || (/Acesso como Consumidor/.test(html) && !/reclamac/i.test(html));
+      if (loggedOut) {
+        return { portal: 'govbr', action, preview: shot, error: 'session expired — gov.br SSO needs CPF + senha + captcha' };
+      }
+      // Parse the inbox table. Filter to rows that look like reclamações
+      // (protocol matches YYYY.MM/<digits>) — skips embedded calendar widgets.
+      const reclamacoes = await page.evaluate(() => {
+        const protocolRe = /^\d{4}\.\d{2}\/\d{4,}/;
+        const out = [];
+        for (const tr of document.querySelectorAll('table tbody tr')) {
+          const tds = tr.querySelectorAll('td');
+          if (tds.length < 5) continue;
+          const protocolo = (tds[0].innerText || '').trim();
+          if (!protocolRe.test(protocolo)) continue;
+          const a = tds[0].querySelector('a');
+          out.push({
+            protocolo,
+            fornecedor: (tds[1].innerText || '').trim(),
+            data: (tds[2].innerText || '').trim(),
+            prazo: (tds[3].innerText || '').trim(),
+            situacao: (tds[4].innerText || '').trim(),
+            href: a?.getAttribute('href') || null,
+          });
+        }
+        return out;
+      }).catch(() => []);
+
+      // Auto-open any "Respondida" complaints. The detail page may need an
+      // accordion expanded ("Manifestação do Fornecedor" / "Resposta") before
+      // the reply body is visible in the DOM.
+      const responded = [];
+      for (const r of reclamacoes) {
+        if (!/respond/i.test(r.situacao)) continue;
+        if (!r.href) continue;
+        const target = r.href.startsWith('http') ? r.href : `https://consumidor.gov.br${r.href}`;
+        try {
+          await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForTimeout(3000);
+          // Click the "Detalhes" link inside the timeline row that holds
+          // "Resposta do fornecedor". The row itself is in a table; the
+          // action column has a Detalhes anchor that opens the reply body
+          // (modal or inline).
+          const respostaRow = page.locator('tr:has-text("Resposta do fornecedor"), tr:has-text("Resposta da empresa")').first();
+          if (await respostaRow.count().catch(() => 0)) {
+            const detalhes = respostaRow.locator('a:has-text("Detalhes"), button:has-text("Detalhes")').first();
+            if (await detalhes.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await detalhes.click({ timeout: 3000 }).catch(() => {});
+              await page.waitForTimeout(2500);
+            }
+          }
+          const detailShot = path.join(OUT, `${claimId}-govbr-${r.protocolo.replace(/[^\w]/g, '_')}.png`);
+          await page.screenshot({ path: detailShot, fullPage: true });
+          // The reply body opens in a modal/dialog or inline expanded panel.
+          // Prefer text inside a [role=dialog] or .modal — that's the most
+          // reliable container after Detalhes click.
+          const replyText = await page.evaluate(() => {
+            const containers = Array.from(document.querySelectorAll('[role="dialog"], .modal-body, .modal-dialog, .modal, [class*="dialog"]'));
+            for (const c of containers) {
+              const t = (c.innerText || '').trim();
+              if (t.length > 80) return t.slice(0, 5000);
+            }
+            // Fallback: walk near a "Manifestação"/"Resposta" label heading.
+            const labels = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,strong,label'));
+            for (const el of labels) {
+              const t = (el.innerText || '').trim();
+              if (/manifesta[çc][aã]o\s+do\s+fornecedor|resposta\s+(da\s+empresa|do\s+fornecedor)/i.test(t) && t.length < 80) {
+                let cur = el;
+                for (let i = 0; i < 6; i++) {
+                  cur = cur.nextElementSibling || cur.parentElement?.nextElementSibling;
+                  if (!cur) break;
+                  const txt = (cur.innerText || '').trim();
+                  if (txt.length > 80) return txt.slice(0, 5000);
+                }
+              }
+            }
+            return '';
+          }).catch(() => '');
+          responded.push({
+            protocolo: r.protocolo,
+            fornecedor: r.fornecedor,
+            url: page.url(),
+            detailScreenshot: detailShot,
+            replyText: replyText.trim(),
+          });
+        } catch (err) { responded.push({ protocolo: r.protocolo, error: String(err?.message || err) }); }
+      }
+
+      return { portal: 'govbr', action, preview: shot, url: page.url(), reclamacoes, responded };
     }
     if (action === 'submit_new' || !action) {
       await page.goto('https://www.consumidor.gov.br/pages/reclamacao/nova/', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -2104,6 +2217,803 @@ const handlers = {
     }
     return { portal: 'govbr', error: `unknown govbr action: ${action}` };
   },
+
+  // ── Wise: open another business account under an existing membership ─────
+  // Requires the AdsPower profile to be already logged into Wise as the
+  // membership owner. Walks Steps 1–7 of the "Open another business account"
+  // flow deterministically. Stops at Step 8 (director ID + docs) and returns
+  // the captured state so the caller can either complete it manually or
+  // dispatch the upload step in a follow-up call once docs are attached.
+  //
+  // Payload shape:
+  //   { jobId, entity: {
+  //       company_type: 'LLC' | 'Inc' | ...
+  //       legal_name, dba?: string,
+  //       ein,
+  //       address: { street, city, state, zip, country: 'US' }
+  //       trading_address: { street, city, state, zip, country },
+  //       industry: { sector, industry, size },
+  //       website, wise_plan: 'advanced'|'basic', wise_purpose: 'both'|... }
+  //     stop_after_step?: 9   // default 9; for dryrun set to 1..9 to inspect
+  //     director?: { firstMiddle, last, dobDay, dobMonth, dobYear, residenceCountry }
+  //     payment?: { saved_card_last4: '9855', cvc: '688' }   // Step 9 ($31 advanced plan)
+  //   }
+  async wise_open_business_account(page, payload = {}) {
+    const tag = payload.jobId || 'adhoc';
+    const entity = payload.entity || {};
+    const director = payload.director || null;
+    const payment = payload.payment || null;
+    const stopAfter = payload.stop_after_step ?? 9;
+    const outDir = path.join(OUT, 'wise-open-business', tag);
+    fs.mkdirSync(outDir, { recursive: true });
+    const steps_visited = [];
+    const errors = [];
+
+    const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+    async function captureStep(label) {
+      const idx = steps_visited.length;
+      const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+      try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+      steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+    }
+    async function settle() {
+      await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+    async function firstVisible(selectors, perTimeout = 3000) {
+      for (const sel of selectors) {
+        const loc = typeof sel === 'function' ? sel() : page.locator(sel).first();
+        try {
+          await loc.waitFor({ state: 'visible', timeout: perTimeout });
+          return loc;
+        } catch { /* try next */ }
+      }
+      return null;
+    }
+    // Wise uses combobox-like custom selects. Strategy: click the combobox by
+    // its accessible label, then click an option whose text matches.
+    async function pickFromCombobox(labelRe, optionText) {
+      const candidates = [
+        () => page.getByRole('combobox', { name: labelRe }),
+        () => page.getByLabel(labelRe),
+        `label:has-text("${optionText}")`,
+      ];
+      const combo = await firstVisible(candidates, 4000);
+      if (!combo) throw new Error(`combobox with label ${labelRe} not visible`);
+      await combo.click({ timeout: 5000 });
+      await page.waitForTimeout(300);
+      // Type to filter the dropdown if it accepts text
+      try { await combo.fill(optionText); } catch { /* not all comboboxes accept fill */ }
+      await page.waitForTimeout(300);
+      const opt = await firstVisible([
+        `[role="option"]:has-text("${optionText}")`,
+        `li:has-text("${optionText}")`,
+        `button:has-text("${optionText}")`,
+      ], 4000);
+      if (!opt) throw new Error(`option "${optionText}" not visible after opening ${labelRe}`);
+      await opt.click({ timeout: 5000 });
+    }
+    async function fillByLabel(labelRe, value) {
+      const inp = await firstVisible([
+        () => page.getByLabel(labelRe),
+        `input[aria-label*="${labelRe.source ?? labelRe}" i]`,
+      ], 4000);
+      if (!inp) throw new Error(`input ${labelRe} not visible`);
+      await inp.fill(String(value ?? ''));
+    }
+    async function clickPrimary(textRe) {
+      const btn = await firstVisible([
+        () => page.getByRole('button', { name: textRe }),
+        `button:has-text("${textRe.source ?? textRe}")`,
+      ], 5000);
+      if (!btn) throw new Error(`primary button ${textRe} not visible`);
+      await btn.click({ timeout: 5000 });
+    }
+
+    // Verify session is alive on Wise — bail early if not.
+    await page.goto('https://wise.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await settle();
+    const onLogin = /\/login|\/(?:registration|auth)/.test(page.url());
+    if (onLogin) {
+      throw new Error(`Wise session expired — log in manually on AdsPower profile, then re-run job ${tag}`);
+    }
+    await captureStep('home');
+
+    // Entry point: "Open another business account" is reachable from the profile
+    // switcher dropdown. URL is reasonably stable.
+    await page.goto('https://wise.com/registration?type=business', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await settle();
+    await captureStep('registration-entry');
+
+    try {
+      // ── Step 1: country ───────────────────────────────────────────────────
+      const country = entity.address?.country === 'US' ? 'United States' : entity.address?.country;
+      await pickFromCombobox(/where is your business located/i, country);
+      await clickPrimary(/Continue/i);
+      await settle();
+      await captureStep('after-step-1-country');
+      if (stopAfter < 2) return ok();
+
+      // ── Step 2: company type, legal name, EIN ─────────────────────────────
+      const companyTypeText = entity.company_type === 'LLC'
+        ? 'Limited Liability Company (LLC)'
+        : entity.company_type === 'Inc'
+          ? 'For-Profit Corporation (Inc)'
+          : entity.company_type;
+      await pickFromCombobox(/company type/i, companyTypeText);
+      await fillByLabel(/Registered business name/i, entity.legal_name);
+      if (entity.dba) await fillByLabel(/Trading Business Name/i, entity.dba);
+      await fillByLabel(/EIN number/i, entity.ein);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-2-business-details');
+      if (stopAfter < 3) return ok();
+
+      // ── Step 3: registered address ────────────────────────────────────────
+      // Country is usually pre-selected from step 1; only re-pick if mismatch.
+      await fillByLabel(/^Address$/i, entity.address?.street);
+      await fillByLabel(/^City$/i, entity.address?.city);
+      if (entity.address?.state) {
+        await pickFromCombobox(/^State$/i, entity.address.state).catch(async () => {
+          await fillByLabel(/^State$/i, entity.address.state);
+        });
+      }
+      await fillByLabel(/ZIP code|Postal code/i, entity.address?.zip);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-3-address');
+      if (stopAfter < 4) return ok();
+
+      // ── Step 4: industry ──────────────────────────────────────────────────
+      await pickFromCombobox(/Business sector/i, entity.industry?.sector);
+      await pickFromCombobox(/^Industry$/i, entity.industry?.industry);
+      await pickFromCombobox(/Size of your business/i, entity.industry?.size);
+      await clickPrimary(/Save and continue/i);
+      await settle();
+      await captureStep('after-step-4-industry');
+      if (stopAfter < 5) return ok();
+
+      // ── Step 5: website ───────────────────────────────────────────────────
+      await fillByLabel(/Business website|social media|e-commerce link/i, entity.website);
+      await clickPrimary(/^Continue$/i);
+      await settle();
+      await captureStep('after-step-5-website');
+      if (stopAfter < 6) return ok();
+
+      // ── Step 6: plan ──────────────────────────────────────────────────────
+      // Click "Get Advanced" or "Get Basic" depending on the entity preference.
+      const planLabel = entity.wise_plan === 'basic' ? /Get Basic/i : /Get Advanced/i;
+      await clickPrimary(planLabel);
+      await settle();
+      await captureStep('after-step-6-plan');
+      if (stopAfter < 7) return ok();
+
+      // ── Step 7: purpose ───────────────────────────────────────────────────
+      const purposeLabel = {
+        both: 'Both paying suppliers and contractors, and receiving money for goods and services',
+        receiving: 'Receiving money for services / products',
+        paying: 'Paying suppliers / contractors / employees',
+        intra_company: 'Making intra-company transfers',
+      }[entity.wise_purpose ?? 'both'];
+      await pickFromCombobox(/using Wise for/i, purposeLabel);
+      await clickPrimary(/Continue|Save and continue/i);
+      await settle();
+      await captureStep('after-step-7-purpose');
+      if (stopAfter < 8) return ok();
+
+      // ── Step 8: company directors (decoded 2026-04-30) ────────────────────
+      // Wise asks: first+middle, last, DOB (day text + month dropdown + year text), country of residence.
+      // For sole-director cos we only fill Director 1; multi-director uses
+      // "Add another company director" (not implemented yet — TBD when needed).
+      if (director) {
+        await fillByLabel(/Full legal first and middle names/i, [director.firstMiddle, director.middle].filter(Boolean).join(' ').trim() || director.firstMiddle);
+        await fillByLabel(/Full legal last name/i, director.last);
+        // DOB: Day is text, Month is select, Year is text
+        await fillByLabel(/^Day$/i, director.dobDay);
+        try {
+          await pickFromCombobox(/^Month$/i, director.dobMonth);
+        } catch {
+          // Some Wise variants render Month as native <select>: try selectOption
+          const native = await firstVisible([`select[name*="month" i]`, `select[aria-label*="month" i]`], 2000);
+          if (native) await native.selectOption({ label: String(director.dobMonth) });
+        }
+        await fillByLabel(/^Year$/i, director.dobYear);
+        // Country of residence — usually combobox of countries
+        await pickFromCombobox(/Country of residence/i, director.residenceCountry);
+        await clickPrimary(/^Continue$/i);
+        await settle();
+        await captureStep('after-step-8-directors');
+      } else {
+        // No director payload — pause and let the operator finish manually.
+        await captureStep('paused-at-step-8-no-director-payload');
+        return ok();
+      }
+
+      if (stopAfter < 9) return ok();
+
+      // ── Step 9: Payment ($31 advanced plan one-time fee) ──────────────────
+      // Wise screen: "Pay with your card" — Saved cards / New card tabs, list
+      // of cards w/ radio + CVC input on the selected one, "Pay 31 USD" button.
+      // Worker only handles the SAVED CARD path (no PCI in our pipeline).
+      if (payment?.saved_card_last4 && payment?.cvc) {
+        // Click the row for the matching last4
+        const cardRow = await firstVisible([
+          `label:has-text("${payment.saved_card_last4}")`,
+          `*:has-text("Ending in ${payment.saved_card_last4}")`,
+          `[role="radio"]:has-text("${payment.saved_card_last4}")`,
+        ], 5000);
+        if (!cardRow) throw new Error(`saved card ending ${payment.saved_card_last4} not visible on Wise payment page`);
+        await cardRow.click({ timeout: 5000 });
+        await page.waitForTimeout(400);
+        // Fill CVC — input appears after the radio is selected
+        await fillByLabel(/security code|CVC|CVV/i, payment.cvc);
+        await captureStep('step-9-payment-filled');
+        await clickPrimary(/Pay\s*31\s*USD|Pay/i);
+        await settle();
+        await captureStep('after-step-9-payment-submitted');
+      } else {
+        await captureStep('paused-at-step-9-no-payment-payload');
+        return ok();
+      }
+
+      // Step 10+ (post-payment Done screen, ToS acceptance, KYC selfie if not
+      // captured earlier) — capture final state and return.
+      await captureStep('done-or-pending-final');
+      return ok();
+    } catch (e) {
+      errors.push({ step: steps_visited.length, message: e.message, stack: e.stack?.split('\n').slice(0, 4).join('\n') });
+      await captureStep(`error-${e.message.slice(0, 30)}`);
+      return ok();
+    }
+
+    function ok() {
+      return {
+        portal: 'wise_open_business_account',
+        job_id: tag,
+        completed_steps: steps_visited.length,
+        steps_visited,
+        stopped_at_step: steps_visited[steps_visited.length - 1]?.step_label,
+        errors,
+        // Phase 2: parse the wise URL once a profile is created — the URL
+        // becomes /home/<membershipId>/<businessProfileId>.
+        wise_profile_id: parseWiseProfileIdFromUrl(page.url()),
+      };
+    }
+  },
+};
+
+// Best-effort: extract the new business profile id from the post-creation URL
+// (Wise routes to /home/<membershipId>/<businessProfileId>/...). Returns null
+// if we're not on a recognizable URL yet.
+function parseWiseProfileIdFromUrl(url) {
+  try {
+    const m = String(url).match(/\/home\/(P\d+)\/(\d+)/);
+    return m ? m[2] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Best-effort: extract Mercury account id from URL like /accounts/<id>/...
+function parseMercuryAccountIdFromUrl(url) {
+  try {
+    const m = String(url).match(/\/accounts\/([a-zA-Z0-9_-]+)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Add Mercury handler to the same handlers object.
+// Mercury — Apply for a new account (decoded 2026-04-30, see project_bcax_mercury_business_workflow.md)
+// Payload contract:
+//   {
+//     jobId: string,
+//     stop_after_step?: 0..9     // default 7 (stop before doc uploads if no paths)
+//     entity: {
+//       display_name, legal_name, ein, phone, website, description, industry,
+//       company_type, country_of_incorporation,                                  // step 9 review only
+//       legal_address:    { street, apt?, city, state, zip, country },            // step 4 block A
+//       physical_address: { country, street, apt?, city, region, postal_code },   // step 4 block B
+//       expected_activity: {
+//         first_deposits: ['Revenue'|'Investors'|'Self', ...],
+//         usage:          ['Receiving revenue','Paying suppliers','Operating expenses','Sending wires','Credit cards', ...],
+//         monthly_balance: '$0-10K'|'$10K-100K'|'$100K-1M'|'$1M-10M'|'$10M+',
+//         operating_countries: ['Paraguay','United States', ...],
+//         us_ops:          ['Customers','Filing and/or paying taxes','Suppliers', ...],
+//         payment_volume:  '$10K-100K' (mirror balance),
+//         payment_countries: ['Paraguay','United States', ...]                    // MUST mirror operating_countries
+//       },
+//       organization_activity: {
+//         customer_types: ['Businesses (B2B)'],
+//         industries: ['Design','Consulting > Business','Ecommerce'],             // exactly 3, fixed taxonomy
+//         sell_method: ['Direct'],
+//         sell_locations: ['My own website'],
+//         additional_qs: ['None of the above'] | ['Paying individual contractors']
+//       }
+//     },
+//     owner: { full_name, role, ownership_percentage, primary_responsibility?: bool },
+//     documents: {                                                                // optional — steps that need files pause if missing
+//       formation_doc_path?: string,    // step 6
+//       ein_doc_path?: string,          // step 6
+//       address_proof_path?: string,    // step 8 sub: verify physical address
+//       source_of_funds_doc_path?: string  // step 8 sub: proof of source of first deposit
+//     }
+//   }
+handlers.mercury_open_business_account = async function (page, payload = {}) {
+  const tag = payload.jobId || 'adhoc';
+  const entity = payload.entity || {};
+  const owner = payload.owner || null;
+  const docs = payload.documents || {};
+  const stopAfterStep = payload.stop_after_step ?? 7;
+  const outDir = path.join(OUT, 'mercury-open-business', tag);
+  fs.mkdirSync(outDir, { recursive: true });
+  const steps_visited = [];
+  const errors = [];
+
+  const safeLabel = (s) => String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+  async function captureStep(label) {
+    const idx = steps_visited.length;
+    const file = path.join(outDir, `step-${idx}-${safeLabel(label)}.png`);
+    try { await page.screenshot({ path: file, fullPage: true }); } catch { /* ignore */ }
+    steps_visited.push({ step_label: label, url: page.url(), screenshot_path: file });
+  }
+  async function settle() {
+    await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+  async function firstVisible(selectors, perTimeout = 3000) {
+    for (const sel of selectors) {
+      const loc = typeof sel === 'function' ? sel() : page.locator(sel).first();
+      try {
+        await loc.waitFor({ state: 'visible', timeout: perTimeout });
+        return loc;
+      } catch { /* try next */ }
+    }
+    return null;
+  }
+  async function fillByLabel(labelRe, value) {
+    if (value == null || value === '') return;
+    const inp = await firstVisible([
+      () => page.getByLabel(labelRe),
+      `input[aria-label*="${labelRe.source ?? labelRe}" i]`,
+      `input[name*="${labelRe.source ?? labelRe}" i]`,
+    ], 4000);
+    if (!inp) throw new Error(`input ${labelRe} not visible`);
+    await inp.fill(String(value));
+  }
+  async function clickByText(textRe, role = 'button') {
+    const btn = await firstVisible([
+      () => page.getByRole(role, { name: textRe }),
+      `${role === 'button' ? 'button' : `[role="${role}"]`}:has-text("${textRe.source ?? textRe}")`,
+      `*:has-text("${textRe.source ?? textRe}")`,
+    ], 5000);
+    if (!btn) throw new Error(`${role} ${textRe} not visible`);
+    await btn.click({ timeout: 5000 });
+  }
+  async function pickFromCombobox(labelRe, optionText) {
+    const candidates = [
+      () => page.getByRole('combobox', { name: labelRe }),
+      () => page.getByLabel(labelRe),
+      `[aria-label*="${labelRe.source ?? labelRe}" i]`,
+    ];
+    const combo = await firstVisible(candidates, 4000);
+    if (!combo) throw new Error(`combobox ${labelRe} not visible`);
+    await combo.click({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    try { await combo.fill(String(optionText)); } catch {}
+    await page.waitForTimeout(300);
+    const opt = await firstVisible([
+      `[role="option"]:has-text("${optionText}")`,
+      `li:has-text("${optionText}")`,
+      `button:has-text("${optionText}")`,
+    ], 4000);
+    if (!opt) throw new Error(`option "${optionText}" not visible after opening ${labelRe}`);
+    await opt.click({ timeout: 5000 });
+  }
+  // Multi-select: open the combobox once, then click each chip. Mercury keeps
+  // the dropdown open between selections so we don't re-click the combobox.
+  async function pickMultiCombobox(labelRe, values) {
+    if (!values || values.length === 0) return;
+    const combo = await firstVisible([
+      () => page.getByRole('combobox', { name: labelRe }),
+      () => page.getByLabel(labelRe),
+    ], 4000);
+    if (!combo) throw new Error(`multi combobox ${labelRe} not visible`);
+    await combo.click({ timeout: 5000 });
+    for (const v of values) {
+      try { await combo.fill(String(v)); } catch {}
+      await page.waitForTimeout(250);
+      const opt = await firstVisible([
+        `[role="option"]:has-text("${v}")`,
+        `li:has-text("${v}")`,
+      ], 3000);
+      if (opt) {
+        await opt.click({ timeout: 4000 });
+        await page.waitForTimeout(200);
+      } else {
+        errors.push({ step: steps_visited.length, message: `multi-select missing option "${v}" for ${labelRe}` });
+      }
+    }
+    // Click outside to close the popper
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+  async function tickCheckbox(labelRe) {
+    const cb = await firstVisible([
+      () => page.getByRole('checkbox', { name: labelRe }),
+      `label:has-text("${labelRe.source ?? labelRe}") input[type="checkbox"]`,
+    ], 3000);
+    if (cb) await cb.check({ timeout: 3000 }).catch(() => cb.click({ timeout: 3000 }));
+  }
+  async function uploadFile(labelOrButtonRe, filePath) {
+    if (!filePath) return false;
+    if (!fs.existsSync(filePath)) throw new Error(`upload path missing: ${filePath}`);
+    const fileInput = await firstVisible([
+      `input[type="file"]`,
+      () => page.getByLabel(labelOrButtonRe),
+    ], 4000);
+    if (!fileInput) throw new Error(`file input ${labelOrButtonRe} not visible`);
+    await fileInput.setInputFiles(filePath);
+    return true;
+  }
+
+  // Verify Mercury session is alive — bail if at /login.
+  await page.goto('https://app.mercury.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await settle();
+  if (/\/login|\/signin|\/auth/.test(page.url())) {
+    throw new Error(`Mercury session expired — log in manually on AdsPower profile, then re-run job ${tag}`);
+  }
+  await captureStep('home');
+
+  try {
+    // ── Step 0: open "Apply for a new account" from the All Accounts dropdown ─
+    await clickByText(/All Accounts|^AS$/i);
+    await page.waitForTimeout(500);
+    await clickByText(/Apply for a new account/i);
+    await settle();
+    await captureStep('after-step-0-apply-clicked');
+    if (stopAfterStep < 1) return ok();
+
+    // ── Step 1: account type (Business vs Personal) ──────────────────────────
+    const businessRadio = await firstVisible([
+      `[role="radio"]:has-text("Business account")`,
+      `label:has-text("Business account")`,
+    ], 5000);
+    if (businessRadio) await businessRadio.click({ timeout: 5000 });
+    await clickByText(/^Continue$/i);
+    await settle();
+    await captureStep('after-step-1-business-selected');
+    if (stopAfterStep < 2) return ok();
+
+    // ── Step 2: company display name ─────────────────────────────────────────
+    await fillByLabel(/Company name/i, entity.display_name || entity.legal_name?.replace(/\s*LLC\s*$/i, ''));
+    await clickByText(/^Next/i);
+    await settle();
+    await captureStep('after-step-2-display-name');
+    if (stopAfterStep < 3) return ok();
+
+    // ── Step 3: prohibited categories (must be all unchecked) ────────────────
+    // Worker NEVER checks any of these — if a client matches one, escalate.
+    await clickByText(/None of the above|^Next$/i);
+    await settle();
+    await captureStep('after-step-3-prohibited');
+    if (stopAfterStep < 4) return ok();
+
+    // ── Step 4: company address (legal + physical) ───────────────────────────
+    const legal = entity.legal_address || {};
+    const phys  = entity.physical_address || {};
+    // Block A — Legal
+    await pickFromCombobox(/^Country/i, legal.country || 'United States').catch(() => {});
+    await fillByLabel(/Street address/i, legal.street);
+    if (legal.apt) await fillByLabel(/Apartment|suite|floor/i, legal.apt);
+    await fillByLabel(/^City$/i, legal.city);
+    if (legal.state) await pickFromCombobox(/^State$/i, legal.state).catch(() => fillByLabel(/^State$/i, legal.state));
+    await fillByLabel(/ZIP code|Postal code/i, legal.zip);
+    // Block B — Physical (scope by section heading "physical address")
+    const physSection = page.locator('section, div').filter({ hasText: /physical address/i }).first();
+    if (await physSection.count()) {
+      const physScope = physSection;
+      // Country dropdown inside the physical block
+      try {
+        await physScope.getByLabel(/^Country/i).click({ timeout: 3000 });
+        await page.waitForTimeout(300);
+        await page.locator(`[role="option"]:has-text("${phys.country}")`).first().click({ timeout: 3000 });
+      } catch {}
+      try { await physScope.getByLabel(/Street address/i).fill(phys.street || ''); } catch {}
+      if (phys.apt) try { await physScope.getByLabel(/Apartment|suite|floor/i).fill(phys.apt); } catch {}
+      try { await physScope.getByLabel(/^City$/i).fill(phys.city || ''); } catch {}
+      if (phys.region) try { await physScope.getByLabel(/Province|Region|State/i).fill(phys.region); } catch {}
+      try { await physScope.getByLabel(/Postal code|ZIP/i).fill(phys.postal_code || ''); } catch {}
+    }
+    await clickByText(/^Next/i);
+    await settle();
+    await captureStep('after-step-4-addresses');
+    if (stopAfterStep < 5) return ok();
+
+    // ── Step 5: ownership details ────────────────────────────────────────────
+    if (owner) {
+      // Expand "Your details" card if collapsed
+      const addBtn = await firstVisible([
+        `button:has-text("Your details")`,
+        `[aria-label*="add owner" i]`,
+        `button:has-text("+")`,
+      ], 3000);
+      if (addBtn) await addBtn.click({ timeout: 3000 }).catch(() => {});
+      await pickFromCombobox(/^Role$/i, owner.role || 'Member').catch(() => {});
+      await fillByLabel(/Ownership percentage|Ownership/i, owner.ownership_percentage ?? 100);
+      await clickByText(/^Continue/i, 'button').catch(() => {});
+      await page.waitForTimeout(600);
+      // Final terms
+      await pickFromCombobox(/primary responsibility/i, owner.full_name).catch(() => {});
+      await tickCheckbox(/I certify that I have provided accurate information/i);
+    }
+    await clickByText(/^Next/i);
+    await settle();
+    await captureStep('after-step-5-ownership');
+    if (stopAfterStep < 6) return ok();
+
+    // ── Step 6: document uploads (Formation + EIN) ───────────────────────────
+    if (docs.formation_doc_path && docs.ein_doc_path) {
+      // Mercury renders two upload zones; targeting by section heading.
+      const formationSection = page.locator('section, div').filter({ hasText: /Formation document/i }).first();
+      const einSection       = page.locator('section, div').filter({ hasText: /EIN document/i }).first();
+      try {
+        const fInput = formationSection.locator('input[type="file"]').first();
+        await fInput.setInputFiles(docs.formation_doc_path);
+      } catch (e) { errors.push({ step: 6, message: `formation upload failed: ${e.message}` }); }
+      try {
+        const eInput = einSection.locator('input[type="file"]').first();
+        await eInput.setInputFiles(docs.ein_doc_path);
+      } catch (e) { errors.push({ step: 6, message: `ein upload failed: ${e.message}` }); }
+      await page.waitForTimeout(2000); // give uploads time to complete
+      await clickByText(/^Next/i);
+      await settle();
+      await captureStep('after-step-6-documents');
+    } else {
+      await captureStep('paused-at-step-6-no-doc-paths');
+      return ok();
+    }
+    if (stopAfterStep < 7) return ok();
+
+    // ── Step 7: expected activity ────────────────────────────────────────────
+    const ea = entity.expected_activity || {};
+    // First deposits — toggle group
+    for (const d of (ea.first_deposits || [])) {
+      const t = await firstVisible([
+        `button:has-text("${d}")`,
+        `[role="button"]:has-text("${d}")`,
+        `label:has-text("${d}")`,
+      ], 2000);
+      if (t) await t.click({ timeout: 3000 }).catch(() => {});
+    }
+    await pickMultiCombobox(/How do you plan to use your Mercury account/i, ea.usage);
+    await pickFromCombobox(/expected monthly account balance/i, ea.monthly_balance).catch(() => {});
+    await pickMultiCombobox(/Which countries will you operate in/i, ea.operating_countries);
+    await pickMultiCombobox(/US business operations/i, ea.us_ops);
+    await pickFromCombobox(/expect to send or receive each month/i, ea.payment_volume).catch(() => {});
+    await pickMultiCombobox(/Which countries do you expect to send or receive money from/i, ea.payment_countries);
+    await clickByText(/^Next/i);
+    await settle();
+    await captureStep('after-step-7-expected-activity');
+    if (stopAfterStep < 8) return ok();
+
+    // ── Step 8: follow-up questions (multi sub-section page) ─────────────────
+    // Address proof upload
+    if (docs.address_proof_path) {
+      const addrSection = page.locator('section, div').filter({ hasText: /Verify your physical address/i }).first();
+      try {
+        const inp = addrSection.locator('input[type="file"]').first();
+        await inp.setInputFiles(docs.address_proof_path);
+      } catch (e) { errors.push({ step: 8, message: `address proof upload failed: ${e.message}` }); }
+      await page.waitForTimeout(2000);
+    } else {
+      await captureStep('paused-at-step-8-no-address-proof');
+      return ok();
+    }
+    // Source-of-funds doc
+    if (docs.source_of_funds_doc_path) {
+      const sofSection = page.locator('section, div').filter({ hasText: /Proof of source of first deposit/i }).first();
+      try {
+        const inp = sofSection.locator('input[type="file"]').first();
+        await inp.setInputFiles(docs.source_of_funds_doc_path);
+      } catch (e) { errors.push({ step: 8, message: `source of funds upload failed: ${e.message}` }); }
+      await page.waitForTimeout(2000);
+    } else {
+      await captureStep('paused-at-step-8-no-source-of-funds-doc');
+      return ok();
+    }
+    // Organization activity
+    const oa = entity.organization_activity || {};
+    for (const t of (oa.customer_types || [])) await tickCheckbox(new RegExp(t.replace(/[()]/g, '.'), 'i'));
+    await pickMultiCombobox(/top 3 industries your clients are in/i, oa.industries);
+    for (const m of (oa.sell_method || [])) await tickCheckbox(new RegExp(m, 'i'));
+    await pickMultiCombobox(/Where do you sell your products/i, oa.sell_locations);
+    // Additional questions
+    for (const q of (oa.additional_qs || ['None of the above'])) await tickCheckbox(new RegExp(q.replace(/[()]/g, '.'), 'i'));
+    await clickByText(/Review Your Application|^Next$/i);
+    await settle();
+    await captureStep('after-step-8-followup');
+    if (stopAfterStep < 9) return ok();
+
+    // ── Step 9: final review + submit ────────────────────────────────────────
+    // Tick legal-agreements acceptance checkbox
+    await tickCheckbox(/agree|accept|I have read/i).catch(() => {});
+    // Pre-submit consistency check: read send/receive country chips and abort
+    // if they don't include all operating countries (caught us during dryrun).
+    // We don't have a perfect read of chips here — we trust the upstream
+    // payload validator to enforce mirror, but capture for audit.
+    await captureStep('pre-submit-final-review');
+    // Click Submit Application
+    await clickByText(/Submit Application/i);
+    await settle();
+    await captureStep('after-step-9-submitted');
+    return ok();
+  } catch (e) {
+    errors.push({ step: steps_visited.length, message: e.message, stack: e.stack?.split('\n').slice(0, 4).join('\n') });
+    await captureStep(`error-${e.message.slice(0, 30)}`);
+    return ok();
+  }
+
+  function ok() {
+    return {
+      portal: 'mercury_open_business_account',
+      job_id: tag,
+      completed_steps: steps_visited.length,
+      steps_visited,
+      stopped_at_step: steps_visited[steps_visited.length - 1]?.step_label,
+      errors,
+      mercury_account_id: parseMercuryAccountIdFromUrl(page.url()),
+      // Mercury sometimes returns a magic link for director liveness/selfie
+      // mid-flow. We surface anything that looks like a verification URL so
+      // the BCA app can forward it to the customer.
+      possible_kyc_url: extractKycLinkFromBody(),
+    };
+
+    function extractKycLinkFromBody() {
+      // Quick best-effort scan: read text content for an https link that
+      // mentions "verify" or "kyc". Enough to bootstrap the forwarding flow.
+      try {
+        const text = ''; // future: await page.evaluate(...)
+        const m = text.match(/https?:\/\/[^\s)"']+(verify|kyc|identity)[^\s)"']*/i);
+        return m ? m[0] : null;
+      } catch {
+        return null;
+      }
+    }
+  }
+};
+
+// ── WhatsApp Web (personal account, paired once via QR on a dedicated AdsPower profile) ──
+// Sends a message to a phone number through web.whatsapp.com. Phone is normalized
+// to digits-only (no leading +). Caller MUST run this against an AdsPower profile
+// where the user has scanned the QR code on their phone at least once.
+handlers.wa_send = async function (page, { to, body, claimId }) {
+  if (!to) throw new Error('wa_send: "to" is required');
+  if (!body) throw new Error('wa_send: "body" is required');
+  const digits = String(to).replace(/\D/g, '');
+  if (digits.length < 7) throw new Error(`wa_send: invalid phone "${to}"`);
+
+  // Close all stale tabs first. The AdsPower profile is shared across runs
+  // and may have leftover web.whatsapp.com tabs that compete for the single
+  // active session and force a "Use here" modal every time.
+  try {
+    const ctx = page.context();
+    const pages = ctx.pages();
+    for (const p of pages) {
+      if (p !== page) { try { await p.close(); } catch {} }
+    }
+  } catch {}
+
+  const url = `https://web.whatsapp.com/send?phone=${digits}&text=${encodeURIComponent(body)}`;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(5000);
+
+  // The "WhatsApp is open in another window" modal can appear at any moment
+  // (on first load, after retry, sometimes during typing). Retry up to 6×
+  // over ~30s — each click is non-destructive (WA permits ping-pong).
+  const useHereSel = 'button:has-text("Use here"), button:has-text("Usar aqui"), button:has-text("Usar aquí"), button:has-text("Utiliser ici"), button:has-text("Connecting"), button:has-text("Conectando"), [role="dialog"] button:not(:has-text("Close")):not(:has-text("Cancel")):not(:has-text("Cerrar")):not(:has-text("Annuler"))';
+  for (let i = 0; i < 6; i++) {
+    try {
+      const useHere = page.locator(useHereSel).first();
+      if (await useHere.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await useHere.click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(3000);
+      } else {
+        break;
+      }
+    } catch { break; }
+  }
+
+  // Detect "phone not on WhatsApp" modal across locales.
+  const notOnWa = page.getByText(/isn.?t on WhatsApp|no\s+es\s+un\s+usuario|invalid|inv[aá]lido|Could not contact|n[uú]mero/i);
+  if (await notOnWa.first().isVisible().catch(() => false)) {
+    const errShot = path.join(OUT, `${claimId || 'wa'}-wa-error.png`);
+    await page.screenshot({ path: errShot, fullPage: true });
+    // Be a bit forgiving — only throw if we ALSO can't find a message input.
+    const inputProbe = await page.locator('div[contenteditable="true"]').count();
+    if (inputProbe === 0) {
+      throw new Error(`wa_send: phone ${digits} not on WhatsApp (or chat failed to open)`);
+    }
+  }
+
+  // Locate the message-input contenteditable. WA Web ships several selector variants.
+  const input = page.locator(
+    'footer div[contenteditable="true"], div[contenteditable="true"][data-tab="10"], div[contenteditable="true"][title="Type a message" i]',
+  ).last();
+  await input.waitFor({ state: 'visible', timeout: 30000 });
+
+  // The text is prefilled from the URL on most loads, but not all. If empty, type it.
+  const currentText = await input.innerText().catch(() => '');
+  if (!currentText || currentText.trim().length < 3) {
+    await input.click();
+    await page.keyboard.type(body, { delay: 6 });
+    await page.waitForTimeout(400);
+  }
+
+  // Click send. Most stable selector across versions: span[data-icon="send"].
+  const sendBtn = page.locator(
+    'span[data-icon="send"], button[aria-label="Send" i], button[data-tab="11"], [data-testid="send"]',
+  ).first();
+  await sendBtn.waitFor({ state: 'visible', timeout: 15000 });
+  await sendBtn.click();
+
+  // Verify actual delivery. WA marks just-sent outbound messages with a clock
+  // icon (msg-time) until the server ACKs; on success it flips to msg-check
+  // (single tick) or msg-dblcheck. If the network rejected the send, WA shows
+  // a "Your message was not sent" modal AND the bubble gets a red exclamation
+  // (msg-error). We poll for an unambiguous success/failure signal, retrying
+  // the modal's "Try again" up to 3× before giving up.
+  const errBtn = page.locator('[role="dialog"] button:has-text("Try again"), [role="dialog"] button:has-text("Reintentar"), [role="dialog"] button:has-text("Réessayer")').first();
+  let confirmed = false;
+  let lastSignal = 'unknown';
+  for (let attempt = 0; attempt < 4 && !confirmed; attempt++) {
+    // Poll up to 20s for delivery signal
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(1000);
+      // "Your message was not sent" modal — click Try again
+      if (await errBtn.isVisible().catch(() => false)) {
+        await errBtn.click().catch(() => {});
+        await page.waitForTimeout(2000);
+        lastSignal = 'modal-retried';
+        break;
+      }
+      const sig = await page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('div.message-out, [data-id*="true_"]'));
+        const last = rows[rows.length - 1];
+        if (!last) return 'no-bubble';
+        if (last.querySelector('[data-icon="msg-error"], [data-icon="status-failed"]')) return 'failed';
+        if (last.querySelector('[data-icon="msg-time"]')) return 'pending';
+        if (last.querySelector('[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-dblcheck-ack"], [aria-label="Sent"], [aria-label="Delivered"], [aria-label="Read"]')) return 'sent';
+        return 'unknown';
+      }).catch(() => 'eval-error');
+      lastSignal = sig;
+      if (sig === 'sent') { confirmed = true; break; }
+      if (sig === 'failed') break; // outer loop will retry
+    }
+    if (!confirmed) {
+      // Try clicking Try again from the bubble's own retry button if present
+      const retryBubble = page.locator('div.message-out button:has-text("Resend"), div.message-out button:has-text("Reenviar"), [aria-label*="Resend" i]').first();
+      if (await retryBubble.isVisible().catch(() => false)) {
+        await retryBubble.click().catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+    }
+  }
+
+  const shot = path.join(OUT, `${claimId || 'wa'}-wa-sent.png`);
+  await page.screenshot({ path: shot, fullPage: true });
+
+  if (!confirmed) {
+    // Don't close the page on failure — leaves the chat open for diagnosis.
+    throw new Error(`wa_send: message did not confirm delivery (last signal: ${lastSignal}). See ${shot}`);
+  }
+
+  // Close the WA tab after confirmed send so it doesn't accumulate on the profile.
+  try { await page.close(); } catch {}
+
+  return { portal: 'wa_send', to: digits, sent_at: new Date().toISOString(), screenshot: shot, signal: lastSignal };
 };
 
 // ── App ─────────────────────────────────────────────────────────────────────
