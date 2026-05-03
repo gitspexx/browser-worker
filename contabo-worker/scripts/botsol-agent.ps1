@@ -774,22 +774,32 @@ try {
     #      -> data is still loaded -> need to click Delete first
     #   B. Post-Delete sticky-button quirk -> Botsol's UI keeps Delete/Export enabled
     #      after a successful Delete -> safe to reclassify as IDLE
-    # We can't distinguish A from B cleanly, so the safe behavior is: try Delete first,
-    # confirm via "Confirm Delete!!" Yes/No popup, exit; next tick will see real IDLE.
+    # Strategy: try Delete once and write a marker file with timestamp. If marker exists
+    # and is < 5 min old, assume sticky quirk (case B) and reclassify as IDLE. Marker is
+    # cleared once a new run starts (queue state populated).
+    $deleteMarker = 'C:\worker\botsol-delete-attempted.stamp'
     if ($phase -eq 'DONE' -and (-not $state -or -not $state.current_run_id)) {
-        if ($AUTO_DELETE_CURRENT -and $btnDelete) {
+        $recentDelete = $false
+        if (Test-Path $deleteMarker) {
+            try {
+                $age = (Get-Date) - (Get-Item $deleteMarker).LastWriteTime
+                if ($age.TotalMinutes -lt 5) { $recentDelete = $true }
+            } catch {}
+        }
+        if ($recentDelete) {
+            Write-Log "DONE phase + recent delete marker -> sticky-button quirk; reclassifying as IDLE"
+            $phase = 'IDLE'
+        } elseif ($AUTO_DELETE_CURRENT -and $btnDelete) {
             Write-Log "DONE phase + no active run state + AUTO_DELETE_CURRENT=true -> clicking Delete first to clear stale data"
             if (Invoke-Element $btnDelete) {
-                # Botsol shows a confirm popup ("Confirm Delete!!" or similar #32770) with Yes/No.
-                # If the popup exists, click Yes; if not, the click was a no-op (already deleted).
                 Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 6 | Out-Null
-                Write-Log "Delete clicked + Yes confirmed; exiting tick (next tick will pick clean IDLE)"
+                try { Set-Content -Path $deleteMarker -Value (Get-Date -Format o) -Encoding UTF8 } catch {}
+                Write-Log "Delete clicked + Yes confirmed; marker written; exiting tick"
                 exit 0
             } else {
                 Write-Log "Delete invoke returned false; falling through" 'warn'
             }
-        }
-        if ($AUTO_START_NEXT) {
+        } elseif ($AUTO_START_NEXT) {
             Write-Log "DONE phase + no active run state + AUTO_START_NEXT=true -> reclassifying as IDLE"
             $phase = 'IDLE'
         }
