@@ -581,8 +581,9 @@ function Handle-NumericPrompt {
                         $aid = [string]$k.Current.AutomationId
                         $en  = [bool]$k.Current.IsEnabled
                         # Match any frm* child (frmInput, frmIntInput, frmSelectFile, frmFileInput, ...)
+                        # OR Botsol's actual InputInteger / InputString AIDs (observed live 2026-05-03).
                         # The Edit-presence check below filters out frmBoolInput (no Edit, just Yes/No).
-                        if ($en -and $aid -like 'frm*' -and $aid -ne 'frmBoolInput') {
+                        if ($en -and (($aid -like 'frm*' -and $aid -ne 'frmBoolInput') -or $aid -eq 'InputInteger' -or $aid -eq 'InputString')) {
                             $editCond = New-Object System.Windows.Automation.PropertyCondition(
                                 [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
                                 [System.Windows.Automation.ControlType]::Edit)
@@ -1143,7 +1144,7 @@ try {
             # The bool + numeric prompts are CHILDREN of Botsol's main window, not top-level.
             Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 8 | Out-Null
 
-            if (-not (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 12 -Tag 'prompt1_result_cap')) {
+            if (-not (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 30 -Tag 'prompt1_result_cap')) {
                 Write-Log "first numeric prompt failed (continuing -- file-open may still appear)" 'warn'
                 if ($jobId) {
                     Update-ScrapeJob -Id $jobId -Patch @{ status='failed'; error='prompt1 failed' } | Out-Null
@@ -1151,7 +1152,7 @@ try {
                 Post-Slack ":x: Botsol prompt1 (result cap) failed for $($next.Country)/$($next.Stem)"
                 exit 0
             }
-            if (-not (Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 12 -Tag 'prompt2_keyword_limit')) {
+            if (-not (Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 30 -Tag 'prompt2_keyword_limit')) {
                 Write-Log "second numeric prompt failed (continuing -- file-open may still appear)" 'warn'
                 if ($jobId) {
                     Update-ScrapeJob -Id $jobId -Patch @{ status='failed'; error='prompt2 failed' } | Out-Null
@@ -1203,7 +1204,32 @@ try {
         }
 
         default {
-            Write-Log "AMBIGUOUS button combo (start=$startEn stop=$stopEn export=$exportEn delete=$deleteEn); no action" 'warn'
+            # AMBIGUOUS = main buttons disabled, usually because a child modal is up.
+            # Resume orphaned Start sequences: detect InputInteger / InputString / frmSelectFile
+            # left over from a previous tick that timed out, fill them in, and let next tick
+            # advance the flow. Without this, the agent is stuck forever.
+            $resumed = $false
+            try {
+                $kids = $win.FindAll([System.Windows.Automation.TreeScope]::Children,
+                    [System.Windows.Automation.Condition]::TrueCondition)
+                foreach ($k in $kids) {
+                    try {
+                        $aid = [string]$k.Current.AutomationId
+                        if (-not $k.Current.IsEnabled) { continue }
+                        if ($aid -eq 'InputInteger' -or $aid -eq 'frmInput' -or $aid -eq 'frmIntInput') {
+                            Write-Log "AMBIGUOUS resume: found stuck numeric prompt aid=$aid; filling with $RESULT_CAP" 'warn'
+                            if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 4 -Tag 'resume_numeric') {
+                                Post-Slack ":wrench: botsol-agent resumed orphaned numeric prompt with $RESULT_CAP"
+                                $resumed = $true
+                            }
+                            break
+                        }
+                    } catch {}
+                }
+            } catch {}
+            if (-not $resumed) {
+                Write-Log "AMBIGUOUS button combo (start=$startEn stop=$stopEn export=$exportEn delete=$deleteEn); no action" 'warn'
+            }
             exit 0
         }
     }
