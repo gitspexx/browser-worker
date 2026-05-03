@@ -78,6 +78,16 @@ $AUTO_START_NEXT       = Parse-Bool $cfg['AUTO_START_NEXT'] $false
 $AUTO_DELETE_CURRENT   = Parse-Bool $cfg['AUTO_DELETE_CURRENT'] $false
 $USE_STARTER           = Parse-Bool $cfg['USE_STARTER'] $true
 $USE_PRUNED            = Parse-Bool $cfg['USE_PRUNED'] $true
+
+# ONLY_COUNTRIES = comma-separated allow-list (e.g. "colombia,mexico"). Empty = all.
+# Useful for staged rollout: validate one country end-to-end before unleashing the
+# full alphabetical sweep across ~80 countries.
+$ONLY_COUNTRIES = @()
+if ($cfg['ONLY_COUNTRIES']) {
+    $ONLY_COUNTRIES = ($cfg['ONLY_COUNTRIES'] -split ',') |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ }
+}
 $RESULT_CAP            = if ($cfg['RESULT_CAP'])    { [string]$cfg['RESULT_CAP'] }    else { '100' }
 $KEYWORD_LIMIT         = if ($cfg['KEYWORD_LIMIT']) { [string]$cfg['KEYWORD_LIMIT'] } else { '5' }
 
@@ -206,6 +216,14 @@ function Get-NextQueueItem {
     $countries = Get-ChildItem -LiteralPath $KEYWORDS_ROOT -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notmatch '^[._]' } |
         Sort-Object Name
+
+    if ($ONLY_COUNTRIES.Count -gt 0) {
+        $countries = $countries | Where-Object { $ONLY_COUNTRIES -contains $_.Name.ToLowerInvariant() }
+        if (-not $countries) {
+            Write-Log "ONLY_COUNTRIES=$($ONLY_COUNTRIES -join ',') matched zero country dirs in $KEYWORDS_ROOT" 'warn'
+            return $null
+        }
+    }
 
     foreach ($country in $countries) {
         $doneDir = Join-Path $country.FullName 'done'
@@ -748,12 +766,30 @@ try {
     }
     Write-Log "phase=$phase"
 
-    # Botsol's Export/Delete buttons can stay enabled after Delete Current Data is clicked
-    # (the UI doesn't transition cleanly to a fresh-IDLE state). If we classify as DONE
-    # but have no active queue state to export, AND auto-start is enabled, treat as IDLE.
-    if ($phase -eq 'DONE' -and (-not $state -or -not $state.current_run_id) -and $AUTO_START_NEXT) {
-        Write-Log "DONE phase + no active run state + AUTO_START_NEXT=true -> reclassifying as IDLE (Botsol post-Delete sticky-button quirk)"
-        $phase = 'IDLE'
+    # DONE phase + no active queue state happens in two situations:
+    #   A. Just-finished scrape that was started manually (no queue-state.json populated)
+    #      -> data is still loaded -> need to click Delete first
+    #   B. Post-Delete sticky-button quirk -> Botsol's UI keeps Delete/Export enabled
+    #      after a successful Delete -> safe to reclassify as IDLE
+    # We can't distinguish A from B cleanly, so the safe behavior is: try Delete first,
+    # confirm via "Confirm Delete!!" Yes/No popup, exit; next tick will see real IDLE.
+    if ($phase -eq 'DONE' -and (-not $state -or -not $state.current_run_id)) {
+        if ($AUTO_DELETE_CURRENT -and $btnDelete) {
+            Write-Log "DONE phase + no active run state + AUTO_DELETE_CURRENT=true -> clicking Delete first to clear stale data"
+            if (Invoke-Element $btnDelete) {
+                # Botsol shows a confirm popup ("Confirm Delete!!" or similar #32770) with Yes/No.
+                # If the popup exists, click Yes; if not, the click was a no-op (already deleted).
+                Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 6 | Out-Null
+                Write-Log "Delete clicked + Yes confirmed; exiting tick (next tick will pick clean IDLE)"
+                exit 0
+            } else {
+                Write-Log "Delete invoke returned false; falling through" 'warn'
+            }
+        }
+        if ($AUTO_START_NEXT) {
+            Write-Log "DONE phase + no active run state + AUTO_START_NEXT=true -> reclassifying as IDLE"
+            $phase = 'IDLE'
+        }
     }
 
     switch ($phase) {
