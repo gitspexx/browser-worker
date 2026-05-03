@@ -769,6 +769,35 @@ try {
     }
     Write-Log "phase=$phase"
 
+    # Auto-dismiss any "ERROR! Please contact botsol support" #32770 popup that
+    # leaks from a botched Start/Delete sequence. It's a plain Windows MessageBox
+    # nested in BotForm with text containing 'ERROR' and an OK button.
+    try {
+        $errCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770')
+        $errDialogs = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $errCond)
+        foreach ($d in $errDialogs) {
+            try {
+                $textCond = New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Text)
+                $texts = $d.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond)
+                $isError = $false
+                foreach ($t in $texts) {
+                    try { if ($t.Current.Name -match 'ERROR|contact botsol') { $isError = $true; break } } catch {}
+                }
+                if ($isError) {
+                    $okBtn = Find-DialogButton -Dialog $d -NameMatch '^&?OK$'
+                    if ($okBtn -and (Invoke-Element $okBtn)) {
+                        Write-Log "Auto-dismissed Botsol ERROR popup via OK"
+                        Post-Slack ":warning: Botsol error popup auto-dismissed (will retry on next tick)"
+                        exit 0
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+
     # DONE phase + no active queue state happens in two situations:
     #   A. Just-finished scrape that was started manually (no queue-state.json populated)
     #      -> data is still loaded -> need to click Delete first
