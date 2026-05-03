@@ -515,11 +515,14 @@ function Dismiss-BoolInput {
                 foreach ($k in $kids) {
                     try {
                         $aid = $k.Current.AutomationId
+                        $cls = $k.Current.ClassName
                         $en  = $k.Current.IsEnabled
-                        if ($en -and ($aid -eq 'frmBoolInput' -or $aid -eq 'frmInput' -or $aid -like 'frmBool*')) {
-                            $btn = Find-DialogButton -Dialog $k -NameMatch ('^' + [regex]::Escape($ButtonName) + '$')
+                        # frmBoolInput / frmInput (Botsol's own dialogs) OR #32770 (standard
+                        # Windows MessageBox like "Confirm Delete!!"). Both are children of BotForm.
+                        if ($en -and ($aid -eq 'frmBoolInput' -or $aid -eq 'frmInput' -or $aid -like 'frmBool*' -or $cls -eq '#32770')) {
+                            $btn = Find-DialogButton -Dialog $k -NameMatch ('^&?' + [regex]::Escape($ButtonName) + '$')
                             if ($btn -and (Invoke-Element $btn)) {
-                                Write-Log "BoolInput child dialog (aid=$aid) dismissed via '$ButtonName'"
+                                Write-Log "BoolInput child dialog (aid=$aid class=$cls) dismissed via '$ButtonName'"
                                 return $true
                             }
                         }
