@@ -3463,11 +3463,33 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
     const browser = await chromium.connectOverCDP(start.ws.puppeteer);
     const ctx = browser.contexts()[0] ?? (await browser.newContext());
 
-    // Open each login URL in its own tab.
+    // Force desktop layout in this CDP session — some airline portals (LATAM,
+    // Norwegian) decide mobile vs desktop from UA + viewport. Override both at
+    // the context level so every new page in this session inherits.
+    const DESKTOP_UA =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    try { await ctx.setExtraHTTPHeaders({}); } catch {}
+    // Close any pre-existing tabs from prior /airline/setup runs to avoid
+    // confusion. Keep one fresh page to avoid closing the last context page.
+    const oldPages = ctx.pages();
+    for (let i = 1; i < oldPages.length; i++) {
+      try { await oldPages[i].close(); } catch {}
+    }
+
+    // Open each login URL in its own tab. Override UA + viewport per page.
     const tabsOpened = [];
+    let firstPage = oldPages[0] ?? (await ctx.newPage());
+    let isFirst = true;
     for (const [airline, url] of Object.entries(AIRLINE_LOGIN_URLS)) {
-      const page = await ctx.newPage();
-      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => {});
+      const page = isFirst ? firstPage : await ctx.newPage();
+      isFirst = false;
+      try {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        const cdp = await page.context().newCDPSession(page);
+        await cdp.send('Network.setUserAgentOverride', { userAgent: DESKTOP_UA });
+      } catch {}
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
       tabsOpened.push({ airline, url });
     }
 
