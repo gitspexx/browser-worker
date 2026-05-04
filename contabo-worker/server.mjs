@@ -3016,45 +3016,219 @@ handlers.wa_send = async function (page, { to, body, claimId }) {
   return { portal: 'wa_send', to: digits, sent_at: new Date().toISOString(), screenshot: shot, signal: lastSignal };
 };
 
-// ── airline_balance — delegated balance + activity scrape ───────────────────
-// Spexx Flights calls this when its local headless Playwright is fingerprint-
-// blocked by an airline portal (LATAM, M&M, etc). AdsPower's persistent
-// real-Chrome profile defeats those blocks.
+// ── airline_balance — AdsPower-mounted balance + activity scrape ────────────
+// Spexx Flights calls this with { airline } when its local headless Playwright
+// is fingerprint-walled. The /submit dispatcher mounts an AdsPower profile
+// (cookie persists across runs — log in once via RDP, scrape forever) before
+// invoking the per-airline scraper here.
 //
-// Per-airline scraper functions live in airlineBalanceScrapers below. Each
-// one drives the post-login page already authenticated (the AdsPower profile
-// keeps the session warm) and returns {balance, activity[]}.
+// Profile selection: a single shared profile id lives in env
+// AIRLINE_BALANCE_PROFILE_ID. Operator must (a) set that env var to a
+// dedicated AdsPower profile, (b) RDP in, (c) launch the profile via
+// AdsPower app, (d) log into each airline manually once. Cookies persist
+// inside the profile for subsequent automated scrapes.
 //
-// Until per-airline scrapers ship, this handler responds with status 501
-// ("not_implemented") with the airline key so the caller can record it in
-// scrape_runs and surface a clear error to the user.
-const airlineBalanceScrapers = {
-  // TODO 2026-05-04: implement the 5 fingerprint-blocked airlines using
-  // AdsPower-mounted Chrome. Each is a port of the corresponding scraper in
-  // gitspexx/spexx-flights workers/balance/<airline>.ts but assumes the
-  // profile is already logged in (skip the login flow on first run, log in
-  // manually via RDP once, AdsPower keeps the cookie).
-  //
-  // latam:        async (page) => { ... },
-  // 'miles-more': async (page) => { ... },
-  // norwegian:    async (page) => { ... },
-  // turkish:      async (page) => { ... },
-  // etihad:       async (page) => { ... },
-  // 'flying-blue':async (page) => { ... },
+// If a scraper finds itself on the login page, it throws a clear error
+// telling the operator to re-login via RDP — never tries to login itself
+// with creds (those wouldn't beat the anti-bot anyway).
+
+// Per-airline activity-row classifier. Mirrors workers/balance/<airline>.ts
+// in the flights repo. ActivityType: 'flight_earn' | 'flight_redeem' |
+// 'transfer_in' | 'transfer_out' | 'promo' | 'purchase' | 'adjustment' | 'other'
+const TYPE_MAPS = {
+  'miles-more': [
+    [/flug|flight/i, 'flight_earn'],
+    [/pr[äa]mienflug|award\s*flight/i, 'flight_redeem'],
+    [/transfer\s*ein|transfer\s*in/i, 'transfer_in'],
+    [/transfer\s*aus|transfer\s*out/i, 'transfer_out'],
+    [/promo|bonus/i, 'promo'],
+    [/kauf|purchase/i, 'purchase'],
+    [/anpassung|adjustment/i, 'adjustment'],
+  ],
+  latam: [
+    [/vuelo|flight/i, 'flight_earn'],
+    [/canje|redeem|booking/i, 'flight_redeem'],
+    [/transferencia\s+entrada|transfer\s+in/i, 'transfer_in'],
+    [/transferencia\s+salida|transfer\s+out/i, 'transfer_out'],
+    [/promo|bonus/i, 'promo'],
+    [/compra|purchase/i, 'purchase'],
+    [/ajuste|adjustment/i, 'adjustment'],
+  ],
+  norwegian: [
+    [/flight|reise|trip/i, 'flight_earn'],
+    [/redeem|use\s*points/i, 'flight_redeem'],
+    [/promo|bonus/i, 'promo'],
+    [/transfer.*in/i, 'transfer_in'],
+    [/transfer.*out/i, 'transfer_out'],
+    [/purchase|buy/i, 'purchase'],
+    [/adjustment|correction/i, 'adjustment'],
+  ],
 };
 
-handlers.airline_balance = async (page, { airline, login, password }) => {
+function classifyActivity(airline, raw) {
+  const map = TYPE_MAPS[airline] ?? [];
+  for (const [re, t] of map) if (re.test(raw)) return t;
+  return 'other';
+}
+
+// Generic IATA route extractor — 'XXX-YYY' from free-text descriptions.
+function parseRoute(desc) {
+  if (!desc) return undefined;
+  const arrow = /([A-Z]{3})\s*(?:-|→|to|\/|>)\s*([A-Z]{3})/i.exec(desc);
+  if (arrow) return `${arrow[1].toUpperCase()}-${arrow[2].toUpperCase()}`;
+  const codes = [...desc.matchAll(/\b([A-Z]{3})\b/g)].map((x) => x[1].toUpperCase());
+  if (codes.length >= 2 && codes[0] !== codes[1]) return `${codes[0]}-${codes[1]}`;
+  return undefined;
+}
+
+function extractFlightNumber(desc, iata) {
+  const m = new RegExp(`\\b${iata}\\s*(\\d{1,4})\\b`, 'i').exec(desc);
+  return m ? `${iata}${m[1]}` : undefined;
+}
+
+const DATE_FORMATS_BY_AIRLINE = {
+  'miles-more': ['dd.MM.yyyy', 'd.M.yyyy', 'yyyy-MM-dd'],
+  latam: ['yyyy-MM-dd', 'dd/MM/yyyy', 'd/M/yyyy'],
+  norwegian: ['MMM d, yyyy', 'd MMM yyyy', 'yyyy-MM-dd'],
+};
+
+// Lightweight date parser — no date-fns dep. Handles the formats above.
+function normalizeDate(raw, airline) {
+  if (!raw) return undefined;
+  const trim = raw.trim();
+  const formats = DATE_FORMATS_BY_AIRLINE[airline] ?? [];
+  for (const fmt of formats) {
+    const d = parseDateByFormat(trim, fmt);
+    if (d) return d;
+  }
+  return undefined;
+}
+
+function parseDateByFormat(s, fmt) {
+  // Translate format tokens into a regex with named groups, then assemble ISO.
+  // Supports yyyy, MM, M, dd, d, MMM (Jan…Dec).
+  const months3 = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  let pattern = '';
+  let groups = [];
+  for (let i = 0; i < fmt.length;) {
+    if (fmt.startsWith('yyyy', i)) { pattern += '(?<y>\\d{4})'; groups.push('y'); i += 4; }
+    else if (fmt.startsWith('MMM', i)) { pattern += '(?<mn>[A-Za-z]{3})'; groups.push('mn'); i += 3; }
+    else if (fmt.startsWith('MM', i)) { pattern += '(?<m>\\d{2})'; groups.push('m'); i += 2; }
+    else if (fmt.startsWith('M', i)) { pattern += '(?<m>\\d{1,2})'; groups.push('m'); i += 1; }
+    else if (fmt.startsWith('dd', i)) { pattern += '(?<d>\\d{2})'; groups.push('d'); i += 2; }
+    else if (fmt.startsWith('d', i)) { pattern += '(?<d>\\d{1,2})'; groups.push('d'); i += 1; }
+    else { pattern += fmt[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); i += 1; }
+  }
+  const m = new RegExp(`^${pattern}$`).exec(s);
+  if (!m) return undefined;
+  const y = m.groups.y;
+  let mm = m.groups.m;
+  if (m.groups.mn) {
+    const idx = months3.indexOf(m.groups.mn.toLowerCase());
+    if (idx < 0) return undefined;
+    mm = String(idx + 1).padStart(2, '0');
+  }
+  if (mm && mm.length === 1) mm = '0' + mm;
+  let dd = m.groups.d;
+  if (dd && dd.length === 1) dd = '0' + dd;
+  if (!y || !mm || !dd) return undefined;
+  return `${y}-${mm}-${dd}`;
+}
+
+const airlineBalanceScrapers = {
+  /**
+   * Miles & More via AdsPower. Assumes cookie persists from prior manual login.
+   * If we land on a login page, throw a clear "session expired" error.
+   */
+  'miles-more': async (page) => {
+    const ACCOUNT_URL = 'https://www.miles-and-more.com/online/portal/mam/de/desktop/account/welcome';
+    const ACTIVITY_URL = 'https://www.miles-and-more.com/online/portal/mam/de/desktop/account/statements';
+
+    await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000); // SPA hydration
+
+    if (/login|anmelden/i.test(page.url())) {
+      throw new Error(
+        'miles-more: AdsPower profile is not logged in. ' +
+        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'navigate to miles-and-more.com, log in manually, then retry.',
+      );
+    }
+
+    // Balance — try a few likely selectors. Capture screenshot on miss.
+    const balanceText = await page
+      .locator('.balance, .miles-status, [data-test="balance"], .meilen-counter, .miles-counter')
+      .first()
+      .innerText({ timeout: 15_000 })
+      .catch(() => '');
+    const balance = parseInt((balanceText || '').replace(/[^\d]/g, ''), 10);
+    if (Number.isNaN(balance)) {
+      const shot = path.join(OUT, `miles-more-balance-fail-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      throw new Error(
+        `miles-more: could not parse balance from "${(balanceText || '').slice(0, 80)}". ` +
+        `Selectors may need updating. Screenshot: ${shot}`,
+      );
+    }
+
+    // Activity / Kontoauszüge
+    await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000);
+    if (/login|anmelden/i.test(page.url())) {
+      throw new Error('miles-more: session expired between balance + activity nav');
+    }
+
+    // Try to set 24-month period — best-effort.
+    try {
+      await page.getByLabel(/Zeitraum|Period/i).selectOption('24');
+    } catch { /* keep default */ }
+
+    await page.waitForSelector('table tbody tr', { timeout: 15_000 }).catch(() => {});
+    const rows = await page.locator('table tbody tr').all();
+
+    const activity = [];
+    for (const row of rows) {
+      const cells = await row.locator('td').allInnerTexts();
+      if (cells.length < 4) continue;
+      const [dateRaw, descRaw, typeRaw, pointsRaw] = cells;
+      const date = normalizeDate(dateRaw, 'miles-more');
+      if (!date) continue;
+      const points = parseInt((pointsRaw || '').replace(/[^\d-]/g, ''), 10);
+      if (Number.isNaN(points)) continue;
+
+      const type = classifyActivity('miles-more', typeRaw);
+      const description = (descRaw || '').trim();
+      activity.push({
+        date,
+        type,
+        description,
+        points,
+        flight_number: type === 'flight_earn' ? extractFlightNumber(description, 'LH') : undefined,
+        route: type === 'flight_earn' ? parseRoute(description) : undefined,
+        raw: { dateRaw, descRaw, typeRaw, pointsRaw },
+      });
+    }
+
+    return { balance, activity };
+  },
+};
+
+handlers.airline_balance = async (page, { airline }) => {
   const fn = airlineBalanceScrapers[airline];
   if (!fn) {
     return {
       ok: false,
-      error: `airline_balance: scraper for "${airline}" not yet implemented on Contabo. ` +
-             `Per-airline scrapers are tracked under workers/balance/<airline>.ts in gitspexx/spexx-flights. ` +
-             `When the AdsPower profile for "${airline}" is logged in, port the post-login scraping logic here.`,
+      error:
+        `airline_balance: scraper for "${airline}" not yet implemented on Contabo. ` +
+        `Add an entry to airlineBalanceScrapers in server.mjs and ship via /redeploy.`,
     };
   }
-  const out = await fn(page, { login, password });
-  return { ok: true, ...out };
+  try {
+    const out = await fn(page);
+    return { ok: true, ...out };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
 };
 
 // ── App ─────────────────────────────────────────────────────────────────────
