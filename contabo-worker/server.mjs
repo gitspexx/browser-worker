@@ -3016,6 +3016,47 @@ handlers.wa_send = async function (page, { to, body, claimId }) {
   return { portal: 'wa_send', to: digits, sent_at: new Date().toISOString(), screenshot: shot, signal: lastSignal };
 };
 
+// ── airline_balance — delegated balance + activity scrape ───────────────────
+// Spexx Flights calls this when its local headless Playwright is fingerprint-
+// blocked by an airline portal (LATAM, M&M, etc). AdsPower's persistent
+// real-Chrome profile defeats those blocks.
+//
+// Per-airline scraper functions live in airlineBalanceScrapers below. Each
+// one drives the post-login page already authenticated (the AdsPower profile
+// keeps the session warm) and returns {balance, activity[]}.
+//
+// Until per-airline scrapers ship, this handler responds with status 501
+// ("not_implemented") with the airline key so the caller can record it in
+// scrape_runs and surface a clear error to the user.
+const airlineBalanceScrapers = {
+  // TODO 2026-05-04: implement the 5 fingerprint-blocked airlines using
+  // AdsPower-mounted Chrome. Each is a port of the corresponding scraper in
+  // gitspexx/spexx-flights workers/balance/<airline>.ts but assumes the
+  // profile is already logged in (skip the login flow on first run, log in
+  // manually via RDP once, AdsPower keeps the cookie).
+  //
+  // latam:        async (page) => { ... },
+  // 'miles-more': async (page) => { ... },
+  // norwegian:    async (page) => { ... },
+  // turkish:      async (page) => { ... },
+  // etihad:       async (page) => { ... },
+  // 'flying-blue':async (page) => { ... },
+};
+
+handlers.airline_balance = async (page, { airline, login, password }) => {
+  const fn = airlineBalanceScrapers[airline];
+  if (!fn) {
+    return {
+      ok: false,
+      error: `airline_balance: scraper for "${airline}" not yet implemented on Contabo. ` +
+             `Per-airline scrapers are tracked under workers/balance/<airline>.ts in gitspexx/spexx-flights. ` +
+             `When the AdsPower profile for "${airline}" is logged in, port the post-login scraping logic here.`,
+    };
+  }
+  const out = await fn(page, { login, password });
+  return { ok: true, ...out };
+};
+
 // ── App ─────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
