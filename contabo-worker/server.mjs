@@ -3248,9 +3248,15 @@ app.get('/status', auth(), async (req, res) => {
 });
 
 app.post('/submit', auth(), async (req, res) => {
-  const { profileId, portal, useAdsPower = true, ...rest } = req.body ?? {};
+  const { profileId: bodyProfileId, portal, useAdsPower = true, ...rest } = req.body ?? {};
   const fn = handlers[portal];
   if (!fn) return res.status(400).json({ error: `unknown portal: ${portal}`, known: Object.keys(handlers) });
+  // For airline_balance, default the profileId to the env-var so the flights
+  // app doesn't need to know which AdsPower profile is doing the work — it's
+  // a Contabo-side config.
+  const profileId = portal === 'airline_balance'
+    ? (bodyProfileId ?? process.env.AIRLINE_BALANCE_PROFILE_ID ?? null)
+    : bodyProfileId;
   try {
     const out = await withSession(profileId, (p) => fn(p, rest), useAdsPower);
     res.json({ ok: true, ...out });
@@ -3285,6 +3291,88 @@ app.post('/adspower/ensure-running', auth(), async (_req, res) => {
     if (await adsReachable()) return res.json({ ok: true, started: true, waited_ms: (i + 1) * 2000 });
   }
   res.status(504).json({ error: 'AdsPower did not come online within 30s' });
+});
+
+// One-shot operator setup for airline_balance. Creates (or finds) the
+// shared "airlines-shared" AdsPower profile, opens it, opens each airline's
+// login URL in a separate tab, and leaves the browser open for the operator
+// to log in manually. The profile_id is logged so the operator can set
+// AIRLINE_BALANCE_PROFILE_ID in C:\worker\.env.
+//
+// Pre-req: AdsPower app is already running (POST /adspower/ensure-running).
+app.post('/airline/setup', auth('admin'), async (_req, res) => {
+  if (!(await adsReachable())) {
+    return res.status(503).json({
+      error: 'AdsPower API not reachable. Start AdsPower app first via RDP or POST /adspower/ensure-running.',
+    });
+  }
+
+  const PROFILE_NAME = 'airlines-shared';
+  const AIRLINE_LOGIN_URLS = {
+    'miles-more': 'https://www.miles-and-more.com/de/de/spa/login.html',
+    latam: 'https://www.latamairlines.com/cl/en/login',
+    norwegian: 'https://en.norwegianreward.com/login',
+    turkish: 'https://www.turkishairlines.com/en-int/miles-and-smiles/login/',
+    etihad: 'https://www.etihad.com/en-us/etihad-guest/sign-in',
+    'flying-blue': 'https://wwws.airfrance.com/loginnetcustomer',
+  };
+
+  try {
+    // Find existing profile by name.
+    const list = await ads('/api/v1/user/list?page=1&page_size=200');
+    const existing = (list.list ?? []).find((u) => u.name === PROFILE_NAME);
+
+    let userId;
+    if (existing) {
+      userId = existing.user_id;
+    } else {
+      // Create one. AdsPower requires `group_id` — pull the default group.
+      const groups = await ads('/api/v1/group/list?page=1&page_size=20');
+      const defaultGroupId = (groups.list?.[0]?.group_id) ?? '0';
+      const created = await fetch(`${ADS}/api/v1/user/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: PROFILE_NAME,
+          group_id: defaultGroupId,
+          user_proxy_config: { proxy_soft: 'no_proxy' },
+          fingerprint_config: { language: ['en-US', 'en'], ua: '' },
+        }),
+      }).then((r) => r.json());
+      if (created.code !== 0) throw new Error(`AdsPower create failed: ${created.msg}`);
+      userId = created.data.id;
+    }
+
+    // Start the profile (returns ws.puppeteer URL for CDP).
+    const start = await ads(`/api/v1/browser/start?user_id=${encodeURIComponent(userId)}`);
+    const browser = await chromium.connectOverCDP(start.ws.puppeteer);
+    const ctx = browser.contexts()[0] ?? (await browser.newContext());
+
+    // Open each login URL in its own tab.
+    const tabsOpened = [];
+    for (const [airline, url] of Object.entries(AIRLINE_LOGIN_URLS)) {
+      const page = await ctx.newPage();
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => {});
+      tabsOpened.push({ airline, url });
+    }
+
+    // Leave the browser open — DO NOT close. Operator logs in manually.
+    res.json({
+      ok: true,
+      profile_id: userId,
+      profile_name: PROFILE_NAME,
+      action: existing ? 'reused' : 'created',
+      tabs_opened: tabsOpened,
+      next_steps: [
+        `Profile ${userId} (${PROFILE_NAME}) is open in AdsPower.`,
+        'RDP into Contabo. The browser has one tab per airline already at the login page.',
+        'Log in to each airline. Cookies will persist in the profile.',
+        `Set on Contabo: AIRLINE_BALANCE_PROFILE_ID=${userId} in C:\\worker\\.env, then restart contabo-worker.`,
+      ],
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Serve a screenshot or HTML dump from SCREENSHOT_DIR. Path traversal is blocked
