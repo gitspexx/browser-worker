@@ -3422,7 +3422,7 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
     });
   }
 
-  const PROFILE_NAME = 'airlines-shared';
+  const PROFILE_NAME = 'flights';
   const AIRLINE_LOGIN_URLS = {
     'miles-more': 'https://www.miles-and-more.com/de/de/spa/login.html',
     latam: 'https://www.latamairlines.com/cl/en/login',
