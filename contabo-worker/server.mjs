@@ -3231,6 +3231,121 @@ handlers.airline_balance = async (page, { airline }) => {
   }
 };
 
+// ── airline_login — auto-login for airline portals (AdsPower-mounted) ───────
+const AIRLINE_LOGIN_FLOWS = {
+  'miles-more': {
+    url: 'https://www.miles-and-more.com/de/de/spa/login.html',
+    userSelector: 'input[name="cardNumber"], input#cardNumber, input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"], button:has-text("Anmelden"), button:has-text("Log in")',
+    successUrlPattern: /\/account\/|\/welcome|dashboard/i,
+  },
+  latam: {
+    url: 'https://www.latamairlines.com/cl/en/login',
+    userSelector: 'input[name="username"], input[type="email"], input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /\/account|\/profile|latampass\.latam/i,
+  },
+  norwegian: {
+    url: 'https://en.norwegianreward.com/login',
+    userSelector: 'input[type="email"], input[name="email"], input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /minkonto|profile|account/i,
+  },
+  turkish: {
+    url: 'https://www.turkishairlines.com/en-int/miles-and-smiles/login/',
+    userSelector: 'input[name="username"], input[id*="user" i], input[type="email"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /\/my-account|\/profile/i,
+  },
+  etihad: {
+    url: 'https://www.etihad.com/en-us/etihad-guest/sign-in',
+    userSelector: 'input[type="email"], input[name="email"], input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /\/my-account|\/dashboard|\/profile/i,
+  },
+  'flying-blue': {
+    url: 'https://wwws.airfrance.com/loginnetcustomer',
+    userSelector: 'input[name="userId"], input[id*="user" i], input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /\/loyalty|\/account|\/profile/i,
+  },
+};
+
+handlers.airline_login = async (page, { airline, login, password }) => {
+  const flow = AIRLINE_LOGIN_FLOWS[airline];
+  if (!flow) {
+    return { ok: false, error: `airline_login: unknown airline "${airline}". Known: ${Object.keys(AIRLINE_LOGIN_FLOWS).join(', ')}` };
+  }
+  if (!login || !password) {
+    return { ok: false, error: 'airline_login: login and password required' };
+  }
+
+  try {
+    await page.goto(flow.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForTimeout(3000);
+
+    // If we're already logged in (cookie exists from a prior session), short-circuit.
+    if (flow.successUrlPattern.test(page.url())) {
+      return { ok: true, status: 'already_logged_in', final_url: page.url() };
+    }
+
+    // Detect anti-bot before we touch the form.
+    const html = (await page.content().catch(() => '')).toLowerCase();
+    if (/security check|sicherheitscheck|unusual behaviour|access denied|are you a human/i.test(html)) {
+      const shot = path.join(OUT, `airline-login-${airline}-blocked-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      return { ok: false, status: 'fingerprint_blocked', final_url: page.url(), screenshot: shot };
+    }
+
+    // Fill the form. fill() throws if the selector doesn't match in 30s.
+    const userInput = page.locator(flow.userSelector).first();
+    const passInput = page.locator(flow.passSelector).first();
+    await userInput.waitFor({ state: 'visible', timeout: 15_000 });
+    await userInput.fill(login);
+    await passInput.fill(password);
+    await page.locator(flow.submitSelector).first().click({ timeout: 10_000 });
+
+    // Wait up to 25s for either success-URL or an obvious failure marker.
+    const startUrl = page.url();
+    const deadline = Date.now() + 25_000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(1500);
+      if (flow.successUrlPattern.test(page.url())) {
+        return { ok: true, status: 'logged_in', final_url: page.url() };
+      }
+      const body = (await page.content().catch(() => '')).toLowerCase();
+      if (/incorrect|invalid|wrong|denied/.test(body) && page.url() === startUrl) {
+        const shot = path.join(OUT, `airline-login-${airline}-fail-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return { ok: false, status: 'bad_credentials', final_url: page.url(), screenshot: shot };
+      }
+      if (/captcha|recaptcha|hcaptcha|verify you are human/.test(body)) {
+        const shot = path.join(OUT, `airline-login-${airline}-captcha-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return { ok: false, status: 'captcha_required', final_url: page.url(), screenshot: shot };
+      }
+      if (/two-factor|verification code|enter the code/.test(body)) {
+        const shot = path.join(OUT, `airline-login-${airline}-2fa-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return { ok: false, status: '2fa_required', final_url: page.url(), screenshot: shot };
+      }
+    }
+
+    // Timed out without clear signal. Capture state for inspection.
+    const shot = path.join(OUT, `airline-login-${airline}-timeout-${Date.now()}.png`);
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    return { ok: false, status: 'timeout', final_url: page.url(), screenshot: shot };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+};
+
 // ── App ─────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -3251,10 +3366,10 @@ app.post('/submit', auth(), async (req, res) => {
   const { profileId: bodyProfileId, portal, useAdsPower = true, ...rest } = req.body ?? {};
   const fn = handlers[portal];
   if (!fn) return res.status(400).json({ error: `unknown portal: ${portal}`, known: Object.keys(handlers) });
-  // For airline_balance, default the profileId to the env-var so the flights
-  // app doesn't need to know which AdsPower profile is doing the work — it's
-  // a Contabo-side config.
-  const profileId = portal === 'airline_balance'
+  // For airline_balance / airline_login, default the profileId to the env-var
+  // so the flights app doesn't need to know which AdsPower profile is doing
+  // the work — it's a Contabo-side config.
+  const profileId = (portal === 'airline_balance' || portal === 'airline_login')
     ? (bodyProfileId ?? process.env.AIRLINE_BALANCE_PROFILE_ID ?? null)
     : bodyProfileId;
   try {
