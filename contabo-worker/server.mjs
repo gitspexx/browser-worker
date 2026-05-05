@@ -3063,6 +3063,24 @@ const TYPE_MAPS = {
     [/purchase|buy/i, 'purchase'],
     [/adjustment|correction/i, 'adjustment'],
   ],
+  lifemiles: [
+    [/vuelo|flight|avianca/i, 'flight_earn'],
+    [/canje|redeem|redencion/i, 'flight_redeem'],
+    [/transferencia\s*entrada|transfer\s*in/i, 'transfer_in'],
+    [/transferencia\s*salida|transfer\s*out/i, 'transfer_out'],
+    [/promo|bonus/i, 'promo'],
+    [/compra|purchase/i, 'purchase'],
+    [/ajuste|adjustment/i, 'adjustment'],
+  ],
+  'smiles-gol': [
+    [/voo|flight|gol/i, 'flight_earn'],
+    [/resgate|redeem/i, 'flight_redeem'],
+    [/transferencia\s*entrada|transfer\s*in/i, 'transfer_in'],
+    [/transferencia\s*saida|transfer\s*out/i, 'transfer_out'],
+    [/promo|bonus/i, 'promo'],
+    [/compra|purchase/i, 'purchase'],
+    [/ajuste|adjustment/i, 'adjustment'],
+  ],
 };
 
 function classifyActivity(airline, raw) {
@@ -3090,6 +3108,8 @@ const DATE_FORMATS_BY_AIRLINE = {
   'miles-more': ['dd.MM.yyyy', 'd.M.yyyy', 'yyyy-MM-dd'],
   latam: ['yyyy-MM-dd', 'dd/MM/yyyy', 'd/M/yyyy'],
   norwegian: ['MMM d, yyyy', 'd MMM yyyy', 'yyyy-MM-dd'],
+  lifemiles: ['MM/dd/yyyy', 'dd/MM/yyyy', 'yyyy-MM-dd'],
+  'smiles-gol': ['dd/MM/yyyy', 'd/M/yyyy', 'yyyy-MM-dd'],
 };
 
 // Lightweight date parser — no date-fns dep. Handles the formats above.
@@ -3211,6 +3231,148 @@ const airlineBalanceScrapers = {
 
     return { balance, activity };
   },
+
+  /**
+   * LifeMiles (Avianca, IATA AV) via AdsPower. Cookie persists from prior
+   * manual login. If we land on a login page, throw a clear "session expired".
+   */
+  lifemiles: async (page) => {
+    const ACCOUNT_URL = 'https://www.lifemiles.com/account';
+    const ACTIVITY_URL = 'https://www.lifemiles.com/account/activity';
+
+    await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000); // SPA hydration
+
+    if (/login|signin|ingreso/i.test(page.url())) {
+      throw new Error(
+        'lifemiles: AdsPower profile is not logged in. ' +
+        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'navigate to lifemiles.com, log in manually, then retry.',
+      );
+    }
+
+    // Balance — best-effort selectors. TODO: verify selector on first real run.
+    const balanceText = await page
+      .locator('[class*="balance"], .miles-counter, .account-balance, [data-testid="miles"]')
+      .first()
+      .innerText({ timeout: 15_000 })
+      .catch(() => '');
+    const balance = parseInt((balanceText || '').replace(/[^\d]/g, ''), 10);
+    if (Number.isNaN(balance)) {
+      const shot = path.join(OUT, `lifemiles-balance-fail-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      throw new Error(
+        `lifemiles: could not parse balance from "${(balanceText || '').slice(0, 80)}". ` +
+        `Selectors may need updating. Screenshot: ${shot}`,
+      );
+    }
+
+    // Activity
+    await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000);
+    if (/login|signin|ingreso/i.test(page.url())) {
+      throw new Error('lifemiles: session expired between balance + activity nav');
+    }
+
+    await page.waitForSelector('table tbody tr', { timeout: 15_000 }).catch(() => {});
+    const rows = await page.locator('table tbody tr').all(); // TODO: verify selector
+
+    const activity = [];
+    for (const row of rows) {
+      const cells = await row.locator('td').allInnerTexts();
+      if (cells.length < 4) continue;
+      const [dateRaw, descRaw, typeRaw, pointsRaw] = cells;
+      const date = normalizeDate(dateRaw, 'lifemiles');
+      if (!date) continue;
+      const points = parseInt((pointsRaw || '').replace(/[^\d-]/g, ''), 10);
+      if (Number.isNaN(points)) continue;
+
+      const type = classifyActivity('lifemiles', typeRaw);
+      const description = (descRaw || '').trim();
+      activity.push({
+        date,
+        type,
+        description,
+        points,
+        flight_number: type === 'flight_earn' ? extractFlightNumber(description, 'AV') : undefined,
+        route: type === 'flight_earn' ? parseRoute(description) : undefined,
+        raw: { dateRaw, descRaw, typeRaw, pointsRaw },
+      });
+    }
+
+    return { balance, activity };
+  },
+
+  /**
+   * Smiles GOL (IATA G3) via AdsPower. Cookie persists from prior manual
+   * login. If we land on a login page, throw "session expired".
+   */
+  'smiles-gol': async (page) => {
+    const ACCOUNT_URL = 'https://www.smiles.com.br/minha-conta';
+    const ACTIVITY_URL = 'https://www.smiles.com.br/extrato';
+
+    await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000); // SPA hydration
+
+    if (/login|signin|entrar/i.test(page.url())) {
+      throw new Error(
+        'smiles-gol: AdsPower profile is not logged in. ' +
+        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'navigate to smiles.com.br, log in manually, then retry.',
+      );
+    }
+
+    // Balance — BR Portuguese terminology. TODO: verify selector on first run.
+    const balanceText = await page
+      .locator('[class*="saldo"], .smiles-balance, .balance-value, [data-testid*="saldo"]')
+      .first()
+      .innerText({ timeout: 15_000 })
+      .catch(() => '');
+    const balance = parseInt((balanceText || '').replace(/[^\d]/g, ''), 10);
+    if (Number.isNaN(balance)) {
+      const shot = path.join(OUT, `smiles-gol-balance-fail-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      throw new Error(
+        `smiles-gol: could not parse balance from "${(balanceText || '').slice(0, 80)}". ` +
+        `Selectors may need updating. Screenshot: ${shot}`,
+      );
+    }
+
+    // Activity / Extrato
+    await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000);
+    if (/login|signin|entrar/i.test(page.url())) {
+      throw new Error('smiles-gol: session expired between balance + activity nav');
+    }
+
+    await page.waitForSelector('table tbody tr', { timeout: 15_000 }).catch(() => {});
+    const rows = await page.locator('table tbody tr').all(); // TODO: verify selector
+
+    const activity = [];
+    for (const row of rows) {
+      const cells = await row.locator('td').allInnerTexts();
+      if (cells.length < 4) continue;
+      const [dateRaw, descRaw, typeRaw, pointsRaw] = cells;
+      const date = normalizeDate(dateRaw, 'smiles-gol');
+      if (!date) continue;
+      const points = parseInt((pointsRaw || '').replace(/[^\d-]/g, ''), 10);
+      if (Number.isNaN(points)) continue;
+
+      const type = classifyActivity('smiles-gol', typeRaw);
+      const description = (descRaw || '').trim();
+      activity.push({
+        date,
+        type,
+        description,
+        points,
+        flight_number: type === 'flight_earn' ? extractFlightNumber(description, 'G3') : undefined,
+        route: type === 'flight_earn' ? parseRoute(description) : undefined,
+        raw: { dateRaw, descRaw, typeRaw, pointsRaw },
+      });
+    }
+
+    return { balance, activity };
+  },
 };
 
 handlers.airline_balance = async (page, { airline }) => {
@@ -3274,6 +3436,20 @@ const AIRLINE_LOGIN_FLOWS = {
     passSelector: 'input[type="password"]',
     submitSelector: 'button[type="submit"]',
     successUrlPattern: /\/loyalty|\/account|\/profile/i,
+  },
+  lifemiles: {
+    url: 'https://www.lifemiles.com/account/login.aspx',
+    userSelector: 'input[name="userId"], input[id*="user" i], input[autocomplete="username"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /\/account|\/dashboard|\/profile/i,
+  },
+  'smiles-gol': {
+    url: 'https://www.smiles.com.br/login',
+    userSelector: 'input[name="cpf"], input[name="document"], input[autocomplete="username"], input[type="email"]',
+    passSelector: 'input[type="password"]',
+    submitSelector: 'button[type="submit"]',
+    successUrlPattern: /minha-conta|account|dashboard/i,
   },
 };
 
@@ -3430,6 +3606,8 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
     turkish: 'https://www.turkishairlines.com/en-int/miles-and-smiles/login/',
     etihad: 'https://www.etihad.com/en-us/etihad-guest/sign-in',
     'flying-blue': 'https://wwws.airfrance.com/loginnetcustomer',
+    lifemiles: 'https://www.lifemiles.com/account/login.aspx',
+    'smiles-gol': 'https://www.smiles.com.br/login',
   };
 
   try {
