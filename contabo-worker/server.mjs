@@ -3081,6 +3081,15 @@ const TYPE_MAPS = {
     [/compra|purchase/i, 'purchase'],
     [/ajuste|adjustment/i, 'adjustment'],
   ],
+  etihad: [
+    [/flight|earn/i, 'flight_earn'],
+    [/redeem|award/i, 'flight_redeem'],
+    [/transfer\s*in/i, 'transfer_in'],
+    [/transfer\s*out/i, 'transfer_out'],
+    [/promo|bonus/i, 'promo'],
+    [/purchase|buy/i, 'purchase'],
+    [/adjustment|correction/i, 'adjustment'],
+  ],
 };
 
 function classifyActivity(airline, raw) {
@@ -3150,6 +3159,7 @@ const DATE_FORMATS_BY_AIRLINE = {
   norwegian: ['MMM d, yyyy', 'd MMM yyyy', 'yyyy-MM-dd'],
   lifemiles: ['MM/dd/yyyy', 'dd/MM/yyyy', 'yyyy-MM-dd'],
   'smiles-gol': ['dd/MM/yyyy', 'd/M/yyyy', 'yyyy-MM-dd'],
+  etihad: ['dd MMM yyyy', 'd MMM yyyy', 'yyyy-MM-dd'],
 };
 
 // Lightweight date parser — no date-fns dep. Handles the formats above.
@@ -3413,6 +3423,66 @@ const airlineBalanceScrapers = {
       });
     }
 
+    return { balance, activity };
+  },
+
+  etihad: async (page) => {
+    const ACCOUNT_URL = 'https://www.etihad.com/en-us/etihad-guest/my-account';
+    const ACTIVITY_URL = 'https://www.etihad.com/en-us/etihad-guest/my-account/transactions';
+
+    await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000);
+
+    if (/sign-?in|login/i.test(page.url())) {
+      throw new Error(
+        'etihad: AdsPower profile is not logged in. ' +
+        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'navigate to etihad.com, log in manually, then retry.',
+      );
+    }
+
+    const bal = await findBalanceNumber(page, {
+      selectors: [
+        '[class*="balance"]', '[class*="miles"]', '[class*="points"]',
+        '[data-testid*="balance"]', '.eg-balance',
+      ],
+      labels: ['etihad\\s*guest\\s*miles', 'available\\s+miles', 'your\\s+balance', 'miles\\s+balance'],
+    });
+    if (Number.isNaN(bal.value)) {
+      const shot = path.join(OUT, `etihad-balance-fail-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      throw new Error(
+        `etihad: could not locate balance (via=${bal.via}, near="${bal.text.slice(0, 80)}"). Screenshot: ${shot}`,
+      );
+    }
+    const balance = bal.value;
+
+    await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(3000);
+    if (/sign-?in|login/i.test(page.url())) {
+      throw new Error('etihad: session expired between balance + activity nav');
+    }
+
+    await page.waitForSelector('table tbody tr', { timeout: 15_000 }).catch(() => {});
+    const rows = await page.locator('table tbody tr').all();
+    const activity = [];
+    for (const row of rows) {
+      const cells = await row.locator('td').allInnerTexts();
+      if (cells.length < 4) continue;
+      const [dateRaw, descRaw, typeRaw, pointsRaw] = cells;
+      const date = normalizeDate(dateRaw, 'etihad');
+      if (!date) continue;
+      const points = parseInt((pointsRaw || '').replace(/[^\d-]/g, ''), 10);
+      if (Number.isNaN(points)) continue;
+      const type = classifyActivity('etihad', typeRaw);
+      const description = (descRaw || '').trim();
+      activity.push({
+        date, type, description, points,
+        flight_number: type === 'flight_earn' ? extractFlightNumber(description, 'EY') : undefined,
+        route: type === 'flight_earn' ? parseRoute(description) : undefined,
+        raw: { dateRaw, descRaw, typeRaw, pointsRaw },
+      });
+    }
     return { balance, activity };
   },
 };
