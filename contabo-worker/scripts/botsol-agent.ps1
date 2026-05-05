@@ -583,7 +583,7 @@ function Handle-NumericPrompt {
                         # Match any frm* child (frmInput, frmIntInput, frmSelectFile, frmFileInput, ...)
                         # OR Botsol's actual InputInteger / InputString AIDs (observed live 2026-05-03).
                         # The Edit-presence check below filters out frmBoolInput (no Edit, just Yes/No).
-                        if ($en -and (($aid -like 'frm*' -and $aid -ne 'frmBoolInput') -or $aid -eq 'InputInteger' -or $aid -eq 'InputString')) {
+                        if ($en -and (($aid -like 'frm*' -and $aid -ne 'frmBoolInput') -or $aid -eq 'InputInteger' -or $aid -eq 'InputString' -or $aid -eq 'InputFile')) {
                             $editCond = New-Object System.Windows.Automation.PropertyCondition(
                                 [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
                                 [System.Windows.Automation.ControlType]::Edit)
@@ -1221,6 +1221,20 @@ try {
                             if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 4 -Tag 'resume_numeric') {
                                 Post-Slack ":wrench: botsol-agent resumed orphaned numeric prompt with $RESULT_CAP"
                                 $resumed = $true
+                            }
+                            break
+                        }
+                        if ($aid -eq 'InputFile' -or $aid -eq 'frmSelectFile') {
+                            $state2 = Read-QueueState
+                            if ($state2 -and $state2.current_full_path) {
+                                $kwPath = [string]$state2.current_full_path
+                                Write-Log "AMBIGUOUS resume: found stuck file picker aid=$aid; filling with $kwPath" 'warn'
+                                if (Handle-NumericPrompt -Value $kwPath -TimeoutSec 4 -Tag 'resume_file') {
+                                    Post-Slack ":wrench: botsol-agent resumed orphaned file picker -> $kwPath"
+                                    $resumed = $true
+                                }
+                            } else {
+                                Write-Log "AMBIGUOUS resume: file picker up but queue state missing path" 'warn'
                             }
                             break
                         }
