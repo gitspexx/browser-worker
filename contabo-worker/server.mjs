@@ -3099,6 +3099,46 @@ function parseRoute(desc) {
   return undefined;
 }
 
+/**
+ * Find a balance number on the page by scanning text near label keywords.
+ * Falls back from explicit selectors to label-anchored heuristic.
+ *
+ * Returns parseInt of the largest digit-run found near the label, or NaN.
+ */
+async function findBalanceNumber(page, opts) {
+  // 1. Try explicit selectors first.
+  for (const sel of opts.selectors ?? []) {
+    const txt = await page.locator(sel).first().innerText({ timeout: 3_000 }).catch(() => '');
+    const n = parseInt((txt || '').replace(/[^\d]/g, ''), 10);
+    if (!Number.isNaN(n)) return { value: n, via: 'selector', source: sel, text: txt };
+  }
+  // 2. Label-anchored fallback: find any element whose text matches one of
+  // the label keywords, then scan its parent / siblings / self for the
+  // largest plausible digit run.
+  const result = await page.evaluate((labels) => {
+    const RE = new RegExp(labels.join('|'), 'i');
+    const NUM = /\b(\d{1,3}(?:[.,\s]\d{3})*|\d+)\b/;
+    const all = Array.from(document.querySelectorAll('body *'));
+    for (const el of all) {
+      const own = el.childNodes && [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent || '').join(' ').trim();
+      if (!own || !RE.test(own)) continue;
+      // Search within this element's parent for the nearest numeric.
+      const candidates = [el, el.parentElement, el.parentElement?.parentElement].filter(Boolean);
+      for (const c of candidates) {
+        const text = (c.innerText || c.textContent || '').slice(0, 400);
+        const m = text.match(NUM);
+        if (m) return { text: text.slice(0, 200), match: m[0] };
+      }
+    }
+    return null;
+  }, opts.labels ?? []);
+  if (result) {
+    const n = parseInt(String(result.match).replace(/[^\d]/g, ''), 10);
+    if (!Number.isNaN(n)) return { value: n, via: 'label', source: opts.labels.join('|'), text: result.text };
+  }
+  return { value: NaN, via: 'none', source: '', text: '' };
+}
+
 function extractFlightNumber(desc, iata) {
   const m = new RegExp(`\\b${iata}\\s*(\\d{1,4})\\b`, 'i').exec(desc);
   return m ? `${iata}${m[1]}` : undefined;
@@ -3237,7 +3277,7 @@ const airlineBalanceScrapers = {
    * manual login. If we land on a login page, throw a clear "session expired".
    */
   lifemiles: async (page) => {
-    const ACCOUNT_URL = 'https://www.lifemiles.com/account';
+    const ACCOUNT_URL = 'https://www.lifemiles.com/account/overview';
     const ACTIVITY_URL = 'https://www.lifemiles.com/account/activity';
 
     await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
@@ -3251,21 +3291,22 @@ const airlineBalanceScrapers = {
       );
     }
 
-    // Balance — best-effort selectors. TODO: verify selector on first real run.
-    const balanceText = await page
-      .locator('[class*="balance"], .miles-counter, .account-balance, [data-testid="miles"]')
-      .first()
-      .innerText({ timeout: 15_000 })
-      .catch(() => '');
-    const balance = parseInt((balanceText || '').replace(/[^\d]/g, ''), 10);
-    if (Number.isNaN(balance)) {
+    // Balance — try explicit selectors first, fall back to label-anchored search.
+    const bal = await findBalanceNumber(page, {
+      selectors: [
+        '[class*="balance"]', '.miles-counter', '.account-balance',
+        '[data-testid="miles"]', '[class*="miles"]', '[class*="points"]',
+      ],
+      labels: ['lifemiles\\s*balance', 'available\\s+miles', 'your\\s+balance', 'balance'],
+    });
+    if (Number.isNaN(bal.value)) {
       const shot = path.join(OUT, `lifemiles-balance-fail-${Date.now()}.png`);
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
       throw new Error(
-        `lifemiles: could not parse balance from "${(balanceText || '').slice(0, 80)}". ` +
-        `Selectors may need updating. Screenshot: ${shot}`,
+        `lifemiles: could not locate balance (via=${bal.via}, near="${bal.text.slice(0, 80)}"). Screenshot: ${shot}`,
       );
     }
+    const balance = bal.value;
 
     // Activity
     await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
@@ -3308,8 +3349,8 @@ const airlineBalanceScrapers = {
    * login. If we land on a login page, throw "session expired".
    */
   'smiles-gol': async (page) => {
-    const ACCOUNT_URL = 'https://www.smiles.com.br/minha-conta';
-    const ACTIVITY_URL = 'https://www.smiles.com.br/extrato';
+    const ACCOUNT_URL = 'https://www.smiles.com.br/group/guest/minha-conta';
+    const ACTIVITY_URL = 'https://www.smiles.com.br/group/guest/extrato';
 
     await page.goto(ACCOUNT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await page.waitForTimeout(3000); // SPA hydration
@@ -3322,21 +3363,22 @@ const airlineBalanceScrapers = {
       );
     }
 
-    // Balance — BR Portuguese terminology. TODO: verify selector on first run.
-    const balanceText = await page
-      .locator('[class*="saldo"], .smiles-balance, .balance-value, [data-testid*="saldo"]')
-      .first()
-      .innerText({ timeout: 15_000 })
-      .catch(() => '');
-    const balance = parseInt((balanceText || '').replace(/[^\d]/g, ''), 10);
-    if (Number.isNaN(balance)) {
+    // Balance — try selectors first, fall back to label-anchored (BR PT).
+    const bal = await findBalanceNumber(page, {
+      selectors: [
+        '[class*="saldo"]', '.smiles-balance', '.balance-value',
+        '[class*="milhas"]', '[class*="balance"]', '[data-testid*="saldo"]',
+      ],
+      labels: ['saldo\\s+atual', 'saldo', 'meu\\s+saldo', 'milhas\\s+disponiveis', 'milhas\\s+disponíveis'],
+    });
+    if (Number.isNaN(bal.value)) {
       const shot = path.join(OUT, `smiles-gol-balance-fail-${Date.now()}.png`);
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
       throw new Error(
-        `smiles-gol: could not parse balance from "${(balanceText || '').slice(0, 80)}". ` +
-        `Selectors may need updating. Screenshot: ${shot}`,
+        `smiles-gol: could not locate balance (via=${bal.via}, near="${bal.text.slice(0, 80)}"). Screenshot: ${shot}`,
       );
     }
+    const balance = bal.value;
 
     // Activity / Extrato
     await page.goto(ACTIVITY_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
