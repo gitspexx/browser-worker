@@ -350,55 +350,88 @@ function Find-BotsolWindow {
     return $null
 }
 
-function Dismiss-TopLevelBotsolPopup {
-    # Crawler Complete + similar standard MessageBox popups are TOP-LEVEL #32770 windows
-    # OWNED by the BotsolApp process — NOT children of BotForm. The descendant-scoped
-    # ERROR-popup handler below misses them, which causes 3-day stalls when DONE is
-    # masked by a modal Crawler Complete dialog. This scans root children for any
-    # #32770 popup belonging to BotsolApp PID and clicks its OK button via UIA Invoke.
-    param([int]$BotsolPid)
+function Dismiss-BotsolModalPopup {
+    # Crawler Complete + similar standard MessageBox popups can mount in TWO places:
+    #   A. Top-level #32770 window owned by BotsolApp PID (separate desktop window)
+    #   B. CHILD of BotForm with class #32770 (in-process modal hosted as child)
+    # Discovered B by scanning live state 2026-05-08 — Crawler Complete sat as child of
+    # BotForm for hours while top-level scan returned nothing, blocking all 4 main
+    # buttons via the modal disable. This scans both scopes and dismisses any benign
+    # popup (Crawler Complete / generic Notice / Information / Warning) via OK button.
+    # ERROR popups stay on the dedicated ERROR handler below (different match logic +
+    # Slack warning emoji), so we explicitly skip them here.
+    param(
+        [int]$BotsolPid,
+        [System.Windows.Automation.AutomationElement]$BotForm
+    )
     if (-not $BotsolPid) { return $false }
     $dismissed = $false
+
+    $candidates = @()
     try {
         $root = [System.Windows.Automation.AutomationElement]::RootElement
-        $wins = $root.FindAll(
+        $topWins = $root.FindAll(
             [System.Windows.Automation.TreeScope]::Children,
             [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($w in $wins) {
+        foreach ($w in $topWins) {
             try {
-                if ($w.Current.ProcessId -ne $BotsolPid) { continue }
-                if ($w.Current.ClassName -ne '#32770') { continue }
-                $popupName = $w.Current.Name
-                if (-not $popupName) { $popupName = '<noname>' }
-                Write-Log "top-level popup detected: name='$popupName' class=#32770 pid=$BotsolPid"
-                $btnCond = New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                    [System.Windows.Automation.ControlType]::Button)
-                $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
-                $clicked = $false
-                foreach ($b in $btns) {
-                    try {
-                        $bn = $b.Current.Name
-                        $en = $b.Current.IsEnabled
-                        if ($en -and $bn -match '^&?(OK|Yes|Close)$') {
-                            $pat = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-                            $pat.Invoke()
-                            Write-Log "dismissed top-level '$popupName' via button '$bn'"
-                            Post-Slack ":white_check_mark: Botsol top-level popup '$popupName' auto-dismissed"
-                            $clicked = $true
-                            $dismissed = $true
-                            break
-                        }
-                    } catch {}
-                }
-                if (-not $clicked) {
-                    Write-Log "top-level popup '$popupName' had no clickable OK/Yes/Close button" 'warn'
+                if ($w.Current.ProcessId -eq $BotsolPid -and $w.Current.ClassName -eq '#32770') {
+                    $candidates += [pscustomobject]@{ Element = $w; Scope = 'top-level' }
                 }
             } catch {}
         }
-    } catch {
-        Write-Log "Dismiss-TopLevelBotsolPopup error: $($_.Exception.Message)" 'warn'
+    } catch {}
+
+    if ($BotForm) {
+        try {
+            $kids = $BotForm.FindAll(
+                [System.Windows.Automation.TreeScope]::Children,
+                [System.Windows.Automation.Condition]::TrueCondition)
+            foreach ($k in $kids) {
+                try {
+                    if ($k.Current.ClassName -eq '#32770') {
+                        $candidates += [pscustomobject]@{ Element = $k; Scope = 'botform-child' }
+                    }
+                } catch {}
+            }
+        } catch {}
     }
+
+    foreach ($cand in $candidates) {
+        $w = $cand.Element
+        $popupName = $null
+        try { $popupName = $w.Current.Name } catch {}
+        if (-not $popupName) { $popupName = '<noname>' }
+
+        # Skip ERROR popups — handled separately to surface a warning emoji + retry path
+        if ($popupName -match 'ERROR') { continue }
+
+        Write-Log "$($cand.Scope) popup detected: name='$popupName' class=#32770 pid=$BotsolPid"
+        $btnCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button)
+        $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+        $clicked = $false
+        foreach ($b in $btns) {
+            try {
+                $bn = $b.Current.Name
+                $en = $b.Current.IsEnabled
+                if ($en -and $bn -match '^&?(OK|Yes|Close)$') {
+                    $pat = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+                    $pat.Invoke()
+                    Write-Log "dismissed $($cand.Scope) '$popupName' via button '$bn'"
+                    Post-Slack ":white_check_mark: Botsol popup '$popupName' auto-dismissed ($($cand.Scope))"
+                    $clicked = $true
+                    $dismissed = $true
+                    break
+                }
+            } catch {}
+        }
+        if (-not $clicked) {
+            Write-Log "$($cand.Scope) popup '$popupName' had no clickable OK/Yes/Close button (btnCount=$($btns.Count))" 'warn'
+        }
+    }
+
     return $dismissed
 }
 
@@ -799,12 +832,13 @@ try {
         exit 0
     }
 
-    # Clear any TOP-LEVEL Crawler Complete / standard MessageBox popups that mask
-    # DONE phase. Done before phase detection so buttons reflect the real state.
+    # Clear any Crawler Complete / standard MessageBox popups (top-level OR child of
+    # BotForm) that mask DONE phase. Done before phase detection so buttons reflect
+    # the real state.
     try {
         $botPid = $win.Current.ProcessId
-        if (Dismiss-TopLevelBotsolPopup -BotsolPid $botPid) {
-            Start-Sleep -Milliseconds 800
+        if (Dismiss-BotsolModalPopup -BotsolPid $botPid -BotForm $win) {
+            Start-Sleep -Milliseconds 1200
             $script:BotsolChildrenCache = $null
         }
     } catch {}
