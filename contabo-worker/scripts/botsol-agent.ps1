@@ -78,6 +78,13 @@ $AUTO_START_NEXT       = Parse-Bool $cfg['AUTO_START_NEXT'] $false
 $AUTO_DELETE_CURRENT   = Parse-Bool $cfg['AUTO_DELETE_CURRENT'] $false
 $USE_STARTER           = Parse-Bool $cfg['USE_STARTER'] $true
 $USE_PRUNED            = Parse-Bool $cfg['USE_PRUNED'] $true
+# When true, skip the Botsol Export+Save-As UI flow and dump the CSV directly
+# from db.sqlite via the Python extractor. The Save-As dialog has been a
+# source of repeated stalls (descendant #32770 with no enumerable buttons,
+# 10s timeouts, etc.). SQLite snapshot is faster, deterministic, and bypasses
+# UI freezes that happen when Botsol becomes "Not Responding" post-Crawler-Complete.
+$EXPORT_VIA_SQLITE     = Parse-Bool $cfg['EXPORT_VIA_SQLITE'] $true
+$EXTRACT_SCRIPT        = if ($cfg['EXTRACT_SCRIPT']) { $cfg['EXTRACT_SCRIPT'] } else { 'C:\worker\scripts\extract_botsol_csv.py' }
 
 # ONLY_COUNTRIES = comma-separated allow-list (e.g. "colombia,mexico"). Empty = all.
 # Useful for staged rollout: validate one country end-to-end before unleashing the
@@ -91,7 +98,7 @@ if ($cfg['ONLY_COUNTRIES']) {
 $RESULT_CAP            = if ($cfg['RESULT_CAP'])    { [string]$cfg['RESULT_CAP'] }    else { '100' }
 $KEYWORD_LIMIT         = if ($cfg['KEYWORD_LIMIT']) { [string]$cfg['KEYWORD_LIMIT'] } else { '5' }
 
-Write-Log "tick start  dry_run=$DRY_RUN  auto_start_next=$AUTO_START_NEXT  auto_delete_current=$AUTO_DELETE_CURRENT  use_starter=$USE_STARTER  use_pruned=$USE_PRUNED  result_cap=$RESULT_CAP  keyword_limit=$KEYWORD_LIMIT"
+Write-Log "tick start  dry_run=$DRY_RUN  auto_start_next=$AUTO_START_NEXT  auto_delete_current=$AUTO_DELETE_CURRENT  use_starter=$USE_STARTER  use_pruned=$USE_PRUNED  result_cap=$RESULT_CAP  keyword_limit=$KEYWORD_LIMIT  export_via_sqlite=$EXPORT_VIA_SQLITE"
 
 # ---------- Slack helper ----------
 function Post-Slack {
@@ -991,71 +998,109 @@ try {
                 exit 0
             }
 
-            # Wet run: click Export Data
-            if (-not (Invoke-Element $btnExport)) {
-                Write-Log "failed to invoke Export Data" 'error'
-                if ($state.current_run_id) {
-                    Update-ScrapeJob -Id $state.current_run_id -Patch @{
-                        status = 'failed'
-                        error  = 'invoke export failed'
-                    } | Out-Null
+            if ($EXPORT_VIA_SQLITE) {
+                # SQLite-direct path: bypass the Botsol Export UI entirely.
+                # Botsol's UI is single-threaded and frequently freezes ("Not Responding")
+                # right after Crawler Complete, blocking Export and Save As clicks. The
+                # SQLite db at %APPDATA%\Botsol\db.sqlite is the source of truth — we
+                # snapshot+dump it, write into OUTPUT_DIR using Botsol's CSV format, and
+                # let csv_processor pick it up identically to a real export. Then click
+                # Delete Current Data to clear Botsol's grid for the next run.
+                Write-Log "DONE: extracting via SQLite -> $outPath"
+                if (-not (Test-Path $EXTRACT_SCRIPT)) {
+                    Write-Log "extract script missing: $EXTRACT_SCRIPT" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = "extract script not found: $EXTRACT_SCRIPT"
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol SQLite extract script missing for $country/$srcFile"
+                    exit 0
                 }
-                Post-Slack ":x: Botsol export click failed for $country/$srcFile"
-                exit 0
-            }
-
-            $dlg = Wait-ForDialog -TimeoutSec 10 -NameMatch 'Save'
-            if (-not $dlg) {
-                Write-Log "save dialog did not appear within 10s" 'error'
-                if ($state.current_run_id) {
-                    Update-ScrapeJob -Id $state.current_run_id -Patch @{
-                        status = 'failed'
-                        error  = 'save dialog timeout'
-                    } | Out-Null
+                Ensure-Dir (Split-Path $outPath -Parent)
+                $extractLog = Join-Path 'C:\worker\logs' "extract-$country-$stem-$stamp.log"
+                $proc = Start-Process -FilePath 'python' `
+                    -ArgumentList @('-u', $EXTRACT_SCRIPT, $outPath) `
+                    -NoNewWindow -Wait -PassThru `
+                    -RedirectStandardOutput $extractLog `
+                    -RedirectStandardError "$extractLog.err"
+                if ($proc.ExitCode -ne 0) {
+                    Write-Log "SQLite extract failed (exit=$($proc.ExitCode)); see $extractLog" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = "sqlite extract exit=$($proc.ExitCode)"
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol SQLite extract failed for $country/$srcFile (exit=$($proc.ExitCode))"
+                    exit 0
                 }
-                Post-Slack ":x: Botsol save dialog timeout for $country/$srcFile"
-                exit 0
-            }
-
-            $fnEdit = Find-DialogFilenameEdit $dlg
-            if (-not (Set-EditValue $fnEdit $outPath)) {
-                Write-Log "could not set save dialog filename" 'error'
-                if ($state.current_run_id) {
-                    Update-ScrapeJob -Id $state.current_run_id -Patch @{
-                        status = 'failed'
-                        error  = 'set filename failed'
-                    } | Out-Null
-                }
-                Post-Slack ":x: Botsol set filename failed for $country/$srcFile"
-                exit 0
-            }
-
-            $saveBtn = Find-DialogButton -Dialog $dlg -NameMatch '^Save$|Save'
-            if (-not (Invoke-Element $saveBtn)) {
-                Write-Log "could not click Save" 'error'
-                if ($state.current_run_id) {
-                    Update-ScrapeJob -Id $state.current_run_id -Patch @{
-                        status = 'failed'
-                        error  = 'click save failed'
-                    } | Out-Null
-                }
-                Post-Slack ":x: Botsol click Save failed for $country/$srcFile"
-                exit 0
-            }
-
-            # Wait for "Botsol: Export Data to CSV" confirmation popup with "Data saved to..." text + OK button.
-            # Without dismissing this modal, Botsol blocks the entire app and the next agent tick
-            # cannot proceed. Discovered from user screenshots 2026-04-27.
-            $confirmDlg = Wait-ForDialog -TimeoutSec 30 -NameMatch 'Botsol.*Export|Export Data to CSV'
-            if ($confirmDlg) {
-                $okBtn = Find-DialogButton -Dialog $confirmDlg -NameMatch '^OK$|^Ok$'
-                if ($okBtn -and (Invoke-Element $okBtn)) {
-                    Write-Log "OK confirmation popup dismissed"
-                } else {
-                    Write-Log "OK popup detected but couldn't click OK (continuing)" 'warn'
-                }
+                Write-Log "SQLite extract complete; output at $outPath"
             } else {
-                Write-Log "OK confirmation popup not detected within 30s (file may already be saved)" 'warn'
+                # Legacy UI-driven Export path (kept for fallback/debug).
+                if (-not (Invoke-Element $btnExport)) {
+                    Write-Log "failed to invoke Export Data" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = 'invoke export failed'
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol export click failed for $country/$srcFile"
+                    exit 0
+                }
+
+                $dlg = Wait-ForDialog -TimeoutSec 10 -NameMatch 'Save'
+                if (-not $dlg) {
+                    Write-Log "save dialog did not appear within 10s" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = 'save dialog timeout'
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol save dialog timeout for $country/$srcFile"
+                    exit 0
+                }
+
+                $fnEdit = Find-DialogFilenameEdit $dlg
+                if (-not (Set-EditValue $fnEdit $outPath)) {
+                    Write-Log "could not set save dialog filename" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = 'set filename failed'
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol set filename failed for $country/$srcFile"
+                    exit 0
+                }
+
+                $saveBtn = Find-DialogButton -Dialog $dlg -NameMatch '^Save$|Save'
+                if (-not (Invoke-Element $saveBtn)) {
+                    Write-Log "could not click Save" 'error'
+                    if ($state.current_run_id) {
+                        Update-ScrapeJob -Id $state.current_run_id -Patch @{
+                            status = 'failed'
+                            error  = 'click save failed'
+                        } | Out-Null
+                    }
+                    Post-Slack ":x: Botsol click Save failed for $country/$srcFile"
+                    exit 0
+                }
+
+                $confirmDlg = Wait-ForDialog -TimeoutSec 30 -NameMatch 'Botsol.*Export|Export Data to CSV'
+                if ($confirmDlg) {
+                    $okBtn = Find-DialogButton -Dialog $confirmDlg -NameMatch '^OK$|^Ok$'
+                    if ($okBtn -and (Invoke-Element $okBtn)) {
+                        Write-Log "OK confirmation popup dismissed"
+                    } else {
+                        Write-Log "OK popup detected but couldn't click OK (continuing)" 'warn'
+                    }
+                } else {
+                    Write-Log "OK confirmation popup not detected within 30s (file may already be saved)" 'warn'
+                }
             }
 
             # Wait for output file
