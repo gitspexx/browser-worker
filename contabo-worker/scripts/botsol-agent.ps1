@@ -343,6 +343,58 @@ function Find-BotsolWindow {
     return $null
 }
 
+function Dismiss-TopLevelBotsolPopup {
+    # Crawler Complete + similar standard MessageBox popups are TOP-LEVEL #32770 windows
+    # OWNED by the BotsolApp process — NOT children of BotForm. The descendant-scoped
+    # ERROR-popup handler below misses them, which causes 3-day stalls when DONE is
+    # masked by a modal Crawler Complete dialog. This scans root children for any
+    # #32770 popup belonging to BotsolApp PID and clicks its OK button via UIA Invoke.
+    param([int]$BotsolPid)
+    if (-not $BotsolPid) { return $false }
+    $dismissed = $false
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $wins = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Children,
+            [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($w in $wins) {
+            try {
+                if ($w.Current.ProcessId -ne $BotsolPid) { continue }
+                if ($w.Current.ClassName -ne '#32770') { continue }
+                $popupName = $w.Current.Name
+                if (-not $popupName) { $popupName = '<noname>' }
+                Write-Log "top-level popup detected: name='$popupName' class=#32770 pid=$BotsolPid"
+                $btnCond = New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Button)
+                $btns = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+                $clicked = $false
+                foreach ($b in $btns) {
+                    try {
+                        $bn = $b.Current.Name
+                        $en = $b.Current.IsEnabled
+                        if ($en -and $bn -match '^&?(OK|Yes|Close)$') {
+                            $pat = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+                            $pat.Invoke()
+                            Write-Log "dismissed top-level '$popupName' via button '$bn'"
+                            Post-Slack ":white_check_mark: Botsol top-level popup '$popupName' auto-dismissed"
+                            $clicked = $true
+                            $dismissed = $true
+                            break
+                        }
+                    } catch {}
+                }
+                if (-not $clicked) {
+                    Write-Log "top-level popup '$popupName' had no clickable OK/Yes/Close button" 'warn'
+                }
+            } catch {}
+        }
+    } catch {
+        Write-Log "Dismiss-TopLevelBotsolPopup error: $($_.Exception.Message)" 'warn'
+    }
+    return $dismissed
+}
+
 $script:BotsolChildrenCache = $null
 
 function Get-BotsolChildren {
@@ -739,6 +791,16 @@ try {
         Write-Log "Botsol window not found; AMBIGUOUS phase, exiting" 'warn'
         exit 0
     }
+
+    # Clear any TOP-LEVEL Crawler Complete / standard MessageBox popups that mask
+    # DONE phase. Done before phase detection so buttons reflect the real state.
+    try {
+        $botPid = $win.Current.ProcessId
+        if (Dismiss-TopLevelBotsolPopup -BotsolPid $botPid) {
+            Start-Sleep -Milliseconds 800
+            $script:BotsolChildrenCache = $null
+        }
+    } catch {}
 
     # Botsol exposes WinForms designer names as AutomationIds (stable across restarts).
     # Earlier recon using FindAll without UIA-client-level WindowsBase saw hash-based
