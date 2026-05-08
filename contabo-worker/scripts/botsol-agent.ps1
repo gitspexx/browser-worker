@@ -1145,7 +1145,16 @@ try {
                     results_found   = $latestN
                 } | Out-Null
             }
-            Post-Slack (":white_check_mark: Botsol DONE  $country / $stem  rows=$latestN  duration=$duration")
+            $countryFlag = switch ($country) {
+                'colombia' { ':flag-co:' }
+                'ecuador'  { ':flag-ec:' }
+                'peru'     { ':flag-pe:' }
+                'chile'    { ':flag-cl:' }
+                'mexico'   { ':flag-mx:' }
+                'brazil'   { ':flag-br:' }
+                default    { ':earth_americas:' }
+            }
+            Post-Slack ("$countryFlag :checkered_flag: *Botsol finished* `"$country / $stem`"  rows=$latestN  duration=$duration")
 
             # Move source .txt to done/
             $countryDir = Join-Path $KEYWORDS_ROOT $country
@@ -1297,7 +1306,17 @@ try {
                 } | Out-Null
             }
 
-            Post-Slack (":arrow_forward: Botsol: $($next.Country)/$($next.Stem) ($($next.Variant)) -- crawl started, $lineCount keywords, cap=$RESULT_CAP")
+            $nextFlag = switch ($next.Country) {
+                'colombia' { ':flag-co:' }
+                'ecuador'  { ':flag-ec:' }
+                'peru'     { ':flag-pe:' }
+                'chile'    { ':flag-cl:' }
+                'mexico'   { ':flag-mx:' }
+                'brazil'   { ':flag-br:' }
+                default    { ':earth_americas:' }
+            }
+            $variantEmoji = if ($next.Variant -eq 'pruned') { ':scissors:' } else { ':seedling:' }
+            Post-Slack ("$nextFlag :rocket: *Botsol switching keyword* -> `"$($next.Country) / $($next.Stem)`" $variantEmoji ($($next.Variant))`n   keywords=$lineCount  cap=$RESULT_CAP  limit=$KEYWORD_LIMIT")
 
             $newState = @{
                 current_run_id      = $jobId
