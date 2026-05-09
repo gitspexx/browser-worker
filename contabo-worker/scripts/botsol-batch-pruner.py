@@ -25,14 +25,98 @@ Outputs:
   - JSON dump of derived patterns to C:\\worker\\tmp\\thing_patterns.json
 """
 
-import csv, json, os, re, sys
+import argparse, csv, json, os, re, sys
 from collections import defaultdict
 from pathlib import Path
 
 
 KEYWORDS_ROOT = r'C:\Botsol\pipeline\keywords_v2'
+ARCHIVE_DIR   = r'C:\Botsol\archive'
 PATTERNS_JSON = r'C:\worker\tmp\thing_patterns.json'
 
+# Cities per country — used by --generate-for to expand productive "things"
+# into per-city kw lines. Mirrors keyword_generator_v2.py.
+COUNTRY_CITIES = {
+    "colombia": ["Bogota", "Medellin", "Cartagena", "Cali", "Barranquilla",
+        "Santa Marta", "San Andres", "Bucaramanga", "Pereira", "Manizales",
+        "Cucuta", "Ibague", "Villavicencio", "Pasto", "Neiva"],
+    "ecuador": ["Quito", "Guayaquil", "Cuenca", "Banos", "Otavalo",
+        "Mindo", "Manta", "Salinas", "Montanita", "Puerto Ayora"],
+    "peru": ["Lima", "Cusco", "Arequipa", "Puno", "Iquitos",
+        "Huaraz", "Trujillo", "Nazca", "Mancora", "Ayacucho"],
+    "chile": ["Santiago", "Valparaiso", "San Pedro de Atacama", "Puerto Natales",
+        "Vina del Mar", "La Serena", "Pucon", "Temuco", "Concepcion", "Iquique"],
+    "mexico": ["Mexico City", "Cancun", "Playa del Carmen", "Tulum", "Oaxaca",
+        "Guadalajara", "Puerto Vallarta", "San Miguel de Allende", "Merida", "Cabo San Lucas"],
+    "brazil": ["Sao Paulo", "Rio de Janeiro", "Salvador", "Florianopolis", "Fortaleza",
+        "Recife", "Curitiba", "Brasilia", "Belo Horizonte", "Manaus"],
+    "argentina": ["Buenos Aires", "Mendoza", "Bariloche", "Cordoba", "Salta",
+        "Ushuaia", "El Calafate", "Iguazu", "Rosario", "Mar del Plata"],
+    "bolivia": ["La Paz", "Sucre", "Cochabamba", "Santa Cruz", "Uyuni",
+        "Potosi", "Oruro", "Tarija", "Trinidad", "Copacabana"],
+}
+
+CATEGORIES = ['cafe', 'do', 'drink', 'eat', 'essentials', 'explore', 'stay', 'wellness']
+
+# Filename patterns we accept for archive auto-discovery.
+# Modern: <country>_<cat>.starter_<stamp>.csv  e.g. ecuador_drink.starter_20260509-1216.csv
+# Modern2: <country>_<cat>_<stamp>.csv         e.g. colombia_do_20260427_163742.csv
+# Legacy: <cat>_starter_<country>_<stamp>.csv  e.g. drink_starter_colombia_20260428.csv
+# Legacy2: <cat>-<country>_<stamp>.csv         e.g. cafe-colombia_20260418_053219.csv
+FILENAME_RX = [
+    re.compile(r'^([a-z]+)_([a-z]+)\.(?:starter|pruned)_', re.IGNORECASE),
+    re.compile(r'^([a-z]+)_starter_([a-z]+)_', re.IGNORECASE),
+    re.compile(r'^([a-z]+)-([a-z]+)_\d', re.IGNORECASE),
+    re.compile(r'^([a-z]+)_([a-z]+)_\d', re.IGNORECASE),
+]
+
+
+def discover_refs_from_archive(archive_dir, keywords_root):
+    """Scan archive_dir for *.csv, parse country+category, pair with source .txt
+    in keywords_root/<country>/. Most-recent CSV per (country,category) wins."""
+    archive = Path(archive_dir)
+    if not archive.exists():
+        return []
+    by_key = {}
+    for csv_path in archive.glob('*.csv'):
+        base = csv_path.name.lower()
+        country, cat = None, None
+        for pat in FILENAME_RX:
+            m = pat.match(base)
+            if not m:
+                continue
+            a, b = m.group(1), m.group(2)
+            if a in COUNTRY_CITIES and b in CATEGORIES:
+                country, cat = a, b; break
+            if b in COUNTRY_CITIES and a in CATEGORIES:
+                country, cat = b, a; break
+        if not country or not cat:
+            continue
+        key = (country, cat)
+        prev = by_key.get(key)
+        if not prev or csv_path.stat().st_mtime > prev.stat().st_mtime:
+            by_key[key] = csv_path
+    refs = []
+    for (country, cat), csv_path in by_key.items():
+        # Source txt: prefer .starter.txt then .txt
+        source_dir = Path(keywords_root) / country
+        candidates = [source_dir / f'{cat}.starter.txt',
+                      source_dir / 'done' / f'{cat}.starter.txt',
+                      source_dir / f'{cat}.txt',
+                      source_dir / 'done' / f'{cat}.txt']
+        source_txt = next((str(p) for p in candidates if p.exists()), None)
+        if not source_txt:
+            continue
+        refs.append({
+            'csv': str(csv_path),
+            'country': country,
+            'category': cat,
+            'source_txt': source_txt,
+        })
+    return refs
+
+
+# Hardcoded refs kept as fallback when archive discovery returns empty.
 DEFAULT_REFS = [
     {
         'csv':     r'C:\Botsol\archive\cafe-colombia_20260418_053219.csv',
@@ -200,20 +284,64 @@ def prune_file(txt_path, country, category, patterns):
     return lines, kept, dropped
 
 
+def generate_starter_for(new_country, patterns, out_root):
+    """For a country with no scraped data yet, build .starter.txt files for each
+    category with productive patterns: expand top productive things across the
+    new country's cities."""
+    cities = COUNTRY_CITIES.get(new_country.lower())
+    if not cities:
+        print(f'  no cities defined for {new_country}, skipping')
+        return
+    target = Path(out_root) / new_country.lower()
+    target.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for cat, p in patterns.items():
+        prods = sorted(p['productive_things'].items(), key=lambda x: x[1], reverse=True)
+        if not prods:
+            continue
+        kws = []
+        for thing, _ in prods:
+            for city in cities:
+                kws.append(f'{thing} in {city} {new_country}')
+            kws.append(f'{thing} in {new_country}')
+        out_file = target / f'{cat}.starter.txt'
+        with out_file.open('w', encoding='utf-8', newline='\n') as f:
+            for k in kws:
+                f.write(k + '\n')
+        print(f'  Generated {len(kws)} kw -> {out_file}')
+        written += 1
+    print(f'  {new_country}: {written} starter files written')
+
+
 def main():
-    refs = DEFAULT_REFS
-    refs_env = os.environ.get('BOTSOL_PRUNER_REFS')
-    if refs_env:
-        try:
-            refs = json.loads(refs_env)
-        except Exception as e:
-            print(f'# WARN: bad BOTSOL_PRUNER_REFS json: {e}', file=sys.stderr)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--auto-discover', action='store_true',
+                    help='Scan archive dir for refs (most-recent CSV per country+cat)')
+    ap.add_argument('--archive', default=ARCHIVE_DIR, help='Archive dir for auto-discover')
+    ap.add_argument('--keywords-root', default=KEYWORDS_ROOT, help='Keywords root')
+    ap.add_argument('--generate-for', default='',
+                    help='Comma-separated NEW countries (e.g. peru,chile). Skips countries that already have a dir in keywords-root.')
+    args = ap.parse_args()
+
+    if args.auto_discover:
+        refs = discover_refs_from_archive(args.archive, args.keywords_root)
+        if not refs:
+            print('# WARN: --auto-discover found 0 refs, falling back to DEFAULT_REFS', file=sys.stderr)
+            refs = DEFAULT_REFS
+    else:
+        refs = DEFAULT_REFS
+        refs_env = os.environ.get('BOTSOL_PRUNER_REFS')
+        if refs_env:
+            try:
+                refs = json.loads(refs_env)
+            except Exception as e:
+                print(f'# WARN: bad BOTSOL_PRUNER_REFS json: {e}', file=sys.stderr)
 
     print('# Botsol batch pruner')
     print(f'# MIN_AVG_UNIQUE = {MIN_AVG_UNIQUE}')
-    print(f'# References:')
+    print(f'# References ({len(refs)} total):')
     for r in refs:
-        print(f'  - {r["country"]}/{r["category"]}: {r["csv"]}')
+        print(f'  - {r["country"]}/{r["category"]}: {os.path.basename(r["csv"])}')
 
     patterns = build_patterns(refs)
 
@@ -295,6 +423,16 @@ def main():
         print(f'\n# TOTAL: {len(summary)} files pruned')
         print(f'  keywords: {total_orig:,} -> {total_kept:,}  ({total_drop:,} dropped, {100.0 * total_drop / total_orig:.1f}%)')
         print(f'\n# Patterns persisted to: {PATTERNS_JSON}')
+
+    # Auto-generate starter files for new countries based on productive patterns
+    if args.generate_for:
+        print(f'\n# Generating starter files for new countries: {args.generate_for}')
+        for new_country in [c.strip().lower() for c in args.generate_for.split(',') if c.strip()]:
+            target_dir = Path(args.keywords_root) / new_country
+            if target_dir.exists() and any(target_dir.glob('*.txt')):
+                print(f'  {new_country}: SKIP (already has files in {target_dir})')
+                continue
+            generate_starter_for(new_country, patterns, args.keywords_root)
 
 
 if __name__ == '__main__':
