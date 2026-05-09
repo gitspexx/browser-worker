@@ -3876,6 +3876,10 @@ async function solveTurnstileChallenge(page) {
 const AIRLINE_ENROLL_FLOWS = {
   norwegian: {
     url: 'https://uk.norwegianreward.com/login/',
+    // The combined login+signup page defaults to the login form; clicking
+    // 'Create new profile' navigates to the real signup form. Without this
+    // step, the signup field selectors are present in DOM but invisible.
+    openSignupSelector: 'button:has-text("Create new profile"), a:has-text("Create new profile")',
     fields: {
       'profile.firstName':           'first_name',
       'profile.lastName':            'last_name',
@@ -3907,11 +3911,27 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
     await page.goto(flow.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
 
-    // Best-effort cookie consent dismissal.
-    const consentBtn = page.getByRole('button', { name: /^(accept(?:\s*all)?|aceptar|aceitar|tout accepter|alle akzeptieren|godkjenn)$/i }).first();
-    if (await consentBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await consentBtn.click({ timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(800);
+    // Best-effort cookie consent dismissal. Match a wider variety: "Accept all",
+    // "Accept all cookies", "Aceptar todas", "Tout accepter", etc.
+    const consentBtn = page
+      .getByRole('button', { name: /^(accept[\s\S]*cookies|accept[\s\S]*all|accept|aceptar|aceitar|tout accepter|alle akzeptieren|godkjenn|i agree)$/i })
+      .first();
+    if (await consentBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await consentBtn.click({ timeout: 3_000 }).catch(() => {});
+      await page.waitForTimeout(1_500);
+    }
+
+    // Some airline pages show a tab / button to switch from login → signup.
+    // If `flow.openSignupSelector` is defined, click it before anti-bot
+    // detection (Cloudflare won't gate again at this stage; the gate was
+    // before the page first loaded).
+    if (flow.openSignupSelector) {
+      const openBtn = page.locator(flow.openSignupSelector).first();
+      if (await openBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await openBtn.click({ timeout: 5_000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+        await page.waitForTimeout(1_500);
+      }
     }
 
     // Anti-bot detection — Cloudflare Turnstile we can solve via CapMonster;
