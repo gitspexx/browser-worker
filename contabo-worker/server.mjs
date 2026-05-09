@@ -3634,6 +3634,153 @@ handlers.airline_login = async (page, { airline, login, password }) => {
   }
 };
 
+// ── airline_enroll — auto-signup for airline loyalty programs (AdsPower) ────
+//
+// Mirrors AIRLINE_LOGIN_FLOWS. Each entry describes how to fill the signup
+// form for one airline: target URL + per-field selector map + submit
+// selector + how to read the issued member number from the post-submit page.
+//
+// Fields use the EnrollInput shape from flights/workers/enroll/index.ts:
+//   first_name, last_name, dob, email, phone, country, postal_code,
+//   address_line1, city, nationality, passport_number, preferred_language.
+//
+// Selectors below for Norwegian were captured by interactive Playwright
+// session 2026-05-08 from a residential IP (where the form actually
+// renders). The Contabo AdsPower profile gives us the same residential
+// fingerprint so these selectors should match here.
+const AIRLINE_ENROLL_FLOWS = {
+  norwegian: {
+    url: 'https://uk.norwegianreward.com/login/',
+    fields: {
+      'profile.firstName':           'first_name',
+      'profile.lastName':            'last_name',
+      'local.newProfileDateOfBirth': 'dob',
+      'profile.country':             'country', // SELECT — match by visible label
+      email:                         'email',
+    },
+    consent: ['local.newProfileCommunicationProfiling'],
+    submitSelector: 'form[name="register"] input[type="submit"], input[type="submit"]:nth-of-type(2)',
+    successPattern: /welcome|verify your email|check your inbox/i,
+  },
+  // TODO: add etihad, delta, lifemiles, miles-more, turkish, flying-blue,
+  // avios, latam — discovery recipe in flights/workers/enroll/STATUS.md.
+};
+
+handlers.airline_enroll = async (page, { airline, profile }) => {
+  const flow = AIRLINE_ENROLL_FLOWS[airline];
+  if (!flow) {
+    return {
+      ok: false,
+      error: `airline_enroll: no flow defined for "${airline}". Known: ${Object.keys(AIRLINE_ENROLL_FLOWS).join(', ') || '(none)'}`,
+    };
+  }
+  if (!profile?.first_name || !profile?.last_name || !profile?.email) {
+    return { ok: false, error: 'airline_enroll: profile must include first_name, last_name, email' };
+  }
+
+  try {
+    await page.goto(flow.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+
+    // Best-effort cookie consent dismissal.
+    const consentBtn = page.getByRole('button', { name: /^(accept(?:\s*all)?|aceptar|aceitar|tout accepter|alle akzeptieren|godkjenn)$/i }).first();
+    if (await consentBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await consentBtn.click({ timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+
+    // Anti-bot detection
+    const html = (await page.content().catch(() => '')).toLowerCase();
+    if (/security check|sicherheitscheck|unusual behaviour|access denied|are you a human|cf-challenge/i.test(html)) {
+      const shot = path.join(OUT, `airline-enroll-${airline}-blocked-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      return { ok: false, status: 'fingerprint_blocked', screenshot: shot };
+    }
+
+    // Fill scalar fields (input + select)
+    for (const [selectorName, profileKey] of Object.entries(flow.fields)) {
+      const value = profile[profileKey];
+      if (!value) continue;
+      const sel = `input[name="${selectorName}"], select[name="${selectorName}"]`;
+      const el = page.locator(sel).first();
+      try {
+        const tagName = await el.evaluate((e) => e.tagName).catch(() => 'INPUT');
+        if (tagName === 'SELECT') {
+          await el.selectOption({ label: String(value) }).catch(async () => {
+            await el.selectOption(String(value));
+          });
+        } else {
+          await el.fill(String(value), { timeout: 8_000 });
+        }
+      } catch (e) {
+        const shot = path.join(OUT, `airline-enroll-${airline}-fill-${selectorName}-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return {
+          ok: false,
+          error: `failed to fill ${selectorName}: ${e?.message || e}`,
+          screenshot: shot,
+        };
+      }
+    }
+
+    // Password fields — derive from last name so re-enroll is deterministic.
+    const password = `${(profile.last_name || 'Spexx').replace(/[^A-Za-z]/g, '').slice(0, 8)}!Aa9${(profile.last_name || '').length}`;
+    for (const sel of ['input[name="newPassword"]', 'input[name="password"]']) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await el.fill(password, { timeout: 5_000 }).catch(() => {});
+      }
+    }
+    const retype = page.locator('input[name="passwordRetype"]').first();
+    if (await retype.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await retype.fill(password, { timeout: 5_000 }).catch(() => {});
+    }
+
+    // Required consent checkboxes
+    for (const consent of flow.consent || []) {
+      const cb = page.locator(`input[name="${consent}"]`).first();
+      if (await cb.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await cb.check({ timeout: 2_000 }).catch(() => {});
+      }
+    }
+
+    const before = path.join(OUT, `airline-enroll-${airline}-pre-submit-${Date.now()}.png`);
+    await page.screenshot({ path: before, fullPage: true }).catch(() => {});
+
+    await page.locator(flow.submitSelector).first().click({ timeout: 8_000 });
+    await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
+
+    const finalHtml = (await page.content().catch(() => '')).toLowerCase();
+    const finalShot = path.join(OUT, `airline-enroll-${airline}-final-${Date.now()}.png`);
+    await page.screenshot({ path: finalShot, fullPage: true }).catch(() => {});
+
+    if (flow.successPattern.test(finalHtml)) {
+      const numMatch = finalHtml.match(/\b\d{7,12}\b/);
+      return {
+        ok: true,
+        status: numMatch ? 'enrolled' : 'pending_verification',
+        member_number: numMatch?.[0] ?? null,
+        screenshot: finalShot,
+      };
+    }
+
+    return {
+      ok: false,
+      status: 'no_success_marker',
+      error: 'submit completed but no welcome / verification text found',
+      screenshot: finalShot,
+    };
+  } catch (err) {
+    const shot = path.join(OUT, `airline-enroll-${airline}-error-${Date.now()}.png`);
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    return {
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      screenshot: shot,
+    };
+  }
+};
+
 // ── App ─────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
