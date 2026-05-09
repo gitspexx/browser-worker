@@ -3911,15 +3911,41 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
     await page.goto(flow.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
 
-    // Best-effort cookie consent dismissal. Match a wider variety: "Accept all",
-    // "Accept all cookies", "Aceptar todas", "Tout accepter", etc.
-    const consentBtn = page
-      .getByRole('button', { name: /^(accept[\s\S]*cookies|accept[\s\S]*all|accept|aceptar|aceitar|tout accepter|alle akzeptieren|godkjenn|i agree)$/i })
-      .first();
-    if (await consentBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      await consentBtn.click({ timeout: 3_000 }).catch(() => {});
-      await page.waitForTimeout(1_500);
+    // Diagnostic snapshot of the page right after Cloudflare bypass.
+    const arriveShot = path.join(OUT, `airline-enroll-${airline}-arrive-${Date.now()}.png`);
+    await page.screenshot({ path: arriveShot, fullPage: true }).catch(() => {});
+
+    // Cookie consent — try ROLE+regex, then a broad list of common selectors.
+    let cookieDismissed = false;
+    for (const labelRe of [
+      /^(accept all cookies?|accept all|accept|aceptar todas?|aceitar todos?|tout accepter|alle akzeptieren|godkjenn alle|i agree|ok)$/i,
+      /accept.*cookie/i,
+    ]) {
+      const btn = page.getByRole('button', { name: labelRe }).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click({ timeout: 3_000 }).catch(() => {});
+        cookieDismissed = true;
+        break;
+      }
     }
+    if (!cookieDismissed) {
+      // Common consent-banner selectors (OneTrust, Quantcast, Cookiebot, Usercentrics)
+      for (const sel of [
+        '#onetrust-accept-btn-handler',
+        '#qc-cmp2-ui button[mode="primary"]',
+        'button[data-testid="uc-accept-all-button"]',
+        'button.css-47sehv',
+        'button[aria-label="Accept all cookies"]',
+      ]) {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await el.click({ timeout: 3_000 }).catch(() => {});
+          cookieDismissed = true;
+          break;
+        }
+      }
+    }
+    if (cookieDismissed) await page.waitForTimeout(1_500);
 
     // Some airline pages show a tab / button to switch from login → signup.
     // If `flow.openSignupSelector` is defined, click it before anti-bot
