@@ -3968,12 +3968,32 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
       // Form should now be reachable; fall through to normal fill logic.
     }
 
-    // Fill scalar fields (input + select)
+    // Fill scalar fields (input + select). Many airline pages render the
+    // SAME field twice (login form + signup form) with one hidden. Find the
+    // first VISIBLE matching element rather than blindly taking .first().
+    async function pickVisible(sel) {
+      const all = page.locator(sel);
+      const count = await all.count();
+      for (let i = 0; i < count; i++) {
+        const el = all.nth(i);
+        if (await el.isVisible({ timeout: 500 }).catch(() => false)) return el;
+      }
+      return null;
+    }
     for (const [selectorName, profileKey] of Object.entries(flow.fields)) {
       const value = profile[profileKey];
       if (!value) continue;
       const sel = `input[name="${selectorName}"], select[name="${selectorName}"]`;
-      const el = page.locator(sel).first();
+      const el = await pickVisible(sel);
+      if (!el) {
+        const shot = path.join(OUT, `airline-enroll-${airline}-no-visible-${selectorName}-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return {
+          ok: false,
+          error: `no visible match for ${selectorName}`,
+          screenshot: shot,
+        };
+      }
       try {
         const tagName = await el.evaluate((e) => e.tagName).catch(() => 'INPUT');
         if (tagName === 'SELECT') {
