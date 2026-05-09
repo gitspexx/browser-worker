@@ -3928,9 +3928,18 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
     if (flow.openSignupSelector) {
       const openBtn = page.locator(flow.openSignupSelector).first();
       if (await openBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
-        await openBtn.click({ timeout: 5_000 }).catch(() => {});
+        const beforeUrl = page.url();
+        // Norwegian's "Create new profile" is a real link — wait for nav.
+        await Promise.all([
+          page.waitForURL((u) => u.toString() !== beforeUrl, { timeout: 30_000 }).catch(() => {}),
+          openBtn.click({ timeout: 5_000 }).catch(() => {}),
+        ]);
         await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
         await page.waitForTimeout(1_500);
+        // Take a screenshot of the post-navigation page so we can confirm
+        // the real signup form is now in DOM.
+        const navShot = path.join(OUT, `airline-enroll-${airline}-after-signup-tab-${Date.now()}.png`);
+        await page.screenshot({ path: navShot, fullPage: true }).catch(() => {});
       }
     }
 
