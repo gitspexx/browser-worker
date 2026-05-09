@@ -3634,6 +3634,231 @@ handlers.airline_login = async (page, { airline, login, password }) => {
   }
 };
 
+// ── CapMonster Turnstile solver (used by airline_enroll for CF gates) ──────
+//
+// Cloudflare Turnstile blocks our datacenter IPs at the IP-reputation layer
+// before any Playwright fingerprint matters. CapMonster's `TurnstileTaskProxyless`
+// solves the challenge and returns a token we can inject into the page's
+// `cf-turnstile-response` input, then submit to bypass the gate.
+//
+// Pricing (~2025): ~$0.001 per Turnstile solve, $10 floor on the account.
+// API key in worker .env as CAPMONSTER_API_KEY.
+// AntiCloudflareTask — for Cloudflare's MANAGED CHALLENGE pages where there
+// is no embedded Turnstile widget / sitekey. Returns cf_clearance cookies +
+// a user-agent that we inject into the browser context, then reload to bypass.
+//
+// Requires a residential proxy. Configure via worker .env:
+//   PROXY_TYPE=http (or socks5, https)
+//   PROXY_ADDRESS=186.179.49.111   (Proxy6 static residential — or any other)
+//   PROXY_PORT=8000
+//   PROXY_LOGIN=...
+//   PROXY_PASSWORD=...
+async function solveAntiCloudflare(page, apiKey) {
+  const proxyType = process.env.PROXY_TYPE;
+  const proxyAddress = process.env.PROXY_ADDRESS;
+  const proxyPort = process.env.PROXY_PORT;
+  if (!proxyType || !proxyAddress || !proxyPort) {
+    return {
+      solved: false,
+      error: 'AntiCloudflareTask requires PROXY_TYPE/ADDRESS/PORT in worker .env (residential)',
+    };
+  }
+  const websiteUrl = page.url();
+  try {
+    const create = await fetch('https://api.capmonster.cloud/createTask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: apiKey,
+        task: {
+          type: 'AntiCloudflareTask',
+          websiteURL: websiteUrl,
+          proxyType,
+          proxyAddress,
+          proxyPort: parseInt(proxyPort, 10),
+          proxyLogin: process.env.PROXY_LOGIN || undefined,
+          proxyPassword: process.env.PROXY_PASSWORD || undefined,
+        },
+      }),
+    }).then((r) => r.json());
+    if (create.errorId !== 0 || !create.taskId) {
+      return { solved: false, error: `capmonster AntiCloudflareTask: ${create.errorDescription || create.errorCode}` };
+    }
+    const taskId = create.taskId;
+    const deadline = Date.now() + 180_000;
+    await new Promise((r) => setTimeout(r, 5_000));
+    while (Date.now() < deadline) {
+      const result = await fetch('https://api.capmonster.cloud/getTaskResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, taskId }),
+      }).then((r) => r.json());
+      if (result.errorId !== 0) {
+        return { solved: false, error: `capmonster AntiCloudflareTask getResult: ${result.errorDescription}` };
+      }
+      if (result.status === 'ready') {
+        const cookies = result.solution?.cookies;
+        const ua = result.solution?.userAgent;
+        if (!cookies?.cf_clearance) {
+          return { solved: false, error: 'AntiCloudflareTask solved but no cf_clearance cookie' };
+        }
+        // Inject cookies into the browser context + reload
+        const url = new URL(websiteUrl);
+        const ctx = page.context();
+        await ctx.addCookies([
+          {
+            name: 'cf_clearance',
+            value: cookies.cf_clearance,
+            domain: url.hostname.replace(/^www\./, ''),
+            path: '/',
+            httpOnly: true,
+            secure: true,
+            sameSite: 'None',
+          },
+        ]);
+        if (ua) {
+          // Updating UA mid-session needs a new context in Playwright; for
+          // AdsPower we trust the existing UA (already set by the profile).
+          console.log('[anti-cf] note: UA mismatch may matter, ignoring');
+        }
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        return { solved: true, method: 'anti-cloudflare', cf_clearance: '<set>' };
+      }
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+    return { solved: false, error: 'AntiCloudflareTask timed out after 180s' };
+  } catch (err) {
+    return { solved: false, error: `AntiCloudflareTask: ${err?.message || err}` };
+  }
+}
+
+async function solveTurnstileChallenge(page) {
+  const apiKey = process.env.CAPMONSTER_API_KEY;
+  if (!apiKey) {
+    return { solved: false, error: 'CAPMONSTER_API_KEY missing in worker .env' };
+  }
+
+  // Cloudflare's managed challenge page hides sitekey in several places.
+  // Try data-sitekey first, then iframe src params, then _cf_chl_opt globals.
+  const probe = await page.evaluate(() => {
+    // (1) Embedded Turnstile widget on a normal page
+    const widget = document.querySelector('.cf-turnstile, [data-sitekey]');
+    if (widget?.getAttribute('data-sitekey')) {
+      return { sitekey: widget.getAttribute('data-sitekey'), source: 'data-sitekey' };
+    }
+    // (2) Cloudflare-injected iframe
+    const ifr = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    if (ifr) {
+      const m = ifr.getAttribute('src')?.match(/\/turnstile\/[^/]+\/([a-zA-Z0-9_-]+)\//);
+      if (m) return { sitekey: m[1], source: 'iframe-src' };
+    }
+    // (3) _cf_chl_opt window global on managed-challenge pages
+    const opt = (window).turnstile?.lastSiteKey || (window)._cf_chl_opt;
+    if (opt && typeof opt === 'object') {
+      // Common keys observed in challenge pages
+      const candidates = [opt.cFPWv, opt.cKey, opt.sitekey, opt.cType];
+      for (const c of candidates) {
+        if (typeof c === 'string' && c.length > 10 && c.length < 50) {
+          return { sitekey: c, source: '_cf_chl_opt' };
+        }
+      }
+    }
+    // (4) Search inline scripts for cf-managed challenge pattern
+    for (const s of document.querySelectorAll('script')) {
+      const text = s.textContent || '';
+      const m = text.match(/turnstile[^"]*['"\s]*sitekey['"\s:]+['"]([0-9a-zA-Z_-]{15,40})['"]/i)
+            || text.match(/['"]([0-9]{4}_[0-9a-zA-Z_-]{20,40})['"]/);
+      if (m) return { sitekey: m[1], source: 'inline-script' };
+    }
+    return { sitekey: null };
+  });
+
+  if (!probe.sitekey) {
+    // Cloudflare's MANAGED CHALLENGE page (vs an embedded Turnstile widget)
+    // doesn't expose a sitekey — the challenge is internal to Cloudflare.
+    // For these, CapMonster offers AntiCloudflareTask which requires a
+    // residential proxy and returns cf_clearance cookies. Try that path.
+    const anti = await solveAntiCloudflare(page, apiKey);
+    if (anti.solved) return anti;
+    // Dump page HTML so the operator can inspect what's actually on the gate.
+    const debugHtml = path.join(OUT, `airline-enroll-turnstile-no-sitekey-${Date.now()}.html`);
+    try {
+      const html = await page.content();
+      fs.writeFileSync(debugHtml, html, 'utf-8');
+    } catch (_) {}
+    return {
+      solved: false,
+      error: anti.error || 'cloudflare_managed_challenge_no_sitekey',
+      detail: 'Page is a Cloudflare-managed challenge (no embedded Turnstile widget). ' +
+              'Need residential proxy on AdsPower profile, OR AntiCloudflareTask with proxy. ' +
+              'AdsPower-profile-proxy is the simpler path.',
+      debug_html: debugHtml,
+    };
+  }
+  const sitekey = probe.sitekey;
+  const websiteUrl = page.url();
+  console.log(`[turnstile] sitekey=${sitekey} from ${probe.source}`);
+
+  try {
+    const create = await fetch('https://api.capmonster.cloud/createTask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: apiKey,
+        task: {
+          type: 'TurnstileTaskProxyless',
+          websiteURL: websiteUrl,
+          websiteKey: sitekey,
+        },
+      }),
+    }).then((r) => r.json());
+
+    if (create.errorId !== 0 || !create.taskId) {
+      return { solved: false, error: `capmonster createTask: ${create.errorDescription || create.errorCode}` };
+    }
+    const taskId = create.taskId;
+
+    // Poll up to 90s. Turnstile usually solves in 10-30s.
+    const deadline = Date.now() + 90_000;
+    await new Promise((r) => setTimeout(r, 5_000));
+    while (Date.now() < deadline) {
+      const result = await fetch('https://api.capmonster.cloud/getTaskResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, taskId }),
+      }).then((r) => r.json());
+      if (result.errorId !== 0) {
+        return { solved: false, error: `capmonster getTaskResult: ${result.errorDescription}` };
+      }
+      if (result.status === 'ready') {
+        const token = result.solution?.token;
+        if (!token) return { solved: false, error: 'capmonster solved but no token' };
+        // Inject into the page. Cloudflare Turnstile reads from the input
+        // `name="cf-turnstile-response"`. Setting it via the native setter
+        // and dispatching change is the safest cross-skin approach.
+        await page.evaluate((t) => {
+          const setNative = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+          inputs.forEach((i) => {
+            setNative.call(i, t);
+            i.dispatchEvent(new Event('input', { bubbles: true }));
+            i.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+          // Also call the global Turnstile callback if defined (some skins use it)
+          if (typeof window.turnstile?.execute === 'function') {
+            try { window.turnstile.execute(); } catch (_) {}
+          }
+        }, token);
+        return { solved: true, token };
+      }
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+    return { solved: false, error: 'capmonster: solve timed out after 90s' };
+  } catch (err) {
+    return { solved: false, error: `capmonster: ${err?.message || err}` };
+  }
+}
+
 // ── airline_enroll — auto-signup for airline loyalty programs (AdsPower) ────
 //
 // Mirrors AIRLINE_LOGIN_FLOWS. Each entry describes how to fill the signup
@@ -3689,12 +3914,58 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
       await page.waitForTimeout(800);
     }
 
-    // Anti-bot detection
+    // Anti-bot detection — Cloudflare Turnstile we can solve via CapMonster;
+    // Akamai / Imperva 'Access Denied' we can't (returns immediately).
     const html = (await page.content().catch(() => '')).toLowerCase();
-    if (/security check|sicherheitscheck|unusual behaviour|access denied|are you a human|cf-challenge/i.test(html)) {
+    const isTurnstile = /are you a human|verify you are human|cf-challenge|cf-turnstile/i.test(html);
+    const isAkamai = /access denied|edgesuite\.net|reference #\d/i.test(html);
+    const isImperva = /security check|sicherheitscheck|unusual behaviour|resembles that of a bot/i.test(html);
+
+    if (isAkamai || isImperva) {
       const shot = path.join(OUT, `airline-enroll-${airline}-blocked-${Date.now()}.png`);
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
       return { ok: false, status: 'fingerprint_blocked', screenshot: shot };
+    }
+
+    if (isTurnstile) {
+      const shotBefore = path.join(OUT, `airline-enroll-${airline}-turnstile-${Date.now()}.png`);
+      await page.screenshot({ path: shotBefore, fullPage: true }).catch(() => {});
+      const solveResult = await solveTurnstileChallenge(page);
+      if (!solveResult.solved) {
+        return {
+          ok: false,
+          status: 'turnstile_unsolved',
+          error: solveResult.error,
+          screenshot: shotBefore,
+        };
+      }
+      // Most Turnstile gates auto-redirect once the token is set. If not,
+      // there's usually a submit button on the gate; click it.
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+      // If we're still on the gate, look for an explicit submit/continue.
+      const stillGated = /are you a human|verify you are human/i.test(
+        (await page.content().catch(() => '')).toLowerCase(),
+      );
+      if (stillGated) {
+        const cont = page.locator('button[type="submit"], input[type="submit"]').first();
+        if (await cont.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await cont.click({ timeout: 5_000 }).catch(() => {});
+          await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+        }
+      }
+      // Re-check; if still gated, give up cleanly.
+      const finalHtml = (await page.content().catch(() => '')).toLowerCase();
+      if (/are you a human|verify you are human/i.test(finalHtml)) {
+        const shotAfter = path.join(OUT, `airline-enroll-${airline}-turnstile-stillgated-${Date.now()}.png`);
+        await page.screenshot({ path: shotAfter, fullPage: true }).catch(() => {});
+        return {
+          ok: false,
+          status: 'turnstile_still_gated',
+          error: 'CapMonster returned a token but the page is still showing the challenge',
+          screenshot: shotAfter,
+        };
+      }
+      // Form should now be reachable; fall through to normal fill logic.
     }
 
     // Fill scalar fields (input + select)
