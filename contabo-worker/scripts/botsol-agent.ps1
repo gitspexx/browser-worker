@@ -95,6 +95,17 @@ if ($cfg['ONLY_COUNTRIES']) {
         ForEach-Object { $_.Trim().ToLowerInvariant() } |
         Where-Object { $_ }
 }
+# COUNTRY_ROTATION = ordered comma-separated list (e.g. "ecuador,colombia,peru,chile,
+# mexico,brazil"). When set AND ONLY_COUNTRIES empty, the agent picks files only from
+# the FIRST country in this list that still has unfinished stems. Once a country
+# fully exhausts (every stem appears in done/), the agent advances to the next.
+# This auto-rotates without env edits — finish ecuador, drop into colombia, etc.
+$COUNTRY_ROTATION = @()
+if ($cfg['COUNTRY_ROTATION']) {
+    $COUNTRY_ROTATION = ($cfg['COUNTRY_ROTATION'] -split ',') |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ }
+}
 $RESULT_CAP            = if ($cfg['RESULT_CAP'])    { [string]$cfg['RESULT_CAP'] }    else { '100' }
 $KEYWORD_LIMIT         = if ($cfg['KEYWORD_LIMIT']) { [string]$cfg['KEYWORD_LIMIT'] } else { '5' }
 
@@ -230,6 +241,22 @@ function Get-NextQueueItem {
             Write-Log "ONLY_COUNTRIES=$($ONLY_COUNTRIES -join ',') matched zero country dirs in $KEYWORDS_ROOT" 'warn'
             return $null
         }
+    } elseif ($COUNTRY_ROTATION.Count -gt 0) {
+        # Re-order country list to follow rotation; drop countries not listed.
+        # The Get-NextQueueItem loop already short-circuits on first country with
+        # unfinished stems, so just changing the order achieves auto-advance:
+        # ecuador exhausts -> first hit becomes colombia -> etc.
+        $byName = @{}
+        foreach ($c in $countries) { $byName[$c.Name.ToLowerInvariant()] = $c }
+        $ordered = @()
+        foreach ($n in $COUNTRY_ROTATION) {
+            if ($byName.ContainsKey($n)) { $ordered += $byName[$n] }
+        }
+        if (-not $ordered) {
+            Write-Log "COUNTRY_ROTATION=$($COUNTRY_ROTATION -join ',') matched zero country dirs in $KEYWORDS_ROOT" 'warn'
+            return $null
+        }
+        $countries = $ordered
     }
 
     foreach ($country in $countries) {
@@ -1217,6 +1244,10 @@ try {
                 Post-Slack ":mag: Colombia / do exported + txt moved. Data still in Botsol memory as safety net; verify CSV then click Delete manually + set AUTO_DELETE_CURRENT=true."
             }
 
+            # Record last-completed country so the next IDLE tick can detect a
+            # country handoff (e.g. ecuador -> colombia) and post a special Slack.
+            try { Set-Content -Path 'C:\worker\botsol-last-country.txt' -Value $country -Encoding UTF8 } catch {}
+
             Clear-QueueState
             exit 0
         }
@@ -1350,6 +1381,30 @@ try {
                 default    { ':earth_americas:' }
             }
             $variantEmoji = if ($next.Variant -eq 'pruned') { ':scissors:' } else { ':seedling:' }
+
+            # Country handoff detection: if the previous completed country differs
+            # from $next.Country, we just rolled over (e.g. ecuador exhausted ->
+            # colombia first kw). Post a celebratory handoff before the keyword line.
+            try {
+                $lastCountryFile = 'C:\worker\botsol-last-country.txt'
+                if (Test-Path $lastCountryFile) {
+                    $lastCountry = (Get-Content $lastCountryFile -Raw).Trim()
+                    if ($lastCountry -and $lastCountry -ne $next.Country) {
+                        $lastFlag = switch ($lastCountry) {
+                            'colombia' { ':flag-co:' }
+                            'ecuador'  { ':flag-ec:' }
+                            'peru'     { ':flag-pe:' }
+                            'chile'    { ':flag-cl:' }
+                            'mexico'   { ':flag-mx:' }
+                            'brazil'   { ':flag-br:' }
+                            default    { ':earth_americas:' }
+                        }
+                        $lastProgress = Get-CountryProgress -Country $lastCountry
+                        Post-Slack ("$lastFlag :tada: *$lastCountry COMPLETED* ($($lastProgress.Done)/$($lastProgress.Total) stems)  :arrow_right:  $nextFlag rolling into *$($next.Country)*")
+                    }
+                }
+            } catch {}
+
             Post-Slack ("$nextFlag :rocket: *Botsol switching keyword* -> `"$($next.Country) / $($next.Stem)`" $variantEmoji ($($next.Variant))`n   keywords=$lineCount  cap=$RESULT_CAP  limit=$KEYWORD_LIMIT")
 
             $newState = @{
