@@ -4222,7 +4222,9 @@ handlers.airline_claim = async (page, { airline, claim }) => {
       }
       const targetValue = useAvianca ? 'Avianca' : 'Star Alliance';
 
-      await page.waitForSelector('input[type="radio"][value="Star Alliance"]', { timeout: 20_000 });
+      // The radio inputs are visually-hidden (label is the click target).
+      // Wait for DOM attachment, not visibility.
+      await page.waitForSelector('input[type="radio"][value="Star Alliance"]', { state: 'attached', timeout: 20_000 });
       const radioState = await page.evaluate((target) => {
         const inputs = [...document.querySelectorAll('input[type="radio"]')];
         const desired = inputs.find((i) => i.value === target);
