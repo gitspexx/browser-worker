@@ -3876,20 +3876,23 @@ async function solveTurnstileChallenge(page) {
 const AIRLINE_ENROLL_FLOWS = {
   norwegian: {
     url: 'https://uk.norwegianreward.com/login/',
-    // The combined login+signup page defaults to the login form; clicking
-    // 'Create new profile' navigates to the real signup form. Without this
-    // step, the signup field selectors are present in DOM but invisible.
-    openSignupSelector: 'button:has-text("Create new profile"), a:has-text("Create new profile")',
-    fields: {
-      'profile.firstName':           'first_name',
-      'profile.lastName':            'last_name',
-      'local.newProfileDateOfBirth': 'dob',
-      'profile.country':             'country', // SELECT — match by visible label
-      email:                         'email',
-    },
+    manualOnly: true,
+    manualReason: 'Gigya intro-page button is unreachable by Playwright locators (top-level + frame walk). Enroll once via AdsPower k1c6fxdw, save creds to 1Password.',
+    // Selectors confirmed via DevTools 2026-05-09: cookie banner is OneTrust,
+    // 'Create new profile' is an <a> with id #login-create-new-profile-button.
+    openSignupSelector: '#login-create-new-profile-button, a:has-text("Create new profile"), button:has-text("Create new profile"), [role="button"]:has-text("Create new profile")',
+    waitForSignupSelector: '#new-profile-first-name',
+    fields: [
+      { selector: '#new-profile-first-name, input[name="profile.firstName"]', profileKey: 'first_name' },
+      { selector: '#new-profile-last-name, input[name="profile.lastName"]',   profileKey: 'last_name' },
+      { selector: '#new-profile-date-of-birth, input[name="local.newProfileDateOfBirth"]', profileKey: 'dob' },
+      { selector: '#new-profile-country, select[name="profile.country"]',     profileKey: 'country' },
+      { selector: '#new-profile-login-id, input[name="email"]',               profileKey: 'email' },
+    ],
     consent: ['local.newProfileCommunicationProfiling'],
-    submitSelector: 'form[name="register"] input[type="submit"], input[type="submit"]:nth-of-type(2)',
-    successPattern: /welcome|verify your email|check your inbox/i,
+    // No type=submit on this form; the action button is a styled <button>.
+    submitSelector: 'button:has-text("Create profile"), button:has-text("Create my profile"), button:has-text("Continue"), button:has-text("Sign up"), button:has-text("Next")',
+    successPattern: /welcome|verify your email|check your inbox|confirmation/i,
   },
   // TODO: add etihad, delta, lifemiles, miles-more, turkish, flying-blue,
   // avios, latam — discovery recipe in flights/workers/enroll/STATUS.md.
@@ -3903,8 +3906,32 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
       error: `airline_enroll: no flow defined for "${airline}". Known: ${Object.keys(AIRLINE_ENROLL_FLOWS).join(', ') || '(none)'}`,
     };
   }
+  if (flow.manualOnly) {
+    return {
+      ok: false,
+      status: 'manual_only',
+      error: `${airline} enroll is flagged manual-only (${flow.manualReason || 'see STATUS.md'})`,
+    };
+  }
   if (!profile?.first_name || !profile?.last_name || !profile?.email) {
     return { ok: false, error: 'airline_enroll: profile must include first_name, last_name, email' };
+  }
+
+  // Hoisted + frame-aware: many airline pages render fields/buttons inside
+  // an embedded iframe (Gigya, Salesforce, etc). pickVisible walks the main
+  // frame first, then every child frame, returning the first visible match.
+  async function pickVisible(sel) {
+    const candidates = [page, ...page.frames().filter((f) => f !== page.mainFrame())];
+    for (const frame of candidates) {
+      const root = frame.locator ? frame.locator(sel) : frame; // page or Frame
+      const all = root;
+      const count = await all.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const el = all.nth(i);
+        if (await el.isVisible({ timeout: 500 }).catch(() => false)) return el;
+      }
+    }
+    return null;
   }
 
   try {
@@ -3951,22 +3978,47 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
     // If `flow.openSignupSelector` is defined, click it before anti-bot
     // detection (Cloudflare won't gate again at this stage; the gate was
     // before the page first loaded).
+    // Some airline signups are multi-step gates (Norwegian: login → intro
+    // page → real form, both intermediate steps share the SAME "Create new
+    // profile" button id). Loop the openSignup click until either the
+    // signup form is visible or we exhaust attempts.
     if (flow.openSignupSelector) {
-      const openBtn = page.locator(flow.openSignupSelector).first();
-      if (await openBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      const maxClicks = flow.openSignupMaxClicks ?? 3;
+      for (let i = 0; i < maxClicks; i++) {
+        if (flow.waitForSignupSelector) {
+          const ready = await page.locator(flow.waitForSignupSelector).first()
+            .isVisible({ timeout: 1_500 }).catch(() => false);
+          if (ready) break;
+        }
+        const openBtn = await pickVisible(flow.openSignupSelector);
+        if (!openBtn) {
+          const dbg = path.join(OUT, `airline-enroll-${airline}-signup-iter${i}-no-button-${Date.now()}.png`);
+          await page.screenshot({ path: dbg, fullPage: true }).catch(() => {});
+          break;
+        }
         const beforeUrl = page.url();
-        // Norwegian's "Create new profile" is a real link — wait for nav.
+        const beforeShot = path.join(OUT, `airline-enroll-${airline}-signup-iter${i}-before-${Date.now()}.png`);
+        await page.screenshot({ path: beforeShot, fullPage: true }).catch(() => {});
+        // Scroll into view + force click via JS to bypass overlays.
+        await openBtn.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => {});
         await Promise.all([
-          page.waitForURL((u) => u.toString() !== beforeUrl, { timeout: 30_000 }).catch(() => {}),
-          openBtn.click({ timeout: 5_000 }).catch(() => {}),
+          page.waitForURL((u) => u.toString() !== beforeUrl, { timeout: 15_000 }).catch(() => {}),
+          openBtn.click({ timeout: 5_000, force: true }).catch(() => {}),
         ]);
-        await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-        await page.waitForTimeout(1_500);
-        // Take a screenshot of the post-navigation page so we can confirm
-        // the real signup form is now in DOM.
-        const navShot = path.join(OUT, `airline-enroll-${airline}-after-signup-tab-${Date.now()}.png`);
-        await page.screenshot({ path: navShot, fullPage: true }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+        if (flow.waitForSignupSelector) {
+          await page.locator(flow.waitForSignupSelector).first().waitFor({
+            state: 'visible',
+            timeout: 10_000,
+          }).catch(() => {});
+        } else {
+          await page.waitForTimeout(1_500);
+        }
+        const afterShot = path.join(OUT, `airline-enroll-${airline}-signup-iter${i}-after-${Date.now()}.png`);
+        await page.screenshot({ path: afterShot, fullPage: true }).catch(() => {});
       }
+      const navShot = path.join(OUT, `airline-enroll-${airline}-after-signup-tab-${Date.now()}.png`);
+      await page.screenshot({ path: navShot, fullPage: true }).catch(() => {});
     }
 
     // Anti-bot detection — Cloudflare Turnstile we can solve via CapMonster;
@@ -4023,29 +4075,27 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
       // Form should now be reachable; fall through to normal fill logic.
     }
 
-    // Fill scalar fields (input + select). Many airline pages render the
-    // SAME field twice (login form + signup form) with one hidden. Find the
-    // first VISIBLE matching element rather than blindly taking .first().
-    async function pickVisible(sel) {
-      const all = page.locator(sel);
-      const count = await all.count();
-      for (let i = 0; i < count; i++) {
-        const el = all.nth(i);
-        if (await el.isVisible({ timeout: 500 }).catch(() => false)) return el;
-      }
-      return null;
-    }
-    for (const [selectorName, profileKey] of Object.entries(flow.fields)) {
-      const value = profile[profileKey];
+    // Fill scalar fields (input + select). Uses hoisted pickVisible.
+    // Normalize fields: support array form [{selector, profileKey}] and
+    // legacy map form { 'name=': 'profileKey' }.
+    const fieldList = Array.isArray(flow.fields)
+      ? flow.fields
+      : Object.entries(flow.fields).map(([name, profileKey]) => ({
+          selector: `input[name="${name}"], select[name="${name}"]`,
+          profileKey,
+          label: name,
+        }));
+    for (const fieldDef of fieldList) {
+      const value = profile[fieldDef.profileKey];
       if (!value) continue;
-      const sel = `input[name="${selectorName}"], select[name="${selectorName}"]`;
-      const el = await pickVisible(sel);
+      const label = fieldDef.label || fieldDef.selector;
+      const el = await pickVisible(fieldDef.selector);
       if (!el) {
-        const shot = path.join(OUT, `airline-enroll-${airline}-no-visible-${selectorName}-${Date.now()}.png`);
+        const shot = path.join(OUT, `airline-enroll-${airline}-no-visible-${fieldDef.profileKey}-${Date.now()}.png`);
         await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
         return {
           ok: false,
-          error: `no visible match for ${selectorName}`,
+          error: `no visible match for ${label}`,
           screenshot: shot,
         };
       }
@@ -4059,11 +4109,11 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
           await el.fill(String(value), { timeout: 8_000 });
         }
       } catch (e) {
-        const shot = path.join(OUT, `airline-enroll-${airline}-fill-${selectorName}-${Date.now()}.png`);
+        const shot = path.join(OUT, `airline-enroll-${airline}-fill-${fieldDef.profileKey}-${Date.now()}.png`);
         await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
         return {
           ok: false,
-          error: `failed to fill ${selectorName}: ${e?.message || e}`,
+          error: `failed to fill ${label}: ${e?.message || e}`,
           screenshot: shot,
         };
       }
@@ -4124,6 +4174,264 @@ handlers.airline_enroll = async (page, { airline, profile }) => {
       error: err && err.message ? err.message : String(err),
       screenshot: shot,
     };
+  }
+};
+
+// ── airline_claim — submit retroactive-mile claims for past flights via the
+//    AdsPower 'flights' profile (k1c6fxdw). One verified flow per airline.
+//    Only LifeMiles is verified end-to-end as of 2026-05-10. Others are stubs
+//    that bail with not_yet_implemented; selectors get hardened per supervised
+//    run.
+handlers.airline_claim = async (page, { airline, claim }) => {
+  const STAR_ALLIANCE_PREFIXES = new Set([
+    'AV','AC','NH','OZ','OS','AI','NZ','CA','SQ','CM','ET',
+    'BR','LO','LH','SK','ZH','SN','SA','TP','TG','TK','UA','LX',
+  ]);
+
+  if (airline === 'lifemiles') {
+    // Verified end-to-end against Alessandro's account 2026-05-10. The flow
+    // assumes the AdsPower 'flights' profile has Alessandro's session cookies
+    // (sticky login). If not, bail with session_expired so an operator can
+    // re-login on RDP.
+    try {
+      const identifier = claim?.ticket_number || claim?.pnr;
+      if (!identifier) return { ok: false, error: 'lifemiles_requires_ticket_or_pnr' };
+
+      await page.goto('https://www.lifemiles.com/fly/retro', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+
+      // Hydrate
+      for (let i = 0; i < 30; i++) {
+        const n = await page.evaluate(() => document.querySelectorAll('input').length);
+        if (n >= 4) break;
+        await page.waitForTimeout(500);
+      }
+      await page.waitForTimeout(2_500);
+
+      const greeted = await page.getByText(/Alessandro|miles$/i).first()
+        .isVisible({ timeout: 5_000 }).catch(() => false);
+      if (!greeted) {
+        const shot = path.join(OUT, `airline-claim-lifemiles-session-expired-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return { ok: false, error: 'session_expired_on_adspower_profile', screenshot: shot };
+      }
+
+      const iata = (claim?.flight_number || '').slice(0, 2).toUpperCase();
+      const useAvianca = iata === 'AV';
+      if (!useAvianca && !STAR_ALLIANCE_PREFIXES.has(iata)) {
+        return { ok: false, error: `airline_${iata}_not_in_star_alliance` };
+      }
+      const targetValue = useAvianca ? 'Avianca' : 'Star Alliance';
+
+      await page.waitForSelector('input[type="radio"][value="Star Alliance"]', { timeout: 20_000 });
+      const radioState = await page.evaluate((target) => {
+        const inputs = [...document.querySelectorAll('input[type="radio"]')];
+        const desired = inputs.find((i) => i.value === target);
+        const checked = inputs.find((i) => i.checked);
+        return { desiredId: desired ? desired.id : null, checkedValue: checked ? checked.value : null };
+      }, targetValue);
+      if (radioState.checkedValue !== targetValue && radioState.desiredId) {
+        const lbl = page.locator(`label[for="${radioState.desiredId}"]`).first();
+        if (await lbl.isVisible({ timeout: 2_000 }).catch(() => false)) {
+          await lbl.click({ timeout: 5_000 });
+        } else {
+          await page.getByText(targetValue, { exact: true }).first().click({ timeout: 5_000 });
+        }
+        await page.waitForTimeout(800);
+      }
+
+      const useTicket = !!claim.ticket_number;
+      const optionValue = useTicket ? '1' : '0';
+      await page.locator('select[aria-label="dropdown"]').first().selectOption({ value: optionValue });
+      await page.evaluate(() => {
+        const sel = document.querySelector('select[aria-label="dropdown"]');
+        if (sel) sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.waitForTimeout(500);
+
+      // Type via keyboard so React onChange fires.
+      await page.locator('#documentNumber').click();
+      await page.locator('#documentNumber').focus();
+      await page.keyboard.press('Control+A').catch(() => {});
+      await page.keyboard.press('Delete').catch(() => {});
+      await page.keyboard.type(identifier, { delay: 30 });
+      await page.keyboard.press('Tab');
+      await page.waitForTimeout(1_500);
+
+      await page.locator('#Retro-Request').click({ timeout: 15_000 });
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(3_000);
+
+      const shot = path.join(OUT, `airline-claim-lifemiles-${claim.flight_number}-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+
+      const notFound = await page.getByText(/We could not find information|No (encontramos|pudimos encontrar)/i)
+        .first().isVisible({ timeout: 5_000 }).catch(() => false);
+      if (notFound) {
+        return { ok: false, error: 'lifemiles_ticket_not_found_or_already_credited', screenshot: shot };
+      }
+
+      const confirmation = page.getByText(/case (number|reference)|reference|confirmaci[oó]n|solicitud (recibida|exitosa)|request received|your case|miles will be credited/i);
+      const confirmed = await confirmation.first().isVisible({ timeout: 8_000 }).catch(() => false);
+      if (confirmed) {
+        const text = (await confirmation.first().textContent()) || '';
+        const ref = (text.match(/\b[A-Z0-9]{6,}\b/) || [])[0];
+        return { ok: true, reference_number: ref, screenshot: shot };
+      }
+
+      // Step 2 unverified — return success with screenshot for human review.
+      return { ok: true, screenshot: shot, status: 'step2_unverified_human_review_required' };
+    } catch (err) {
+      const shot = path.join(OUT, `airline-claim-lifemiles-error-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      return { ok: false, error: err && err.message ? err.message : String(err), screenshot: shot };
+    }
+  }
+
+  // Other Tier 2 airlines: stubs. Add per-airline logic as their workers
+  // get verified through supervised runs (see flights/workers/claim/*.ts).
+  return {
+    ok: false,
+    error: `airline_claim: no flow yet for "${airline}". Implemented: lifemiles. ` +
+      'Use a supervised run via flights/workers/claim/<airline>.ts logic, then port verified selectors here.',
+  };
+};
+
+/**
+ * dom_inspect — discovery handler used to capture selectors for new airline
+ * flows. Drives the AdsPower-mounted Chromium through a click path and
+ * returns a structured DOM dump (visible buttons, fields, iframes) for each
+ * stage, plus screenshots. Lets the flights app build new AIRLINE_ENROLL_FLOWS
+ * entries without manual DevTools work.
+ *
+ * Body: { url, clickPath?: [{ selector, label?, waitMs? }], dismissCookies?: bool }
+ */
+handlers.dom_inspect = async (page, { url, clickPath = [], dismissCookies = true }) => {
+  if (!url) return { ok: false, error: 'dom_inspect: url required' };
+
+  async function dumpFrame(frame) {
+    return frame.evaluate(() => {
+      const visible = (el) => {
+        if (!el || !el.offsetParent) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== 'hidden' && cs.display !== 'none';
+      };
+      const trim = (s, n = 80) => (s == null ? null : String(s).trim().slice(0, n));
+      const buttons = [
+        ...document.querySelectorAll(
+          'a, button, [role="button"], input[type="submit"], input[type="button"]',
+        ),
+      ]
+        .filter(visible)
+        .map((b) => ({
+          tag: b.tagName,
+          type: b.getAttribute('type') || null,
+          id: b.id || null,
+          name: b.getAttribute('name') || null,
+          text: trim(b.textContent || b.value),
+          href: b.tagName === 'A' ? b.getAttribute('href') : null,
+          classes: trim(b.className, 120),
+          aria: b.getAttribute('aria-label') || null,
+          dataTestId: b.getAttribute('data-testid') || null,
+        }))
+        .slice(0, 60);
+      const fields = [...document.querySelectorAll('input, select, textarea')]
+        .filter(visible)
+        .map((f) => ({
+          tag: f.tagName,
+          type: f.getAttribute('type') || null,
+          id: f.id || null,
+          name: f.getAttribute('name') || null,
+          placeholder: f.getAttribute('placeholder') || null,
+          aria: f.getAttribute('aria-label') || null,
+          required: !!f.required,
+          dataTestId: f.getAttribute('data-testid') || null,
+        }))
+        .slice(0, 80);
+      const iframes = [...document.querySelectorAll('iframe')].map((f) => ({
+        src: f.getAttribute('src') || null,
+        id: f.id || null,
+        name: f.getAttribute('name') || null,
+      }));
+      return { url: location.href, title: document.title, buttons, fields, iframes };
+    });
+  }
+
+  async function dumpStage(label) {
+    const shot = path.join(OUT, `dom-inspect-${label}-${Date.now()}.png`);
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    let main = null;
+    try { main = await dumpFrame(page); } catch (e) { main = { error: String(e?.message || e) }; }
+    const childFrames = [];
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      try {
+        const data = await dumpFrame(frame);
+        childFrames.push({ frameUrl: frame.url(), ...data });
+      } catch {
+        childFrames.push({ frameUrl: frame.url(), error: 'access_denied' });
+      }
+    }
+    return { label, screenshot: shot, main, childFrames };
+  }
+
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+
+    if (dismissCookies) {
+      const cookieSelectors = [
+        '#onetrust-accept-btn-handler',
+        '#qc-cmp2-ui button[mode="primary"]',
+        'button[data-testid="uc-accept-all-button"]',
+        'button[aria-label="Accept all cookies"]',
+        'button[aria-label="Accept all"]',
+        'button:has-text("Accept all")',
+        'button:has-text("Accept All Cookies")',
+        'button:has-text("I agree")',
+      ];
+      for (const sel of cookieSelectors) {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+          await el.click({ timeout: 3_000 }).catch(() => {});
+          await page.waitForTimeout(800);
+          break;
+        }
+      }
+    }
+
+    const stages = [await dumpStage('arrive')];
+    let i = 0;
+    for (const step of clickPath) {
+      i++;
+      const candidates = [page, ...page.frames().filter((f) => f !== page.mainFrame())];
+      let clicked = false;
+      for (const ctx of candidates) {
+        const loc = ctx.locator(step.selector);
+        const count = await loc.count().catch(() => 0);
+        for (let n = 0; n < count; n++) {
+          const el = loc.nth(n);
+          if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+            const before = page.url();
+            await Promise.all([
+              page.waitForURL((u) => u.toString() !== before, { timeout: 12_000 }).catch(() => {}),
+              el.click({ timeout: 5_000, force: true }).catch(() => {}),
+            ]);
+            clicked = true;
+            break;
+          }
+        }
+        if (clicked) break;
+      }
+      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+      await page.waitForTimeout(step.waitMs ?? 1500);
+      stages.push(await dumpStage(step.label || `step${i}-${clicked ? 'clicked' : 'noclick'}`));
+    }
+
+    return { ok: true, finalUrl: page.url(), stages };
+  } catch (err) {
+    const shot = path.join(OUT, `dom-inspect-error-${Date.now()}.png`);
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    return { ok: false, error: err?.message || String(err), screenshot: shot };
   }
 };
 
