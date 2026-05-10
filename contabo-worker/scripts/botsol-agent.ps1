@@ -178,6 +178,59 @@ function Update-ScrapeJob {
     }
 }
 
+function Process-RetryRequests {
+    # Honor "Retry" clicks from the dashboard. Dashboard PATCHes scrape_jobs to
+    # status='queued' for the failed job. Each tick we scan for botsol-source
+    # rows in queued state, restore the source .txt from done/<file>.txt back to
+    # <country>/<file>.txt (if present), then mark the row as 'retry_pending'
+    # so the agent's normal IDLE flow can pick the file. Idempotent: re-running
+    # against an already-restored file is a no-op.
+    if (-not $KOLLABLY_URL -or -not $KOLLABLY_KEY) { return }
+    try {
+        $uri = "$KOLLABLY_URL/rest/v1/scrape_jobs?source=eq.botsol&status=eq.queued&select=id,country,source_file"
+        $rows = Invoke-RestMethod -Uri $uri -Headers (Get-SupaHeaders) -TimeoutSec 15
+        if (-not $rows -or $rows.Count -eq 0) { return }
+        Write-Log "retry: $($rows.Count) queued botsol jobs to process"
+        foreach ($r in $rows) {
+            $jid = $r.id
+            $country = $r.country
+            $srcFile = $r.source_file
+            if (-not $country -or -not $srcFile) {
+                Write-Log "retry: row $jid missing country/source_file, marking failed" 'warn'
+                Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='retry rejected: missing country/source_file' } | Out-Null
+                continue
+            }
+            $countryDir = Join-Path $KEYWORDS_ROOT $country
+            $doneDir = Join-Path $countryDir 'done'
+            $livePath = Join-Path $countryDir $srcFile
+            $donePath = Join-Path $doneDir $srcFile
+            if (Test-Path -LiteralPath $livePath) {
+                Write-Log "retry: $country/$srcFile already in country dir, leaving in place"
+            } elseif (Test-Path -LiteralPath $donePath) {
+                try {
+                    Move-Item -LiteralPath $donePath -Destination $livePath -Force
+                    Write-Log "retry: moved $country/done/$srcFile -> $country/$srcFile"
+                } catch {
+                    Write-Log "retry: failed to restore $country/$srcFile : $($_.Exception.Message)" 'error'
+                    Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error="retry restore failed: $($_.Exception.Message)" } | Out-Null
+                    continue
+                }
+            } else {
+                Write-Log "retry: $country/$srcFile not found in dir or done/ - cannot retry" 'warn'
+                Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='retry rejected: source file missing' } | Out-Null
+                continue
+            }
+            # Mark as retry_pending — purely informational. Agent IDLE flow will
+            # create a NEW scrape_jobs row when it picks up the file. The old row
+            # stays as 'retry_pending' for audit. (We don't delete it.)
+            Update-ScrapeJob -Id $jid -Patch @{ status='retry_pending' } | Out-Null
+            Post-Slack ":arrows_counterclockwise: Botsol retry queued for $country / $srcFile (file restored from done/)"
+        }
+    } catch {
+        Write-Log "Process-RetryRequests error: $($_.Exception.Message)" 'warn'
+    }
+}
+
 # ---------- Queue state ----------
 function Read-QueueState {
     if (-not (Test-Path -LiteralPath $STATE_FILE)) { return $null }
@@ -858,6 +911,11 @@ try {
         Write-Log "Botsol window not found; AMBIGUOUS phase, exiting" 'warn'
         exit 0
     }
+
+    # Honor any "Retry" clicks from the dashboard (status='queued' rows in
+    # scrape_jobs). Restores source files from done/ and marks rows as
+    # retry_pending. Idempotent + safe to run every tick.
+    Process-RetryRequests
 
     # Clear any Crawler Complete / standard MessageBox popups (top-level OR child of
     # BotForm) that mask DONE phase. Done before phase detection so buttons reflect
