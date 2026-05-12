@@ -4323,8 +4323,15 @@ handlers.airline_claim = async (page, { airline, claim }) => {
       }
 
       // Flight number is split: 2-letter code + numeric portion. AV24 → ("AV","24").
+      // flightNumberCode is readonly when ?partnerCode= pre-fills the airline,
+      // so skip if disabled.
       const numericPart = (claim.flight_number || '').slice(2).replace(/\D/g, '');
-      await page.locator('input[name="flightNumberCode"]').fill(iata);
+      const codeDisabled = await page.evaluate(
+        () => !!document.querySelector('input[name="flightNumberCode"]')?.disabled,
+      );
+      if (!codeDisabled) {
+        await page.locator('input[name="flightNumberCode"]').fill(iata);
+      }
       await page.locator('input[name="flightNumber"]').fill(numericPart);
 
       // Date: YYYY-MM-DD → DD/MM/YYYY
@@ -4373,7 +4380,12 @@ handlers.airline_claim = async (page, { airline, claim }) => {
       if (claim.ticket_number) {
         const digits = String(claim.ticket_number).replace(/\D/g, '');
         if (digits.length >= 13) {
-          await page.locator('input[name="ticketNumberCode"]').fill(digits.slice(0, 3));
+          const tnCodeDisabled = await page.evaluate(
+            () => !!document.querySelector('input[name="ticketNumberCode"]')?.disabled,
+          );
+          if (!tnCodeDisabled) {
+            await page.locator('input[name="ticketNumberCode"]').fill(digits.slice(0, 3));
+          }
           await page.locator('input[name="ticketNumber"]').fill(digits.slice(3, 13));
         }
       }
