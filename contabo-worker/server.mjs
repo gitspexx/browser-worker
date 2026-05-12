@@ -4334,30 +4334,53 @@ handlers.airline_claim = async (page, { airline, claim }) => {
       }
       await page.locator('input[name="flightNumber"]').fill(numericPart);
 
-      // Date: YYYY-MM-DD → DD/MM/YYYY
+      // Date: YYYY-MM-DD → DD/MM/YYYY. M&M's calendar widget intercepts fill()
+      // — the input is rendered but bound to a date-picker that wipes typed
+      // values. Use evaluate to set the value directly + dispatch input/change
+      // events so the widget's internal state syncs.
       if (claim.flight_date) {
         const [y, m, d] = claim.flight_date.split('-');
         if (y && m && d) {
-          await page.locator('input[name="date"]').fill(`${d}/${m}/${y}`);
-          // Tab out to commit value past M&M's calendar widget
+          const dateStr = `${d}/${m}/${y}`;
+          await page.evaluate((v) => {
+            const el = document.querySelector('input[name="date"]');
+            if (!el) return;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(el, v);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+          }, dateStr);
+          // Fallback: also click + type as user, in case the widget needs key events
+          await page.locator('input[name="date"]').click().catch(() => {});
+          await page.keyboard.press('Control+A').catch(() => {});
+          await page.keyboard.press('Delete').catch(() => {});
+          await page.keyboard.type(dateStr, { delay: 50 });
           await page.keyboard.press('Tab');
           await page.waitForTimeout(500);
         }
       }
 
-      // Departure + Arrival airports. M&M shows an autocomplete after 3 chars
-      // — typing the IATA + waiting + pressing ArrowDown+Enter selects the
-      // first match.
+      // Departure + Arrival airports. M&M shows an autocomplete after 3 chars.
+      // CRITICAL: do NOT press Enter — when the dropdown isn't open yet,
+      // Enter submits the form (partial data → server redirect → page blank →
+      // "Execution context destroyed"). Click the matching <li> instead, or
+      // Tab out if no option visible.
       async function fillAirport(name, code) {
         if (!code) return;
         const inp = page.locator(`input[name="${name}"]`);
         await inp.fill('');
         await inp.click();
-        await page.keyboard.type(code, { delay: 60 });
-        await page.waitForTimeout(1_500);
-        await page.keyboard.press('ArrowDown');
-        await page.waitForTimeout(200);
-        await page.keyboard.press('Enter');
+        await page.keyboard.type(code, { delay: 80 });
+        await page.waitForTimeout(2_000);
+        // Click the visible <li> matching the IATA code
+        const li = page.locator('ul li').filter({ hasText: new RegExp(`\\b${code}\\b`, 'i') }).first();
+        if (await li.isVisible({ timeout: 2_000 }).catch(() => false)) {
+          await li.click({ timeout: 5_000 }).catch(() => {});
+        } else {
+          // No dropdown — Tab to commit, NEVER Enter
+          await page.keyboard.press('Tab');
+        }
         await page.waitForTimeout(500);
       }
       await fillAirport('departure', claim.origin);
@@ -4390,8 +4413,9 @@ handlers.airline_claim = async (page, { airline, claim }) => {
         }
       }
 
-      // Submit
-      const submitLabels = [/Submit retroactive credit request/i, /^Submit$/i, /^Request$/i, /^Senden$/i, /^Anfordern$/i];
+      // Submit. M&M's button reads "Submit credit request" — keep older
+      // variants in case they re-skin the UI per partner.
+      const submitLabels = [/^Submit credit request$/i, /Submit retroactive credit/i, /^Submit$/i, /^Request$/i, /^Senden$/i, /^Anfordern$/i];
       let submitted = false;
       for (const lbl of submitLabels) {
         const btn = page.getByRole('button', { name: lbl }).first();
@@ -4414,6 +4438,13 @@ handlers.airline_claim = async (page, { airline, claim }) => {
       await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
 
       const bodyText = await page.locator('body').innerText().catch(() => '');
+      // M&M business rules — verified 2026-05-11:
+      //   "The flight must be at least seven days but no more than six months in the past"
+      //   → outside_retro_window (flight too old or too recent). Flagged client-side
+      //     after submit. Caller should fall back to email_fallback path.
+      if (/at least seven days|no more than six months|mindestens sieben Tage|sechs Monaten/i.test(bodyText)) {
+        return { ok: false, error: 'miles-more_outside_retro_window', screenshot: shot };
+      }
       if (/cannot be found|not found|nicht gefunden|already credited|bereits gutgeschrieben/i.test(bodyText)) {
         return { ok: false, error: 'miles-more_ticket_not_found_or_already_credited', screenshot: shot };
       }
