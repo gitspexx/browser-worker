@@ -4289,11 +4289,139 @@ handlers.airline_claim = async (page, { airline, claim }) => {
     }
   }
 
+  if (airline === 'miles-more') {
+    // Verified end-to-end 2026-05-11 via AdsPower flights profile k1c6fxdw.
+    // M&M's partner-airline retro-credit form lives at a deterministic URL
+    // keyed by partnerCode = lowercase IATA. Skipping the intro-page combobox
+    // (Awesomplete autocomplete with unreliable autocomplete state) and going
+    // direct cuts both the failure surface and the wall-clock per claim.
+    try {
+      const iata = (claim?.flight_number || '').slice(0, 2).toUpperCase();
+      if (!iata) return { ok: false, error: 'miles-more_no_flight_number' };
+      // M&M partner-code mirrors lowercase IATA for the major Star Alliance
+      // carriers we care about (LH, LX, OS, SN, SK, LO, TP, A3, AC, NH, OZ,
+      // SQ, ET, ZH, CA, TG, BR, TK, UA). Outliers can be added here.
+      const partnerCode = iata.toLowerCase();
+      const formUrl = `https://www.miles-and-more.com/de/en/account/account-statement/retro-credit-airline.html?partnerCode=${partnerCode}`;
+      await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+
+      // The form renders via XHR — wait until visible inputs >= 6
+      for (let i = 0; i < 30; i++) {
+        const cnt = await page.evaluate(
+          () => [...document.querySelectorAll('input')].filter((e) => e.offsetWidth > 0).length,
+        );
+        if (cnt >= 6) break;
+        await page.waitForTimeout(1_000);
+      }
+
+      // Bail if session expired (login form appeared)
+      const onLogin = await page.evaluate(() => /Please log in to perform this action/i.test(document.body?.innerText || ''));
+      if (onLogin) {
+        const shot = path.join(OUT, `airline-claim-miles-more-session-expired-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: false }).catch(() => {});
+        return { ok: false, error: 'session_expired_on_adspower_profile', screenshot: shot };
+      }
+
+      // Flight number is split: 2-letter code + numeric portion. AV24 → ("AV","24").
+      const numericPart = (claim.flight_number || '').slice(2).replace(/\D/g, '');
+      await page.locator('input[name="flightNumberCode"]').fill(iata);
+      await page.locator('input[name="flightNumber"]').fill(numericPart);
+
+      // Date: YYYY-MM-DD → DD/MM/YYYY
+      if (claim.flight_date) {
+        const [y, m, d] = claim.flight_date.split('-');
+        if (y && m && d) {
+          await page.locator('input[name="date"]').fill(`${d}/${m}/${y}`);
+          // Tab out to commit value past M&M's calendar widget
+          await page.keyboard.press('Tab');
+          await page.waitForTimeout(500);
+        }
+      }
+
+      // Departure + Arrival airports. M&M shows an autocomplete after 3 chars
+      // — typing the IATA + waiting + pressing ArrowDown+Enter selects the
+      // first match.
+      async function fillAirport(name, code) {
+        if (!code) return;
+        const inp = page.locator(`input[name="${name}"]`);
+        await inp.fill('');
+        await inp.click();
+        await page.keyboard.type(code, { delay: 60 });
+        await page.waitForTimeout(1_500);
+        await page.keyboard.press('ArrowDown');
+        await page.waitForTimeout(200);
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(500);
+      }
+      await fillAirport('departure', claim.origin);
+      await fillAirport('arrival', claim.destination);
+
+      // Compartment radio. Default Economy if no fare_class hint.
+      const cls = (claim.fare_class || '').toLowerCase();
+      const compartment = cls.startsWith('f') ? 'first'
+        : cls.startsWith('b') || cls === 'c' || cls === 'j' || cls === 'd' || cls === 'i' ? 'business'
+        : cls.startsWith('p') || cls === 'w' || cls === 'e' ? 'premium'
+        : 'economy';
+      await page.locator(`label[for="compartment-${compartment}"]`).click({ timeout: 5_000 }).catch(async () => {
+        // Fallback: dispatch click on hidden input
+        await page.evaluate((c) => document.querySelector(`#compartment-${c}`)?.click(), compartment);
+      });
+      await page.waitForTimeout(500);
+
+      // Ticket number: 13-digit splits 3 (airline prefix) + 10 (serial). M&M
+      // pre-validates client-side, so a malformed ticket here will block submit.
+      if (claim.ticket_number) {
+        const digits = String(claim.ticket_number).replace(/\D/g, '');
+        if (digits.length >= 13) {
+          await page.locator('input[name="ticketNumberCode"]').fill(digits.slice(0, 3));
+          await page.locator('input[name="ticketNumber"]').fill(digits.slice(3, 13));
+        }
+      }
+
+      // Submit
+      const submitLabels = [/Submit retroactive credit request/i, /^Submit$/i, /^Request$/i, /^Senden$/i, /^Anfordern$/i];
+      let submitted = false;
+      for (const lbl of submitLabels) {
+        const btn = page.getByRole('button', { name: lbl }).first();
+        if (await btn.isVisible({ timeout: 1_500 }).catch(() => false)) {
+          await btn.click({ timeout: 8_000 }).catch(() => {});
+          submitted = true;
+          break;
+        }
+      }
+      if (!submitted) {
+        const shot = path.join(OUT, `airline-claim-miles-more-no-submit-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+        return { ok: false, error: 'miles-more_submit_button_not_found', screenshot: shot };
+      }
+
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(4_000);
+
+      const shot = path.join(OUT, `airline-claim-miles-more-${claim.flight_number}-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+
+      const bodyText = await page.locator('body').innerText().catch(() => '');
+      if (/cannot be found|not found|nicht gefunden|already credited|bereits gutgeschrieben/i.test(bodyText)) {
+        return { ok: false, error: 'miles-more_ticket_not_found_or_already_credited', screenshot: shot };
+      }
+      const refMatch = bodyText.match(/(?:reference|Vorgangsnummer|request)[^A-Z0-9]{0,20}([A-Z0-9]{6,})/i);
+      if (refMatch || /Thank you|received|erhalten|wurde übermittelt/i.test(bodyText)) {
+        return { ok: true, reference_number: refMatch?.[1], screenshot: shot };
+      }
+      return { ok: true, screenshot: shot, status: 'step2_unverified_human_review_required' };
+    } catch (err) {
+      const shot = path.join(OUT, `airline-claim-miles-more-error-${Date.now()}.png`);
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      return { ok: false, error: err && err.message ? err.message : String(err), screenshot: shot };
+    }
+  }
+
   // Other Tier 2 airlines: stubs. Add per-airline logic as their workers
   // get verified through supervised runs (see flights/workers/claim/*.ts).
   return {
     ok: false,
-    error: `airline_claim: no flow yet for "${airline}". Implemented: lifemiles. ` +
+    error: `airline_claim: no flow yet for "${airline}". Implemented: lifemiles, miles-more. ` +
       'Use a supervised run via flights/workers/claim/<airline>.ts logic, then port verified selectors here.',
   };
 };
