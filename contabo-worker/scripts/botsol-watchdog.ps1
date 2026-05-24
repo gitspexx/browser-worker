@@ -17,6 +17,7 @@ $StatePath    = 'C:\worker\botsol-state.json'
 $LogDir       = 'C:\worker\logs'
 $LogPath      = Join-Path $LogDir 'botsol-watchdog.log'
 $ReloadCooldownSec = 300
+$HeartbeatIntervalSec = 21600  # 6 hours
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
@@ -34,6 +35,7 @@ function Load-State {
         last_crawler_complete_sig = $null
         last_chrome_reload_ts     = 0
         last_run_ts               = 0
+        last_heartbeat_ts         = 0
     }
 }
 
@@ -105,7 +107,7 @@ foreach ($w in $allWindows) {
 if ($crawlerHit) {
     $sig = '{0}|{1}' -f $crawlerHit.Current.Name, $crawlerHit.Current.NativeWindowHandle
     if ($state.last_crawler_complete_sig -ne $sig) {
-        Post-Slack (":white_check_mark: *Botsol crawler complete* on Contabo — save the CSV from the output folder and kick off the next batch. Window: ``{0}``" -f $crawlerHit.Current.Name)
+        Post-Slack (":white_check_mark: *Botsol crawler complete* on $env:COMPUTERNAME — save the CSV from the output folder and kick off the next batch. Window: ``{0}``" -f $crawlerHit.Current.Name)
         $state.last_crawler_complete_sig = $sig
     } else {
         Write-Log "Crawler Complete already alerted (sig=$sig)"
@@ -184,7 +186,7 @@ foreach ($cw in $chromeWindows) {
         }
 
         if ($clicked) {
-            Post-Slack ':arrows_counterclockwise: *Botsol Chrome auto-reloaded* on Contabo after `Aw, Snap!` crash.'
+            Post-Slack ':arrows_counterclockwise: *Botsol Chrome auto-reloaded* on $env:COMPUTERNAME after `Aw, Snap!` crash.'
             $state.last_chrome_reload_ts = $now
             $reloadedThisRun = $true
         } else {
@@ -193,6 +195,30 @@ foreach ($cw in $chromeWindows) {
     } catch {
         Write-Log ("Chrome scan error: {0}" -f $_.Exception.Message)
     }
+}
+
+
+# --- Check 3: Periodic heartbeat (every 6h, even if nothing detected) ---
+$lastHb = 0
+try { $lastHb = [int]$state.last_heartbeat_ts } catch {}
+if (($now - $lastHb) -ge $HeartbeatIntervalSec) {
+    $agentTail = ''
+    try {
+        $agentTail = (Get-Content 'C:\worker\logs\botsol-agent.log' -Tail 3 -ErrorAction SilentlyContinue) -join "`n"
+    } catch {}
+    $pendingCount = 0
+    try {
+        $pendingCount = (Get-ChildItem 'C:\Botsol\pipeline\keywords_v2' -Recurse -Filter '*.starter.txt' -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -notin @('done','skipped','_skip') }).Count
+    } catch {}
+    $hbMsg = @"
+:heart: *Botsol watchdog heartbeat* on $env:COMPUTERNAME ($((Get-Date).ToString('yyyy-MM-dd HH:mm')) local)
+- agent.log tail:
+$agentTail
+- pending starter files: $pendingCount
+- chrome windows now: $($chromeWindows.Count)
+"@
+    Post-Slack $hbMsg
+    $state.last_heartbeat_ts = $now
 }
 
 $state.last_run_ts = $now
