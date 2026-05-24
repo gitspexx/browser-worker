@@ -262,6 +262,32 @@ function Clear-QueueState {
     }
 }
 
+
+function Abandon-CurrentRun {
+    param(
+        [string]$country,
+        [string]$srcFile,
+        [string]$reason = ''
+    )
+    try {
+        if ($country -and $srcFile) {
+            $countryDir = Join-Path $KEYWORDS_ROOT $country
+            $skipDir    = Join-Path $countryDir 'skipped'
+            Ensure-Dir $skipDir
+            $srcPath = Join-Path $countryDir $srcFile
+            if (Test-Path -LiteralPath $srcPath) {
+                Move-Item -LiteralPath $srcPath -Destination (Join-Path $skipDir $srcFile) -Force
+                Write-Log "Abandon: moved $country/$srcFile -> skipped/ (reason: $reason)" 'warn'
+            } else {
+                Write-Log "Abandon: source $country/$srcFile not found; clearing state anyway (reason: $reason)" 'warn'
+            }
+        }
+    } catch {
+        Write-Log "Abandon: failed to move skip file: $($_.Exception.Message)" 'warn'
+    }
+    Clear-QueueState
+}
+
 # ---------- Queue picker ----------
 # Logic: walk countries alphabetically; per country, group files by category-stem
 # (cafe.starter.txt + cafe.pruned.txt + cafe.txt all collapse to stem 'cafe').
@@ -337,21 +363,38 @@ function Get-NextQueueItem {
             }
         }
 
-        foreach ($stem in ($byStem.Keys | Sort-Object)) {
-            if ($doneStems.ContainsKey($stem)) { continue }
+        # Compute exact filenames already in done/ (per-variant, not per-stem)
+        # so that pruned round-2 still runs after its sibling starter is done.
+        $doneNames = @{}
+        if (Test-Path -LiteralPath $doneDir) {
+            foreach ($df in (Get-ChildItem -LiteralPath $doneDir -File -Filter '*.txt' -ErrorAction SilentlyContinue)) {
+                $doneNames[$df.Name] = $true
+            }
+        }
 
+        foreach ($stem in ($byStem.Keys | Sort-Object)) {
             $variants = $byStem[$stem]
+            # Drop variants that are already in done/ by exact filename match
+            $eligible = @{}
+            foreach ($vname in $variants.Keys) {
+                $vFile = $variants[$vname]
+                if (-not $doneNames.ContainsKey($vFile.Name)) {
+                    $eligible[$vname] = $vFile
+                }
+            }
+            if ($eligible.Count -eq 0) { continue }
+
             $pick = $null
             $variantUsed = $null
-            if ($USE_STARTER -and $variants.ContainsKey('starter')) {
-                $pick = $variants['starter']; $variantUsed = 'starter'
-            } elseif ($USE_PRUNED -and $variants.ContainsKey('pruned')) {
-                $pick = $variants['pruned']; $variantUsed = 'pruned'
-            } elseif ($variants.ContainsKey('original')) {
-                $pick = $variants['original']; $variantUsed = 'original'
-            } elseif ($variants.ContainsKey('pruned')) {
-                $pick = $variants['pruned']; $variantUsed = 'pruned-fallback'
-            } elseif ($variants.ContainsKey('starter')) {
+            if ($USE_STARTER -and $eligible.ContainsKey('starter')) {
+                $pick = $eligible['starter']; $variantUsed = 'starter'
+            } elseif ($USE_PRUNED -and $eligible.ContainsKey('pruned')) {
+                $pick = $eligible['pruned']; $variantUsed = 'pruned'
+            } elseif ($eligible.ContainsKey('original')) {
+                $pick = $eligible['original']; $variantUsed = 'original'
+            } elseif ($eligible.ContainsKey('pruned')) {
+                $pick = $eligible['pruned']; $variantUsed = 'pruned-fallback'
+            } elseif ($eligible.ContainsKey('starter')) {
                 $pick = $variants['starter']; $variantUsed = 'starter-fallback'
             }
 
@@ -1135,6 +1178,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol SQLite extract script missing for $country/$srcFile"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "extract script missing"
                     exit 0
                 }
                 Ensure-Dir (Split-Path $outPath -Parent)
@@ -1153,6 +1197,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol SQLite extract failed for $country/$srcFile (exit=$($proc.ExitCode))"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "sqlite extract failed"
                     exit 0
                 }
                 Write-Log "SQLite extract complete; output at $outPath"
@@ -1167,6 +1212,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol export click failed for $country/$srcFile"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "export click failed"
                     exit 0
                 }
 
@@ -1180,6 +1226,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol save dialog timeout for $country/$srcFile"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "save dialog timeout"
                     exit 0
                 }
 
@@ -1193,6 +1240,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol set filename failed for $country/$srcFile"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "set filename failed"
                     exit 0
                 }
 
@@ -1206,6 +1254,7 @@ try {
                         } | Out-Null
                     }
                     Post-Slack ":x: Botsol click Save failed for $country/$srcFile"
+                    Abandon-CurrentRun -country $country -srcFile $srcFile -reason "click save failed"
                     exit 0
                 }
 
@@ -1244,6 +1293,7 @@ try {
                     } | Out-Null
                 }
                 Post-Slack ":x: Botsol export produced no usable file: $country/$srcFile"
+                Abandon-CurrentRun -country $country -srcFile $srcFile -reason "export no usable file"
                 exit 0
             }
 
