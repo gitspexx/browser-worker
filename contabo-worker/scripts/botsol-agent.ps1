@@ -1058,7 +1058,8 @@ try {
                 Write-Log "Delete clicked + Yes confirmed; marker written; exiting tick"
                 exit 0
             } else {
-                Write-Log "Delete invoke returned false; falling through" 'warn'
+                Write-Log "Delete invoke returned false; writing marker anyway to escape stuck loop (self-heal)" 'warn'
+              try { Set-Content -Path $deleteMarker -Value (Get-Date -Format o) -Encoding UTF8 } catch {}
             }
         } elseif ($AUTO_START_NEXT) {
             Write-Log "DONE phase + no active run state + AUTO_START_NEXT=true -> reclassifying as IDLE"
