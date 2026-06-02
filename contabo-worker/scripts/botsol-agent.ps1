@@ -870,6 +870,32 @@ function Handle-NumericPrompt {
         }
     } catch {}
 
+    # Some Botsol prompts gate the input Edit behind a "Limited to" radio (e.g. the
+    # "How many businesses..." result-cap dialog: txtInput stays disabled until the
+    # rbLimit radio is selected). Select it first so the Edit becomes enabled,
+    # otherwise we'd bail below with "no enabled Edit control".
+    try {
+        $radioCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::RadioButton)
+        foreach ($rb in $found.FindAll([System.Windows.Automation.TreeScope]::Descendants, $radioCond)) {
+            $raid = [string]$rb.Current.AutomationId; $rnm = [string]$rb.Current.Name
+            if ($raid -eq 'rbLimit' -or $rnm -match 'Limited') {
+                try {
+                    $sip = $rb.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+                    if (-not $sip.Current.IsSelected) {
+                        $sip.Select()
+                        Write-Log "$Tag selected '$rnm' radio to enable input edit"
+                        Start-Sleep -Milliseconds 400
+                    }
+                } catch {
+                    try { $rb.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); Start-Sleep -Milliseconds 400 } catch {}
+                }
+                break
+            }
+        }
+    } catch {}
+
     # Fill the first enabled Edit
     $editCond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -1540,6 +1566,34 @@ try {
                     try {
                         $aid = [string]$k.Current.AutomationId
                         if (-not $k.Current.IsEnabled) { continue }
+                        if ($aid -eq 'frmLimitInput') {
+                            # Orphaned result-cap dialog ("How many businesses...", radio-gated).
+                            # Replay the remaining Start sequence inline with the CORRECT values so
+                            # the later delay prompt isn't filled with RESULT_CAP. Path from queue.
+                            $rcNext = Get-NextQueueItem
+                            $rcWhat = if ($rcNext) { "$($rcNext.Country)/$($rcNext.FileName)" } else { '<no next>' }
+                            Write-Log "AMBIGUOUS resume: orphaned result-cap dialog (frmLimitInput); replaying start for $rcWhat" 'warn'
+                            if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 8 -Tag 'resume_result_cap') {
+                                Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 15 -Tag 'resume_keyword_limit' | Out-Null
+                                Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 8 | Out-Null
+                                if ($rcNext -and $rcNext.FullPath) {
+                                    if (Handle-NumericPrompt -Value $rcNext.FullPath -TimeoutSec 15 -Tag 'resume_file_select') {
+                                        # Persist queue-state so the DONE handler can export + roll to the next stem.
+                                        Write-QueueState @{
+                                            current_run_id      = $null
+                                            current_country     = $rcNext.Country
+                                            current_source_file = $rcNext.FileName
+                                            started_at          = (Get-Date).ToUniversalTime().ToString("o")
+                                        }
+                                        Post-Slack ":wrench: botsol-agent recovered stuck result-cap dialog -> started $($rcNext.Country)/$($rcNext.Stem)"
+                                    }
+                                } else {
+                                    Write-Log "AMBIGUOUS resume: filled cap but no next item for file-select" 'warn'
+                                }
+                                $resumed = $true
+                            }
+                            break
+                        }
                         if ($aid -eq 'InputInteger' -or $aid -eq 'frmInput' -or $aid -eq 'frmIntInput') {
                             Write-Log "AMBIGUOUS resume: found stuck numeric prompt aid=$aid; filling with $RESULT_CAP" 'warn'
                             if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 4 -Tag 'resume_numeric') {
