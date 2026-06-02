@@ -17,7 +17,7 @@ $StatePath    = 'C:\worker\botsol-state.json'
 $LogDir       = 'C:\worker\logs'
 $LogPath      = Join-Path $LogDir 'botsol-watchdog.log'
 $ReloadCooldownSec = 300
-$HeartbeatIntervalSec = 21600  # 6 hours
+$HeartbeatIntervalSec = 7200  # 6 hours
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
@@ -28,15 +28,24 @@ function Write-Log {
 }
 
 function Load-State {
-    if (Test-Path $StatePath) {
-        try { return (Get-Content $StatePath -Raw | ConvertFrom-Json) } catch { }
-    }
-    return [pscustomobject]@{
+    $defaults = @{
         last_crawler_complete_sig = $null
         last_chrome_reload_ts     = 0
         last_run_ts               = 0
         last_heartbeat_ts         = 0
     }
+    $state = $null
+    if (Test-Path $StatePath) {
+        try { $state = Get-Content $StatePath -Raw | ConvertFrom-Json } catch { }
+    }
+    if (-not $state) { $state = [pscustomobject]@{} }
+    # Hydrate missing fields so dynamic assignment never silently fails on JSON-loaded objects
+    foreach ($k in $defaults.Keys) {
+        if (-not ($state.PSObject.Properties.Name -contains $k)) {
+            Add-Member -InputObject $state -MemberType NoteProperty -Name $k -Value $defaults[$k]
+        }
+    }
+    return $state
 }
 
 function Save-State {
@@ -77,6 +86,31 @@ if (-not $root) {
     $state.last_run_ts = $now
     Save-State $state
     exit 0
+}
+
+# --- Check 0: ensure BotsolApp is running (relaunch if the whole app died) ---
+# Without this, a full BotsolApp crash/close halts the 24/7 scrape loop until a
+# human re-launches it from RDP. The watchdog runs InteractiveToken in the user
+# session, so Start-Process lands the window on the interactive desktop where the
+# botsol-agent (also session-2 interactive) can find and drive it.
+$BotsolExe = 'C:\Program Files (x86)\Botsol\Botsol Crawler\BotsolApp.exe'
+$botsolProc = Get-Process -Name 'BotsolApp' -ErrorAction SilentlyContinue
+if (-not $botsolProc) {
+    if (Test-Path $BotsolExe) {
+        try {
+            Start-Process -FilePath $BotsolExe -WorkingDirectory (Split-Path $BotsolExe)
+            Write-Log "BotsolApp not running — relaunched from $BotsolExe"
+            Post-Slack ":rotating_light: *BotsolApp was down — watchdog relaunched it* on $env:COMPUTERNAME. Agent resumes the scrape loop within ~2 min."
+            Start-Sleep -Seconds 12   # let the window initialize before the UIA checks below
+        } catch {
+            Write-Log ("ERROR: failed to relaunch BotsolApp: {0}" -f $_.Exception.Message)
+            Post-Slack ":x: *BotsolApp down and watchdog relaunch FAILED* on $env:COMPUTERNAME — needs manual RDP launch."
+        }
+    } else {
+        Write-Log "ERROR: BotsolApp not running and exe missing at $BotsolExe"
+    }
+} else {
+    Write-Log ("BotsolApp running (PID {0})" -f $botsolProc.Id)
 }
 
 # Enumerate top-level windows
