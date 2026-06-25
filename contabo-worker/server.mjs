@@ -4951,6 +4951,93 @@ app.get('/fb-pool/state', auth(), (_req, res) => {
   }
 });
 
+// ── FB Groups Poster — POST /fb-pool/post ──────────────────────────────────
+// Drives AdsPower + Playwright to submit a text post into a FB group on
+// behalf of one of the warmup profiles. Returns {ok, posted_url}.
+// Spec: gitspexx/growthops docs/superpowers/specs/2026-05-25-fb-groups-poster-mvp-design.md
+const FB_POST_PROFILE_MAP = {
+  'fb-bali-main': 'k1cula5r',
+  'fb-bali-secondary': 'k1cuj237',
+  'fb-marketplace-br': 'k1cuj24r',
+};
+const FB_COMPOSER_SELECTORS = [
+  'div[aria-label*="Write something" i][role="textbox"]',
+  'div[aria-label*="Create a public post" i][role="textbox"]',
+  'div[role="textbox"][contenteditable="true"]',
+];
+const FB_POST_BUTTON_SELECTORS = [
+  'div[aria-label="Post"][role="button"]',
+  'div[role="button"]:has-text("Post")',
+  'button:has-text("Post")',
+];
+async function fbPostAds(pathname) {
+  const r = await fetch(`${ADS}${pathname}`);
+  const j = await r.json();
+  if (j.code !== 0) throw new Error(`adspower ${pathname}: ${j.msg}`);
+  return j.data || {};
+}
+app.post('/fb-pool/post', auth(), async (req, res) => {
+  const { profile, group_url, text } = req.body ?? {};
+  if (!profile || !group_url || !text) {
+    return res.status(422).json({ error: 'profile, group_url, text all required' });
+  }
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) {
+    return res.status(400).json({ error: `unknown profile: ${profile}` });
+  }
+  let browser = null;
+  let permalink = null;
+  try {
+    const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
+    if (active?.status === 'Active') {
+      await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}`);
+    const ws = started?.ws?.puppeteer;
+    if (!ws) throw new Error(`adspower start: no CDP url returned`);
+    browser = await chromium.connectOverCDP(ws);
+    const ctx = browser.contexts()[0] || (await browser.newContext());
+    const page = await ctx.newPage();
+    await page.goto(group_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await new Promise(r => setTimeout(r, 3000));
+    let composer = null;
+    for (const sel of FB_COMPOSER_SELECTORS) {
+      try {
+        await page.waitForSelector(sel, { timeout: 4000 });
+        composer = page.locator(sel).first();
+        break;
+      } catch {}
+    }
+    if (!composer) throw new Error('composer_missing');
+    await composer.click();
+    await new Promise(r => setTimeout(r, 1000));
+    await composer.fill(text);
+    await new Promise(r => setTimeout(r, 1000));
+    let clicked = false;
+    for (const sel of FB_POST_BUTTON_SELECTORS) {
+      try {
+        await page.locator(sel).last().click({ timeout: 4000 });
+        clicked = true;
+        break;
+      } catch {}
+    }
+    if (!clicked) throw new Error('post_button_missing');
+    try {
+      await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 });
+      permalink = page.url();
+    } catch {
+      permalink = null;
+    }
+    await page.close();
+    return res.json({ ok: true, posted_url: permalink });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`contabo-worker on :${PORT} — auth ${AUTH_DISABLED ? 'DISABLED (dev)' : 'enabled'}`);
 });
