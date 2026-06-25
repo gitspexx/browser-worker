@@ -99,7 +99,7 @@ if ($cfg['ONLY_COUNTRIES']) {
 # mexico,brazil"). When set AND ONLY_COUNTRIES empty, the agent picks files only from
 # the FIRST country in this list that still has unfinished stems. Once a country
 # fully exhausts (every stem appears in done/), the agent advances to the next.
-# This auto-rotates without env edits — finish ecuador, drop into colombia, etc.
+# This auto-rotates without env edits - finish ecuador, drop into colombia, etc.
 $COUNTRY_ROTATION = @()
 if ($cfg['COUNTRY_ROTATION']) {
     $COUNTRY_ROTATION = ($cfg['COUNTRY_ROTATION'] -split ',') |
@@ -229,11 +229,11 @@ function Process-RetryRequests {
                 Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='retry rejected: source file missing' } | Out-Null
                 continue
             }
-            # Mark as retry_pending — purely informational. Agent IDLE flow will
+            # Mark as retry_pending - purely informational. Agent IDLE flow will
             # create a NEW scrape_jobs row when it picks up the file. The old row
             # stays as 'retry_pending' for audit. (We don't delete it.)
             Update-ScrapeJob -Id $jid -Patch @{ status='retry_pending' } | Out-Null
-            Post-Slack ":arrows_counterclockwise: Botsol retry queued for $country / $srcFile (file restored from done/)"
+            Write-Log ":arrows_counterclockwise: Botsol retry queued for $country / $srcFile (file restored from done/)"
         }
     } catch {
         Write-Log "Process-RetryRequests error: $($_.Exception.Message)" 'warn'
@@ -486,7 +486,7 @@ function Dismiss-BotsolModalPopup {
     # Crawler Complete + similar standard MessageBox popups can mount in TWO places:
     #   A. Top-level #32770 window owned by BotsolApp PID (separate desktop window)
     #   B. CHILD of BotForm with class #32770 (in-process modal hosted as child)
-    # Discovered B by scanning live state 2026-05-08 — Crawler Complete sat as child of
+    # Discovered B by scanning live state 2026-05-08 - Crawler Complete sat as child of
     # BotForm for hours while top-level scan returned nothing, blocking all 4 main
     # buttons via the modal disable. This scans both scopes and dismisses any benign
     # popup (Crawler Complete / generic Notice / Information / Warning) via OK button.
@@ -535,7 +535,7 @@ function Dismiss-BotsolModalPopup {
         try { $popupName = $w.Current.Name } catch {}
         if (-not $popupName) { $popupName = '<noname>' }
 
-        # Skip ERROR popups — handled separately to surface a warning emoji + retry path
+        # Skip ERROR popups - handled separately to surface a warning emoji + retry path
         if ($popupName -match 'ERROR') { continue }
 
         Write-Log "$($cand.Scope) popup detected: name='$popupName' class=#32770 pid=$BotsolPid"
@@ -552,7 +552,7 @@ function Dismiss-BotsolModalPopup {
                     $pat = $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
                     $pat.Invoke()
                     Write-Log "dismissed $($cand.Scope) '$popupName' via button '$bn'"
-                    Post-Slack ":white_check_mark: Botsol popup '$popupName' auto-dismissed ($($cand.Scope))"
+                    Write-Log ":white_check_mark: Botsol popup '$popupName' auto-dismissed ($($cand.Scope))"
                     $clicked = $true
                     $dismissed = $true
                     break
@@ -603,7 +603,7 @@ function Find-ByAutomationId {
         [string]$AutomationId
     )
     if (-not $Root) { return $null }
-    # PropertyCondition on AutomationIdProperty is flaky for these WinForms controls —
+    # PropertyCondition on AutomationIdProperty is flaky for these WinForms controls -
     # falls back to enumerate-once (via cache) + PS-side filter.
     foreach ($k in (Get-BotsolChildren -Root $Root)) {
         try {
@@ -1006,25 +1006,41 @@ function Get-StallDecision {
     return @{ Action = 'count'; StallTicks = $newTicks; SoftAttempted = $true }
 }
 
-# Hard recovery: surgically kill BotsolApp + ONLY its embedded Chrome (path match,
-# never AdsPower's SunBrowser), then fire the proven cold-start scheduled-task chain
-# (the same tasks that recovered the box manually on 2026-06-08). After this the
-# caller clears queue-state; the next IDLE tick starts the next pending file.
+# Hard recovery: NON-DESTRUCTIVE. We kill NOTHING.
+#  - Killing BotsolApp -> 'Select Bot' chooser strand (banned by user 2026-06-12).
+#  - Killing its embedded Chrome mid-crawl is ALSO harmful: it leaves BotsolApp in a
+#    "phantom-RUNNING" state (Stop stays enabled, no browser, Stop-click can't clear it),
+#    which loops forever and never advances (cost: ~6.5h wedged on mexico/stay 2026-06-13).
+#    Reviewing the logs, the Chrome-kill never once produced a recovery.
+# So hard recovery just re-clicks Stop (the caller does this) and lets BotsolApp end its
+# OWN crawl gracefully with the browser still alive. A genuinely hung crawl is left for
+# the watchdog's throttled human-nudge alert; we never wedge it ourselves.
 function Invoke-BotsolHardRestart {
+    Write-Log "hard-recovery(non-destructive): no kill; relying on Stop + watchdog human-nudge alert"
+}
+
+# Extract-before-delete safety net. Dumps whatever rows are currently loaded in Botsol's
+# grid (db.sqlite active table) into a CSV that csv_processor will ingest (dedup-safe by
+# google_maps_url), BEFORE the grid is ever cleared. This is the guarantee that an
+# interrupted/orphaned category is NEVER lost on a Delete. Returns:
+#   'captured' - rows written and will be ingested
+#   'empty'    - table had no rows (nothing to lose)
+#   'error'    - extractor failed unexpectedly; caller MUST NOT delete (preserve + retry)
+function Invoke-SafeExtract {
+    param([string]$OutPath, [string]$Tag)
+    if (-not (Test-Path $EXTRACT_SCRIPT)) { Write-Log "safe-extract: extract script missing $EXTRACT_SCRIPT" 'error'; return 'error' }
+    Ensure-Dir (Split-Path $OutPath -Parent)
+    $log = Join-Path 'C:\worker\logs' "extract-$Tag.log"
     try {
-        Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'Botsol Crawler\\chrome\\chrome\.exe') } |
-            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
-    } catch {}
-    try { Get-Process -Name 'BotsolApp' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-    Start-Sleep -Seconds 3
-    foreach ($pair in @(@('BotsolShellLaunch',12), @('BotsolSelectClick',8), @('BotsolPick',8))) {
-        $tn = [string]$pair[0]; $wait = [int]$pair[1]
-        try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop; Write-Log "hard-restart: ran scheduled task $tn" }
-        catch { Write-Log "hard-restart: failed to run $tn : $($_.Exception.Message)" 'warn' }
-        Start-Sleep -Seconds $wait
-    }
-    Write-Log "hard-restart: cold-start chain complete; agent IDLE flow will pick next file"
+        $proc = Start-Process -FilePath 'python' -ArgumentList @('-u', $EXTRACT_SCRIPT, $OutPath) `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    } catch { Write-Log "safe-extract: launch failed: $($_.Exception.Message)" 'error'; return 'error' }
+    $out = ''
+    try { $out = Get-Content $log -Raw -EA SilentlyContinue } catch {}
+    if ($out -match 'Wrote\s+\d+\s+rows')          { Write-Log "safe-extract: captured -> $OutPath"; return 'captured' }
+    if ($out -match 'No data table with rows found') { return 'empty' }
+    Write-Log "safe-extract: unrecognized result (exit=$($proc.ExitCode)); see $log" 'warn'
+    return 'error'
 }
 
 # ============================================================================
@@ -1073,8 +1089,12 @@ try {
     $stopEn   = Get-ButtonEnabled $btnStop
     $exportEn = Get-ButtonEnabled $btnExport
     $deleteEn = Get-ButtonEnabled $btnDelete
+    # Stop button TEXT: "Stop Bot" while crawling, "Stopping...." once a Stop is in progress.
+    # A stuck "Stopping...." == the dead-Chrome deadlock (BotsolApp can't finish stopping a
+    # browser that already died), so re-clicking Stop is pointless + only spams the UI.
+    $stopName = if ($btnStop) { try { [string]$btnStop.Current.Name } catch { '' } } else { '' }
 
-    Write-Log "buttons: start=$startEn stop=$stopEn export=$exportEn delete=$deleteEn"
+    Write-Log "buttons: start=$startEn stop=$stopEn export=$exportEn delete=$deleteEn stopName='$stopName'"
 
     $state = Read-QueueState
 
@@ -1110,7 +1130,7 @@ try {
                     $okBtn = Find-DialogButton -Dialog $d -NameMatch '^&?OK$'
                     if ($okBtn -and (Invoke-Element $okBtn)) {
                         Write-Log "Auto-dismissed Botsol ERROR popup via OK"
-                        Post-Slack ":warning: Botsol error popup auto-dismissed (will retry on next tick)"
+                        Write-Log ":warning: Botsol error popup auto-dismissed (will retry on next tick)"
                         exit 0
                     }
                 }
@@ -1139,7 +1159,20 @@ try {
             Write-Log "DONE phase + recent delete marker -> sticky-button quirk; reclassifying as IDLE"
             $phase = 'IDLE'
         } elseif ($AUTO_DELETE_CURRENT -and $btnDelete) {
-            Write-Log "DONE phase + no active run state + AUTO_DELETE_CURRENT=true -> clicking Delete first to clear stale data"
+            # EXTRACT-BEFORE-DELETE GUARD: this branch used to clear "stale" data outright,
+            # which is the ONE place leads were ever lost (an interrupted/orphaned category
+            # leaves its rows loaded here). Never clear without first capturing them.
+            $recCountry = if ($state -and $state.current_country)     { [string]$state.current_country } else { 'unknown' }
+            $recStem    = if ($state -and $state.current_source_file) { [System.IO.Path]::GetFileNameWithoutExtension([string]$state.current_source_file) } else { 'orphan' }
+            $recStamp   = Get-Date -Format 'yyyyMMdd-HHmm'
+            $recPath    = Join-Path $OUTPUT_DIR ("{0}_{1}_recovered_{2}.csv" -f $recCountry, $recStem, $recStamp)
+            $safe = Invoke-SafeExtract -OutPath $recPath -Tag "predelete-$recCountry-$recStem-$recStamp"
+            if ($safe -eq 'error') {
+                Write-Log "DONE+no-run-state: extract-before-delete FAILED -> NOT clicking Delete (preserving loaded rows); will retry next tick" 'warn'
+                Post-Slack ":warning: Botsol: couldn't safely extract loaded rows before clearing the grid - preserving data, retrying next tick."
+                exit 0
+            }
+            Write-Log "DONE phase + no active run state -> extract-before-delete ($safe) done; clicking Delete to clear stale data"
             if (Invoke-Element $btnDelete) {
                 Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 6 | Out-Null
                 try { Set-Content -Path $deleteMarker -Value (Get-Date -Format o) -Encoding UTF8 } catch {}
@@ -1161,6 +1194,38 @@ try {
             $logText = Get-EditValue $editLog
             $parsed = Parse-LiveLog $logText
             Write-Log "running: latest_record=$($parsed.LatestRecord)  keyword='$($parsed.LatestKeyword)'"
+
+            # --- "Stopping..." deadlock guard (root cause of the daily hang, 2026-06-15) ----------
+            # When BotsolApp's scraper Chrome dies mid-crawl, a Stop never completes: the Stop
+            # button text sticks at "Stopping...." forever. Re-clicking it does nothing but append
+            # "Stopping the bot, please wait.." to the progress box (the spam the user saw on screen)
+            # and can never recover. So: do NOT click Stop. Salvage the loaded rows ONCE (db.sqlite
+            # survives; csv_processor dedups), alert ONCE for a manual restart, then hold quietly.
+            if ($stopName -match 'Stopping') {
+                $sticks = 0; try { $sticks = [int]$state.stopping_ticks } catch {}
+                $sticks++
+                if ($sticks -eq 1) {
+                    $sc = if ($state -and $state.current_country)     { [string]$state.current_country } else { 'unknown' }
+                    $sf = if ($state -and $state.current_source_file) { [System.IO.Path]::GetFileNameWithoutExtension([string]$state.current_source_file) } else { 'frozen' }
+                    $sp = Join-Path $OUTPUT_DIR ("{0}_{1}_salvage_{2}.csv" -f $sc, $sf, (Get-Date -Format 'yyyyMMdd-HHmm'))
+                    $sr = Invoke-SafeExtract -OutPath $sp -Tag "salvage-$sc-$sf"
+                    Write-Log "Stopping-deadlock detected -> salvaged loaded rows ($sr); will NOT re-click Stop (avoids the 'Stopping...' spam)" 'warn'
+                } else {
+                    Write-Log "Stopping-deadlock: tick $sticks, holding (no Stop click)"
+                }
+                $alerted = $false; try { $alerted = [bool]$state.stopping_alerted } catch {}
+                if ($sticks -ge 5 -and -not $alerted) {
+                    Post-Slack (":rotating_light: *BOTSOL STUCK - MANUAL RESTART NEEDED* on $env:COMPUTERNAME. ``$($state.current_country)/$($state.current_source_file)`` hit the BotsolApp ``Stopping...`` deadlock (its scraper Chrome died; the Stop can't complete). Loaded rows already salvaged + ingested. :point_right: RDP into 66.70.134.73 -> relaunch BotsolApp -> click the bot + *Select*.")
+                    $alerted = $true
+                }
+                if ($state) {
+                    $state | Add-Member -NotePropertyName stopping_ticks   -NotePropertyValue $sticks  -Force
+                    $state | Add-Member -NotePropertyName stopping_alerted -NotePropertyValue $alerted -Force
+                    try { Write-QueueState $state } catch {}
+                }
+                exit 0
+            }
+            # ------------------------------------------------------------------------------------
 
             # Detect Chrome restart (planned by Botsol every N lines, OR unplanned crash auto-reloaded by watchdog).
             # Track Chrome window PIDs across ticks. PID-set change == at least one Chrome instance restarted.
@@ -1192,7 +1257,7 @@ try {
                 $line = $evt | ConvertTo-Json -Compress
                 try { Add-Content -LiteralPath 'C:\worker\logs\chrome-restarts.jsonl' -Value $line -Encoding UTF8 } catch {}
                 Write-Log "chrome restart detected: old_pids=[$lastChromePidsStr] new_pids=[$chromePidsStr] @ record #$($parsed.LatestRecord)"
-                Post-Slack (":arrows_counterclockwise: Chrome restarted during $($state.current_country)/$($state.current_source_file) at record #$($parsed.LatestRecord) (keyword: $($parsed.LatestKeyword))")
+                Write-Log (":arrows_counterclockwise: Chrome restarted during $($state.current_country)/$($state.current_source_file) at record #$($parsed.LatestRecord) (keyword: $($parsed.LatestKeyword))")
             }
 
             if ($state -and $state.current_run_id) {
@@ -1226,19 +1291,55 @@ try {
                     Write-QueueState $newState
                 } catch {}
 
+                # NEVER click Stop during a scrape (user directive 2026-06-15). The agent only
+                # acts on real completion (Crawler Complete -> DONE -> export). A frozen record means
+                # BotsolApp's scraper Chrome died; clicking Stop only deadlocks it + spams "Stopping..".
+                # So: at 'soft' (~30 min frozen) we just watch (let Botsol finish); at 'hard' (~46 min
+                # frozen = truly hung) we salvage the loaded rows ONCE (db.sqlite -> CSV -> csv_processor,
+                # dedup-safe), alert ONCE for a manual restart, leave the category file PENDING so it
+                # re-scrapes after restart, then hold. No Stop, ever.
                 if ($decision.Action -eq 'soft') {
                     $mins = [int]($decision.StallTicks * 2)
-                    Write-Log "STALL: no progress for $($decision.StallTicks) ticks (~$mins min) at record #$curRec on $($state.current_country)/$($state.current_source_file) -> SOFT recovery: clicking Stop" 'warn'
-                    Post-Slack (":warning: *Botsol frozen* at record #$curRec on ``$($state.current_country)/$($state.current_source_file)`` for ~$mins min. Auto-recovery: clicking Stop to salvage partial data + advance.")
-                    $stopOk = Invoke-Element $btnStop
-                    Write-Log "STALL soft: Stop invoke returned $stopOk"
+                    Write-Log "STALL: record frozen ~$mins min at #$curRec on $($state.current_country)/$($state.current_source_file); watching (letting Botsol finish, NO Stop)" 'warn'
                 }
                 elseif ($decision.Action -eq 'hard') {
                     $mins = [int]($decision.StallTicks * 2)
-                    Write-Log "STALL: still frozen after soft for $($decision.StallTicks) ticks (~$mins min) -> HARD recovery: kill + cold-start" 'warn'
-                    Post-Slack (":rotating_light: *Botsol still frozen* after Stop attempt (~$mins min) on ``$($state.current_country)/$($state.current_source_file)``. HARD recovery: restarting BotsolApp + cold-start chain. In-flight partial data may be lost.")
-                    Invoke-BotsolHardRestart
-                    Clear-QueueState
+                    $handled = $false; try { $handled = [bool]$state.hang_handled } catch {}
+                    if (-not $handled) {
+                        $hc = [string]$state.current_country
+                        $hs = [System.IO.Path]::GetFileNameWithoutExtension([string]$state.current_source_file)
+                        Write-Log "HUNG: record frozen ~$mins min on $hc/$($state.current_source_file) (scraper Chrome died). NOT clicking Stop. Salvaging once + alerting; category stays PENDING for re-scrape." 'warn'
+                        $hp = Join-Path $OUTPUT_DIR ("{0}_{1}_salvage_{2}.csv" -f $hc, $hs, (Get-Date -Format 'yyyyMMdd-HHmm'))
+                        $hr = Invoke-SafeExtract -OutPath $hp -Tag "hung-$hc-$hs"
+                        Write-Log "HUNG salvage: $hr -> $hp"
+                        # Attempt cap: a chronic-hanger (e.g. a captcha-walled keyword) must not block
+                        # the queue forever. Track hangs per category in a sidecar; after 3, move it to
+                        # skipped/ (partial already salvaged) so the rotation progresses past it.
+                        $hkey = "$hc/$hs"; $haFile = 'C:\worker\hang-attempts.json'; $ha = @{}
+                        try { if (Test-Path $haFile) { (Get-Content $haFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $ha[$_.Name] = [int]$_.Value } } } catch {}
+                        $att = 0; if ($ha.ContainsKey($hkey)) { $att = [int]$ha[$hkey] }
+                        $att++; $ha[$hkey] = $att
+                        try { ($ha | ConvertTo-Json -Compress) | Set-Content $haFile -Encoding UTF8 } catch {}
+                        if ($att -ge 3) {
+                            try {
+                                $cd = Join-Path $KEYWORDS_ROOT $hc; $sk = Join-Path $cd 'skipped'; Ensure-Dir $sk
+                                $src = Join-Path $cd ([string]$state.current_source_file)
+                                if (Test-Path $src) { Move-Item -LiteralPath $src -Destination (Join-Path $sk ([string]$state.current_source_file)) -Force }
+                            } catch {}
+                            Write-Log "HUNG: $hkey hung $att times -> moved to skipped/ (partial salvaged); queue will progress past it" 'warn'
+                            Post-Slack (":no_entry: *Botsol gave up on* ``$hkey`` after $att hangs (partial leads salvaged + ingested). Moved to skipped so the queue continues. :point_right: restart BotsolApp -> click bot + Select to resume with the NEXT category.")
+                        } else {
+                            Write-Log "HUNG: $hkey attempt $att of 3 -> left PENDING for re-scrape after restart"
+                            Post-Slack (":rotating_light: *BOTSOL STUCK - MANUAL RESTART NEEDED* on $env:COMPUTERNAME. ``$hkey`` froze (~$mins min; scraper Chrome died) - attempt $att of 3. Loaded rows salvaged; it re-scrapes after restart. :point_right: RDP into 66.70.134.73 -> relaunch BotsolApp -> click bot + Select. (Agent will NOT touch Stop.)")
+                        }
+                        try {
+                            $st2 = @{}; foreach ($p in $state.PSObject.Properties) { $st2[$p.Name] = $p.Value }
+                            $st2.hang_handled = $true
+                            Write-QueueState $st2
+                        } catch {}
+                    } else {
+                        Write-Log "HUNG: still frozen ~$mins min on $($state.current_country)/$($state.current_source_file); holding (already salvaged + alerted, no Stop)"
+                    }
                 }
             } else {
                 Write-Log "RUNNING phase but no current_run_id in state file" 'warn'
@@ -1284,7 +1385,7 @@ try {
                 # SQLite-direct path: bypass the Botsol Export UI entirely.
                 # Botsol's UI is single-threaded and frequently freezes ("Not Responding")
                 # right after Crawler Complete, blocking Export and Save As clicks. The
-                # SQLite db at %APPDATA%\Botsol\db.sqlite is the source of truth — we
+                # SQLite db at %APPDATA%\Botsol\db.sqlite is the source of truth - we
                 # snapshot+dump it, write into OUTPUT_DIR using Botsol's CSV format, and
                 # let csv_processor pick it up identically to a real export. Then click
                 # Delete Current Data to clear Botsol's grid for the next run.
@@ -1459,7 +1560,17 @@ try {
                 }
             }
 
-            # Click Delete Current Data to clear for next run — gated by env var.
+            # Completed cleanly -> clear any hang-attempt counter for this category.
+            try {
+                $haFile = 'C:\worker\hang-attempts.json'
+                if (Test-Path $haFile) {
+                    $ha = @{}; (Get-Content $haFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $ha[$_.Name] = [int]$_.Value }
+                    $hkey = "$country/$stem"
+                    if ($ha.ContainsKey($hkey)) { $ha.Remove($hkey); ($ha | ConvertTo-Json -Compress) | Set-Content $haFile -Encoding UTF8 }
+                }
+            } catch {}
+
+            # Click Delete Current Data to clear for next run - gated by env var.
             # AUTO_DELETE_CURRENT=false keeps the in-memory data in Botsol as a safety net
             # (user can re-export manually if CSV looks wrong). After verifying the first
             # successful export, flip AUTO_DELETE_CURRENT=true in orchestrator.env.
@@ -1469,7 +1580,7 @@ try {
                 }
             } else {
                 Write-Log "skipping Delete Current Data (AUTO_DELETE_CURRENT=false). Verify CSV then click Delete manually, then flip the env var."
-                Post-Slack ":mag: Colombia / do exported + txt moved. Data still in Botsol memory as safety net; verify CSV then click Delete manually + set AUTO_DELETE_CURRENT=true."
+                Write-Log ":mag: Colombia / do exported + txt moved. Data still in Botsol memory as safety net; verify CSV then click Delete manually + set AUTO_DELETE_CURRENT=true."
             }
 
             # Record last-completed country so the next IDLE tick can detect a
@@ -1483,7 +1594,7 @@ try {
         'IDLE' {
             if (-not $AUTO_START_NEXT) {
                 Write-Log "IDLE but AUTO_START_NEXT=false; pausing (operator handoff required for Start Bot + numeric prompts flow)"
-                # Post Slack once per pause — state-less dedupe: only notify if we just
+                # Post Slack once per pause - state-less dedupe: only notify if we just
                 # transitioned out of a run (queue-state cleared but log shows recent RUNNING/DONE).
                 exit 0
             }
@@ -1579,7 +1690,7 @@ try {
             #    Discovered 2026-04-27 from user screenshot. Same Edit+OK pattern as numeric
             #    prompts, so Handle-NumericPrompt handles it (matches frm* children with Edit
             #    and dismisses via OK/Continue/Yes/Accept matcher).
-            if (-not (Handle-NumericPrompt -Value $next.FullPath -TimeoutSec 15 -Tag 'file_select')) {
+            if (-not (Handle-NumericPrompt -Value $next.FullPath -TimeoutSec 45 -Tag 'file_select')) {
                 Write-Log "file-select dialog failed (path: $($next.FullPath))" 'error'
                 if ($jobId) {
                     Update-ScrapeJob -Id $jobId -Patch @{
@@ -1633,7 +1744,7 @@ try {
                 }
             } catch {}
 
-            Post-Slack ("$nextFlag :rocket: *Botsol switching keyword* -> `"$($next.Country) / $($next.Stem)`" $variantEmoji ($($next.Variant))`n   keywords=$lineCount  cap=$RESULT_CAP  limit=$KEYWORD_LIMIT")
+            Write-Log ("$nextFlag :rocket: *Botsol switching keyword* -> `"$($next.Country) / $($next.Stem)`" $variantEmoji ($($next.Variant))`n   keywords=$lineCount  cap=$RESULT_CAP  limit=$KEYWORD_LIMIT")
 
             $newState = @{
                 current_run_id      = $jobId
@@ -1670,7 +1781,7 @@ try {
                                 Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 15 -Tag 'resume_keyword_limit' | Out-Null
                                 Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 8 | Out-Null
                                 if ($rcNext -and $rcNext.FullPath) {
-                                    if (Handle-NumericPrompt -Value $rcNext.FullPath -TimeoutSec 15 -Tag 'resume_file_select') {
+                                    if (Handle-NumericPrompt -Value $rcNext.FullPath -TimeoutSec 45 -Tag 'resume_file_select') {
                                         # Persist queue-state so the DONE handler can export + roll to the next stem.
                                         Write-QueueState @{
                                             current_run_id      = $null

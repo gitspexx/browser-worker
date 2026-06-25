@@ -17,8 +17,8 @@ $StatePath    = 'C:\worker\botsol-state.json'
 $LogDir       = 'C:\worker\logs'
 $LogPath      = Join-Path $LogDir 'botsol-watchdog.log'
 $ReloadCooldownSec = 300
-$HeartbeatIntervalSec = 7200  # 6 hours
-$StallAlertMin = 50            # backstop: alert if agent reports no scrape progress this long
+$HeartbeatIntervalSec = 14400  # 4 hours — periodic "how's it going" pulse on long scrapes
+$StallAlertMin = 30            # hung-stop deadlock needs a MANUAL restart; alert at 30 min
 $StallAlertCooldownSec = 3600  # at most one stall backstop alert per hour
 $QueueStatePath = 'C:\worker\botsol-queue-state.json'  # the agent's run state (not this watchdog's)
 
@@ -145,7 +145,7 @@ foreach ($w in $allWindows) {
 if ($crawlerHit) {
     $sig = '{0}|{1}' -f $crawlerHit.Current.Name, $crawlerHit.Current.NativeWindowHandle
     if ($state.last_crawler_complete_sig -ne $sig) {
-        Post-Slack (":white_check_mark: *Botsol crawler complete* on $env:COMPUTERNAME — save the CSV from the output folder and kick off the next batch. Window: ``{0}``" -f $crawlerHit.Current.Name)
+        Write-Log (":white_check_mark: Botsol crawler-complete popup seen (agent auto-extracts) Window: {0}" -f $crawlerHit.Current.Name)
         $state.last_crawler_complete_sig = $sig
     } else {
         Write-Log "Crawler Complete already alerted (sig=$sig)"
@@ -224,7 +224,7 @@ foreach ($cw in $chromeWindows) {
         }
 
         if ($clicked) {
-            Post-Slack ':arrows_counterclockwise: *Botsol Chrome auto-reloaded* on $env:COMPUTERNAME after `Aw, Snap!` crash.'
+            Write-Log ':arrows_counterclockwise: Botsol Chrome auto-reloaded after Aw-Snap crash (routine; not alerting).'
             $state.last_chrome_reload_ts = $now
             $reloadedThisRun = $true
         } else {
@@ -252,7 +252,7 @@ try {
                 $ageMin = [int]((Get-Date) - $lp).TotalMinutes
                 $lastAlert = 0; try { $lastAlert = [int]$state.last_stall_alert_ts } catch {}
                 if ($ageMin -ge $StallAlertMin -and ($now - $lastAlert) -ge $StallAlertCooldownSec) {
-                    Post-Slack (":rotating_light: *Botsol no scrape progress for ~$ageMin min* on $env:COMPUTERNAME (``$($qs.current_country)/$($qs.current_source_file)`` @ record #$($qs.stall_last_record)). Agent self-heal should have handled this — if it repeats, check the BotsolAgent scheduled task is alive.")
+                    Post-Slack (":rotating_light: *BOTSOL STUCK — MANUAL RESTART NEEDED* on $env:COMPUTERNAME. No scrape progress for ~$ageMin min on ``$($qs.current_country)/$($qs.current_source_file)`` (record #$($qs.stall_last_record)). This is the hung-``Stopping…`` deadlock — the agent CANNOT clear it without a restart (by design, it never kills BotsolApp). :point_right: *ACTION:* RDP into 66.70.134.73 → close + relaunch BotsolApp → click the bot + *Select*. Re-reminding hourly until scraping resumes.")
                     $state.last_stall_alert_ts = $now
                     Write-Log "stall backstop alert posted (age=$ageMin min)"
                 }
@@ -261,7 +261,7 @@ try {
     }
 } catch { Write-Log ("Check4 stall backstop error: {0}" -f $_.Exception.Message) }
 
-# --- Check 3: Periodic heartbeat (every 6h, even if nothing detected) ---
+# --- Check 3: Periodic heartbeat (every 4h) — light "how's it going" pulse ---
 $lastHb = 0
 try { $lastHb = [int]$state.last_heartbeat_ts } catch {}
 if (($now - $lastHb) -ge $HeartbeatIntervalSec) {
@@ -273,12 +273,13 @@ if (($now - $lastHb) -ge $HeartbeatIntervalSec) {
     try {
         $pendingCount = (Get-ChildItem 'C:\Botsol\pipeline\keywords_v2' -Recurse -Filter '*.starter.txt' -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -notin @('done','skipped','_skip') }).Count
     } catch {}
+    $qs = $null
+    try { $qs = Get-Content 'C:\worker\botsol-queue-state.json' -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
+    $cur = if ($qs -and $qs.current_country) { "$($qs.current_country)/$($qs.current_source_file) @ record #$($qs.stall_last_record)" } else { 'between categories' }
     $hbMsg = @"
-:heart: *Botsol watchdog heartbeat* on $env:COMPUTERNAME ($((Get-Date).ToString('yyyy-MM-dd HH:mm')) local)
-- agent.log tail:
-$agentTail
-- pending starter files: $pendingCount
-- chrome windows now: $($chromeWindows.Count)
+:heart: *Botsol still running* on $env:COMPUTERNAME ($((Get-Date).ToString('HH:mm')) local)
+- now scraping: $cur
+- categories left in queue: $pendingCount
 "@
     Post-Slack $hbMsg
     $state.last_heartbeat_ts = $now

@@ -3220,7 +3220,7 @@ const airlineBalanceScrapers = {
     if (/login|anmelden/i.test(page.url())) {
       throw new Error(
         'miles-more: AdsPower profile is not logged in. ' +
-        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'RDP into Karahost, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
         'navigate to miles-and-more.com, log in manually, then retry.',
       );
     }
@@ -3296,7 +3296,7 @@ const airlineBalanceScrapers = {
     if (/login|signin|ingreso/i.test(page.url())) {
       throw new Error(
         'lifemiles: AdsPower profile is not logged in. ' +
-        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'RDP into Karahost, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
         'navigate to lifemiles.com, log in manually, then retry.',
       );
     }
@@ -3368,7 +3368,7 @@ const airlineBalanceScrapers = {
     if (/login|signin|entrar/i.test(page.url())) {
       throw new Error(
         'smiles-gol: AdsPower profile is not logged in. ' +
-        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'RDP into Karahost, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
         'navigate to smiles.com.br, log in manually, then retry.',
       );
     }
@@ -3436,7 +3436,7 @@ const airlineBalanceScrapers = {
     if (/sign-?in|login/i.test(page.url())) {
       throw new Error(
         'etihad: AdsPower profile is not logged in. ' +
-        'RDP into Contabo, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
+        'RDP into Karahost, open the AIRLINE_BALANCE_PROFILE_ID profile in AdsPower, ' +
         'navigate to etihad.com, log in manually, then retry.',
       );
     }
@@ -3493,7 +3493,7 @@ handlers.airline_balance = async (page, { airline }) => {
     return {
       ok: false,
       error:
-        `airline_balance: scraper for "${airline}" not yet implemented on Contabo. ` +
+        `airline_balance: scraper for "${airline}" not yet implemented on Karahost. ` +
         `Add an entry to airlineBalanceScrapers in server.mjs and ship via /redeploy.`,
     };
   }
@@ -3871,7 +3871,7 @@ async function solveTurnstileChallenge(page) {
 //
 // Selectors below for Norwegian were captured by interactive Playwright
 // session 2026-05-08 from a residential IP (where the form actually
-// renders). The Contabo AdsPower profile gives us the same residential
+// renders). The Karahost AdsPower profile gives us the same residential
 // fingerprint so these selectors should match here.
 const AIRLINE_ENROLL_FLOWS = {
   norwegian: {
@@ -4608,6 +4608,124 @@ handlers.dom_inspect = async (page, { url, clickPath = [], dismissCookies = true
   }
 };
 
+// ── price_scrape ──────────────────────────────────────────────────────────────
+// Generic e-commerce price extractor for the Italy vendor-comparison table in
+// Spexx Health. Works across MyProtein.it / Amazon.it / iHerb / JSHealth because
+// all expose schema.org Product JSON-LD or og:price meta. Pure navigation — no
+// login, no form submit. The headless→AdsPower fallback is orchestrated by the
+// caller (health app): call with useAdsPower:false first, retry with true +
+// profileId when the result is `blocked` or the currency isn't EUR.
+//
+// Body: { url }
+handlers.price_scrape = async (page, { url }) => {
+  if (!url) return { ok: false, error: 'price_scrape: url required' };
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    // Cloudflare "Just a moment" / "Verifying you are human" interstitial: a real
+    // browser passes the JS challenge in a few seconds and redirects to the PDP.
+    // Poll up to ~18s for the challenge title to clear before scraping.
+    for (let i = 0; i < 12; i++) {
+      const t = (await page.title().catch(() => '')) || '';
+      if (!/just a moment|attention required|verifying you|checking your browser|un attimo/i.test(t)) break;
+      await page.waitForTimeout(1500);
+    }
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    for (const sel of ['#onetrust-accept-btn-handler', 'button#sp-cc-accept', '[aria-label="Accept cookies"]', 'button:has-text("Accetta")', 'button:has-text("Accept all")']) {
+      const el = await page.$(sel).catch(() => null);
+      if (el) { await el.click().catch(() => {}); break; }
+    }
+    await page.waitForTimeout(800);
+
+    const extracted = await page.evaluate(() => {
+      const out = { price: null, currency: null, raw: null, method: null, title: document.title || null };
+      const num = (v) => {
+        if (v == null) return null;
+        const s = String(v).replace(/[^0-9.,]/g, '').trim();
+        if (!s) return null;
+        let t = s;
+        if (s.includes(',') && s.includes('.')) {
+          // both present → decimal separator is whichever appears LAST.
+          t = s.lastIndexOf(',') > s.lastIndexOf('.')
+            ? s.replace(/\./g, '').replace(',', '.')  // EU: 1.234,56 → 1234.56
+            : s.replace(/,/g, '');                    // US: 1,234.56 → 1234.56
+        } else if (s.includes(',') && !s.includes('.')) {
+          t = s.replace(',', '.');                    // 12,99 → 12.99
+        }
+        const n = parseFloat(t);
+        return Number.isFinite(n) ? n : null;
+      };
+      // 1) schema.org Product JSON-LD
+      const walk = (node) => {
+        if (!node || typeof node !== 'object') return null;
+        const cand = (o) => {
+          if (!o) return null;
+          const p = o.price ?? o.lowPrice ?? o.highPrice;
+          return p != null ? { price: num(p), currency: o.priceCurrency || null, raw: String(p) } : null;
+        };
+        const offers = node.offers;
+        if (Array.isArray(offers)) { for (const o of offers) { const c = cand(o); if (c?.price != null) return c; } }
+        else { const c = cand(offers); if (c?.price != null) return c; }
+        return null;
+      };
+      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const data = JSON.parse(s.textContent);
+          const arr = Array.isArray(data) ? data : (data['@graph'] ? data['@graph'] : [data]);
+          for (const node of arr) {
+            const c = walk(node);
+            if (c?.price != null) { out.price = c.price; out.currency = c.currency; out.raw = c.raw; out.method = 'json-ld'; return out; }
+          }
+        } catch {}
+      }
+      // 2) OpenGraph / itemprop meta
+      const meta = (p) => document.querySelector(`meta[property="${p}"]`)?.content || document.querySelector(`meta[itemprop="${p.split(':').pop()}"]`)?.content || null;
+      const mp = meta('product:price:amount') || meta('og:price:amount');
+      if (mp) { out.price = num(mp); out.currency = meta('product:price:currency') || meta('og:price:currency') || null; out.raw = mp; out.method = 'meta'; return out; }
+      // 3) per-host DOM fallback
+      const host = location.hostname;
+      const SEL = {
+        'amazon.it': ['.a-price .a-offscreen', '#corePrice_feature_div .a-offscreen', '#priceblock_ourprice'],
+        'iherb.com': ['.product-price .price', '[itemprop="price"]', '.b-price-block .price'],
+        'myprotein.it': ['[data-component="productPrice"]', '.athenaProductPagePrice', '.productPrice_price'],
+      };
+      const hostKey = Object.keys(SEL).find((k) => host.includes(k));
+      const sels = hostKey ? SEL[hostKey] : ['[itemprop="price"]', '.price', '.product-price'];
+      for (const sel of sels) {
+        const el = document.querySelector(sel);
+        const txt = el?.getAttribute?.('content') || el?.textContent;
+        const n = num(txt);
+        if (n != null) {
+          out.price = n; out.raw = (txt || String(n)).trim().slice(0, 40); out.method = `dom:${sel}`;
+          out.currency = /€|EUR/.test(txt || '') ? 'EUR' : (/\$|USD/.test(txt || '') ? 'USD' : null);
+          return out;
+        }
+      }
+      return out;
+    });
+
+    const bodyText = (await page.evaluate(() => (document.body?.innerText || '').slice(0, 2000))).toLowerCase();
+    const blocked = /captcha|are you a human|enter the characters|verify you are|robot check|access denied|unusual traffic/.test(bodyText) || extracted.price == null;
+
+    const shot = path.join(OUT, `price-${Date.now()}.png`);
+    await page.screenshot({ path: shot, fullPage: false }).catch(() => {});
+
+    return {
+      portal: 'price_scrape',
+      url,
+      finalUrl: page.url(),
+      title: extracted.title,
+      price: extracted.price,
+      currency: extracted.currency,
+      raw_price_text: extracted.raw,
+      method: extracted.method,
+      blocked,
+      screenshot: shot,
+    };
+  } catch (err) {
+    return { portal: 'price_scrape', url, ok: false, blocked: true, error: err?.message || String(err) };
+  }
+};
+
 // ── App ─────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -4630,7 +4748,7 @@ app.post('/submit', auth(), async (req, res) => {
   if (!fn) return res.status(400).json({ error: `unknown portal: ${portal}`, known: Object.keys(handlers) });
   // For airline_balance / airline_login, default the profileId to the env-var
   // so the flights app doesn't need to know which AdsPower profile is doing
-  // the work — it's a Contabo-side config.
+  // the work — it's a Karahost-side config.
   const profileId = (portal === 'airline_balance' || portal === 'airline_login')
     ? (bodyProfileId ?? process.env.AIRLINE_BALANCE_PROFILE_ID ?? null)
     : bodyProfileId;
@@ -4766,9 +4884,9 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
       tabs_opened: tabsOpened,
       next_steps: [
         `Profile ${userId} (${PROFILE_NAME}) is open in AdsPower.`,
-        'RDP into Contabo. The browser has one tab per airline already at the login page.',
+        'RDP into Karahost. The browser has one tab per airline already at the login page.',
         'Log in to each airline. Cookies will persist in the profile.',
-        `Set on Contabo: AIRLINE_BALANCE_PROFILE_ID=${userId} in C:\\worker\\.env, then restart contabo-worker.`,
+        `Set on Karahost: AIRLINE_BALANCE_PROFILE_ID=${userId} in C:\\worker\\.env, then restart contabo-worker.`,
       ],
     });
   } catch (e) {
@@ -4888,69 +5006,6 @@ app.get('/redeploy/status', auth(), (_req, res) => {
   }
 });
 
-// ── FB warmup pool dashboard data ──────────────────────────────────────────
-// Surfaces state from C:\fb-verify\state.json + recent warmup.log lines so the
-// GrowthOps frontend can render the FbPool page. Read-only.
-app.get('/fb-pool/state', auth(), (_req, res) => {
-  try {
-    const STATE_PATH = 'C:\\fb-verify\\state.json';
-    const LOG_PATH = 'C:\\fb-verify\\warmup.log';
-    let state = null;
-    let log_tail = [];
-    let state_error = null;
-    let log_error = null;
-    try {
-      state = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
-    } catch (e) {
-      state_error = String(e?.message || e);
-    }
-    try {
-      const body = readFileSync(LOG_PATH, 'utf8');
-      log_tail = body.split(/\r?\n/).filter(Boolean).slice(-80);
-    } catch (e) {
-      log_error = String(e?.message || e);
-    }
-    // Try to query AdsPower for live browser status per profile (best-effort)
-    const adsCheck = async (userId) => {
-      try {
-        const r = await fetch(`${ADS}/api/v1/browser/active?user_id=${encodeURIComponent(userId)}`);
-        const j = await r.json();
-        return j?.data?.status === 'Active';
-      } catch { return false; }
-    };
-    const profiles = state?.profiles || [];
-    Promise.all(profiles.map(p => adsCheck(p.user_id).then(active => ({ ...p, browser_active: active }))))
-      .then(enriched => {
-        res.json({
-          fetched_at: new Date().toISOString(),
-          state_error,
-          log_error,
-          profiles: enriched,
-          log_tail,
-          stats: {
-            total_profiles: profiles.length,
-            active_profiles: profiles.filter(p => !p.skip).length,
-            dead_profiles: profiles.filter(p => p.skip).length,
-            total_sessions: profiles.reduce((acc, p) => acc + (p.session_log?.length || 0), 0),
-          },
-        });
-      })
-      .catch(err => {
-        res.json({
-          fetched_at: new Date().toISOString(),
-          state_error,
-          log_error,
-          profiles,
-          log_tail,
-          stats: { total_profiles: profiles.length },
-          ads_error: String(err?.message || err),
-        });
-      });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
 // ── FB Groups Poster — POST /fb-pool/post ──────────────────────────────────
 // Drives AdsPower + Playwright to submit a text post into a FB group on
 // behalf of one of the warmup profiles. Returns {ok, posted_url}.
@@ -5038,6 +5093,70 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
   }
 });
 
+
+// ── FB warmup pool dashboard data ──────────────────────────────────────────
+// Surfaces state from C:\fb-verify\state.json + recent warmup.log lines so the
+// GrowthOps frontend can render the FbPool page. Read-only.
+app.get('/fb-pool/state', auth(), (_req, res) => {
+  try {
+    const STATE_PATH = 'C:\\fb-verify\\state.json';
+    const LOG_PATH = 'C:\\fb-verify\\warmup.log';
+    let state = null;
+    let log_tail = [];
+    let state_error = null;
+    let log_error = null;
+    try {
+      state = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
+    } catch (e) {
+      state_error = String(e?.message || e);
+    }
+    try {
+      const body = readFileSync(LOG_PATH, 'utf8');
+      log_tail = body.split(/\r?\n/).filter(Boolean).slice(-80);
+    } catch (e) {
+      log_error = String(e?.message || e);
+    }
+    // Try to query AdsPower for live browser status per profile (best-effort)
+    const adsCheck = async (userId) => {
+      try {
+        const r = await fetch(`${ADS}/api/v1/browser/active?user_id=${encodeURIComponent(userId)}`);
+        const j = await r.json();
+        return j?.data?.status === 'Active';
+      } catch { return false; }
+    };
+    const profiles = state?.profiles || [];
+    Promise.all(profiles.map(p => adsCheck(p.user_id).then(active => ({ ...p, browser_active: active }))))
+      .then(enriched => {
+        res.json({
+          fetched_at: new Date().toISOString(),
+          state_error,
+          log_error,
+          profiles: enriched,
+          log_tail,
+          stats: {
+            total_profiles: profiles.length,
+            active_profiles: profiles.filter(p => !p.skip).length,
+            dead_profiles: profiles.filter(p => p.skip).length,
+            total_sessions: profiles.reduce((acc, p) => acc + (p.session_log?.length || 0), 0),
+          },
+        });
+      })
+      .catch(err => {
+        res.json({
+          fetched_at: new Date().toISOString(),
+          state_error,
+          log_error,
+          profiles,
+          log_tail,
+          stats: { total_profiles: profiles.length },
+          ads_error: String(err?.message || err),
+        });
+      });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`contabo-worker on :${PORT} — auth ${AUTH_DISABLED ? 'DISABLED (dev)' : 'enabled'}`);
+  console.log(`browser-worker on :${PORT} — auth ${AUTH_DISABLED ? 'DISABLED (dev)' : 'enabled'}`);
 });
