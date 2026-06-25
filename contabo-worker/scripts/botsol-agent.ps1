@@ -109,6 +109,15 @@ if ($cfg['COUNTRY_ROTATION']) {
 $RESULT_CAP            = if ($cfg['RESULT_CAP'])    { [string]$cfg['RESULT_CAP'] }    else { '100' }
 $KEYWORD_LIMIT         = if ($cfg['KEYWORD_LIMIT']) { [string]$cfg['KEYWORD_LIMIT'] } else { '5' }
 
+# Frozen-run self-heal thresholds (ticks; agent ticks every ~2 min).
+# A RUNNING-but-frozen scrape (record counter not advancing) is invisible to the
+# phase machine, so it used to sit dead for days (2026-06-05..08: 3.5 days at
+# record #229). STALL_SOFT_TICKS no-progress ticks -> click Stop (salvage partial
+# rows via the normal DONE->extract path). STALL_HARD_TICKS more with still no
+# progress -> kill BotsolApp + cold-start chain. Defaults: soft ~30min, hard ~16min later.
+$STALL_SOFT_TICKS      = if ($cfg['STALL_SOFT_TICKS']) { [int]$cfg['STALL_SOFT_TICKS'] } else { 15 }
+$STALL_HARD_TICKS      = if ($cfg['STALL_HARD_TICKS']) { [int]$cfg['STALL_HARD_TICKS'] } else { 8 }
+
 Write-Log "tick start  dry_run=$DRY_RUN  auto_start_next=$AUTO_START_NEXT  auto_delete_current=$AUTO_DELETE_CURRENT  use_starter=$USE_STARTER  use_pruned=$USE_PRUNED  result_cap=$RESULT_CAP  keyword_limit=$KEYWORD_LIMIT  export_via_sqlite=$EXPORT_VIA_SQLITE"
 
 # ---------- Slack helper ----------
@@ -870,6 +879,32 @@ function Handle-NumericPrompt {
         }
     } catch {}
 
+    # Some Botsol prompts gate the input Edit behind a "Limited to" radio (e.g. the
+    # "How many businesses..." result-cap dialog: txtInput stays disabled until the
+    # rbLimit radio is selected). Select it first so the Edit becomes enabled,
+    # otherwise we'd bail below with "no enabled Edit control".
+    try {
+        $radioCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::RadioButton)
+        foreach ($rb in $found.FindAll([System.Windows.Automation.TreeScope]::Descendants, $radioCond)) {
+            $raid = [string]$rb.Current.AutomationId; $rnm = [string]$rb.Current.Name
+            if ($raid -eq 'rbLimit' -or $rnm -match 'Limited') {
+                try {
+                    $sip = $rb.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+                    if (-not $sip.Current.IsSelected) {
+                        $sip.Select()
+                        Write-Log "$Tag selected '$rnm' radio to enable input edit"
+                        Start-Sleep -Milliseconds 400
+                    }
+                } catch {
+                    try { $rb.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); Start-Sleep -Milliseconds 400 } catch {}
+                }
+                break
+            }
+        }
+    } catch {}
+
     # Fill the first enabled Edit
     $editCond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -937,6 +972,59 @@ function Parse-LiveLog {
     $out.LatestRecord = $maxN
     $out.LatestKeyword = $lastKw
     return $out
+}
+
+# ----------------------------------------------------------------------------
+# Frozen-run detection (pure decision fn). Unit-tested via _test_stall.ps1.
+# Returns @{ Action='reset'|'count'|'soft'|'hard'; StallTicks=int; SoftAttempted=bool }.
+# 'soft' at SoftThreshold consecutive no-progress ticks; 'hard' SoftThreshold+HardThreshold.
+# Single-fire of 'hard' is the caller's responsibility (kill + Clear-QueueState removes
+# the RUNNING phase next tick, so this fn is never re-entered for the same dead run).
+# ----------------------------------------------------------------------------
+function Get-StallDecision {
+    param(
+        [int]$CurrentRecord,
+        [int]$LastRecord,
+        [int]$StallTicks,
+        [bool]$SoftAttempted,
+        [int]$SoftThreshold,
+        [int]$HardThreshold
+    )
+    if ($CurrentRecord -gt $LastRecord) {
+        return @{ Action = 'reset'; StallTicks = 0; SoftAttempted = $false }
+    }
+    $newTicks = $StallTicks + 1
+    if (-not $SoftAttempted) {
+        if ($newTicks -ge $SoftThreshold) {
+            return @{ Action = 'soft'; StallTicks = $newTicks; SoftAttempted = $true }
+        }
+        return @{ Action = 'count'; StallTicks = $newTicks; SoftAttempted = $false }
+    }
+    if ($newTicks -ge ($SoftThreshold + $HardThreshold)) {
+        return @{ Action = 'hard'; StallTicks = $newTicks; SoftAttempted = $true }
+    }
+    return @{ Action = 'count'; StallTicks = $newTicks; SoftAttempted = $true }
+}
+
+# Hard recovery: surgically kill BotsolApp + ONLY its embedded Chrome (path match,
+# never AdsPower's SunBrowser), then fire the proven cold-start scheduled-task chain
+# (the same tasks that recovered the box manually on 2026-06-08). After this the
+# caller clears queue-state; the next IDLE tick starts the next pending file.
+function Invoke-BotsolHardRestart {
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'Botsol Crawler\\chrome\\chrome\.exe') } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+    } catch {}
+    try { Get-Process -Name 'BotsolApp' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Seconds 3
+    foreach ($pair in @(@('BotsolShellLaunch',12), @('BotsolSelectClick',8), @('BotsolPick',8))) {
+        $tn = [string]$pair[0]; $wait = [int]$pair[1]
+        try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop; Write-Log "hard-restart: ran scheduled task $tn" }
+        catch { Write-Log "hard-restart: failed to run $tn : $($_.Exception.Message)" 'warn' }
+        Start-Sleep -Seconds $wait
+    }
+    Write-Log "hard-restart: cold-start chain complete; agent IDLE flow will pick next file"
 }
 
 # ============================================================================
@@ -1058,7 +1146,8 @@ try {
                 Write-Log "Delete clicked + Yes confirmed; marker written; exiting tick"
                 exit 0
             } else {
-                Write-Log "Delete invoke returned false; falling through" 'warn'
+                Write-Log "Delete invoke returned false; writing marker anyway to escape stuck loop (self-heal)" 'warn'
+              try { Set-Content -Path $deleteMarker -Value (Get-Date -Format o) -Encoding UTF8 } catch {}
             }
         } elseif ($AUTO_START_NEXT) {
             Write-Log "DONE phase + no active run state + AUTO_START_NEXT=true -> reclassifying as IDLE"
@@ -1113,13 +1202,44 @@ try {
                 }
                 Update-ScrapeJob -Id $state.current_run_id -Patch $patch | Out-Null
 
-                # Persist updated chrome_pids back to queue-state.json
+                # ---- Frozen-run detection / self-heal (see Get-StallDecision) ----
+                $curRec   = [int]$parsed.LatestRecord
+                $prevRec  = if ($null -ne $state.stall_last_record)     { [int]$state.stall_last_record }      else { 0 }
+                $prevTk   = if ($null -ne $state.stall_ticks)           { [int]$state.stall_ticks }            else { 0 }
+                $prevSoft = if ($null -ne $state.stall_soft_attempted)  { [bool]$state.stall_soft_attempted }  else { $false }
+                $decision = Get-StallDecision -CurrentRecord $curRec -LastRecord $prevRec -StallTicks $prevTk -SoftAttempted $prevSoft -SoftThreshold $STALL_SOFT_TICKS -HardThreshold $STALL_HARD_TICKS
+
+                # Persist chrome_pids + stall tracking back to queue-state.json
                 try {
                     $newState = @{}
                     foreach ($prop in $state.PSObject.Properties) { $newState[$prop.Name] = $prop.Value }
                     $newState.chrome_pids = $chromePidsStr
+                    if ($decision.Action -eq 'reset') {
+                        $newState.stall_last_record      = $curRec
+                        $newState.stall_last_progress_at = (Get-Date).ToString('o')
+                    } else {
+                        $newState.stall_last_record = [Math]::Max($curRec, $prevRec)
+                        if (-not $state.stall_last_progress_at) { $newState.stall_last_progress_at = (Get-Date).ToString('o') }
+                    }
+                    $newState.stall_ticks          = $decision.StallTicks
+                    $newState.stall_soft_attempted = $decision.SoftAttempted
                     Write-QueueState $newState
                 } catch {}
+
+                if ($decision.Action -eq 'soft') {
+                    $mins = [int]($decision.StallTicks * 2)
+                    Write-Log "STALL: no progress for $($decision.StallTicks) ticks (~$mins min) at record #$curRec on $($state.current_country)/$($state.current_source_file) -> SOFT recovery: clicking Stop" 'warn'
+                    Post-Slack (":warning: *Botsol frozen* at record #$curRec on ``$($state.current_country)/$($state.current_source_file)`` for ~$mins min. Auto-recovery: clicking Stop to salvage partial data + advance.")
+                    $stopOk = Invoke-Element $btnStop
+                    Write-Log "STALL soft: Stop invoke returned $stopOk"
+                }
+                elseif ($decision.Action -eq 'hard') {
+                    $mins = [int]($decision.StallTicks * 2)
+                    Write-Log "STALL: still frozen after soft for $($decision.StallTicks) ticks (~$mins min) -> HARD recovery: kill + cold-start" 'warn'
+                    Post-Slack (":rotating_light: *Botsol still frozen* after Stop attempt (~$mins min) on ``$($state.current_country)/$($state.current_source_file)``. HARD recovery: restarting BotsolApp + cold-start chain. In-flight partial data may be lost.")
+                    Invoke-BotsolHardRestart
+                    Clear-QueueState
+                }
             } else {
                 Write-Log "RUNNING phase but no current_run_id in state file" 'warn'
             }
@@ -1539,6 +1659,34 @@ try {
                     try {
                         $aid = [string]$k.Current.AutomationId
                         if (-not $k.Current.IsEnabled) { continue }
+                        if ($aid -eq 'frmLimitInput') {
+                            # Orphaned result-cap dialog ("How many businesses...", radio-gated).
+                            # Replay the remaining Start sequence inline with the CORRECT values so
+                            # the later delay prompt isn't filled with RESULT_CAP. Path from queue.
+                            $rcNext = Get-NextQueueItem
+                            $rcWhat = if ($rcNext) { "$($rcNext.Country)/$($rcNext.FileName)" } else { '<no next>' }
+                            Write-Log "AMBIGUOUS resume: orphaned result-cap dialog (frmLimitInput); replaying start for $rcWhat" 'warn'
+                            if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 8 -Tag 'resume_result_cap') {
+                                Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 15 -Tag 'resume_keyword_limit' | Out-Null
+                                Dismiss-BoolInput -ButtonName 'Yes' -TimeoutSec 8 | Out-Null
+                                if ($rcNext -and $rcNext.FullPath) {
+                                    if (Handle-NumericPrompt -Value $rcNext.FullPath -TimeoutSec 15 -Tag 'resume_file_select') {
+                                        # Persist queue-state so the DONE handler can export + roll to the next stem.
+                                        Write-QueueState @{
+                                            current_run_id      = $null
+                                            current_country     = $rcNext.Country
+                                            current_source_file = $rcNext.FileName
+                                            started_at          = (Get-Date).ToUniversalTime().ToString("o")
+                                        }
+                                        Post-Slack ":wrench: botsol-agent recovered stuck result-cap dialog -> started $($rcNext.Country)/$($rcNext.Stem)"
+                                    }
+                                } else {
+                                    Write-Log "AMBIGUOUS resume: filled cap but no next item for file-select" 'warn'
+                                }
+                                $resumed = $true
+                            }
+                            break
+                        }
                         if ($aid -eq 'InputInteger' -or $aid -eq 'frmInput' -or $aid -eq 'frmIntInput') {
                             Write-Log "AMBIGUOUS resume: found stuck numeric prompt aid=$aid; filling with $RESULT_CAP" 'warn'
                             if (Handle-NumericPrompt -Value $RESULT_CAP -TimeoutSec 4 -Tag 'resume_numeric') {

@@ -4888,6 +4888,69 @@ app.get('/redeploy/status', auth(), (_req, res) => {
   }
 });
 
+// ── FB warmup pool dashboard data ──────────────────────────────────────────
+// Surfaces state from C:\fb-verify\state.json + recent warmup.log lines so the
+// GrowthOps frontend can render the FbPool page. Read-only.
+app.get('/fb-pool/state', auth(), (_req, res) => {
+  try {
+    const STATE_PATH = 'C:\\fb-verify\\state.json';
+    const LOG_PATH = 'C:\\fb-verify\\warmup.log';
+    let state = null;
+    let log_tail = [];
+    let state_error = null;
+    let log_error = null;
+    try {
+      state = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
+    } catch (e) {
+      state_error = String(e?.message || e);
+    }
+    try {
+      const body = readFileSync(LOG_PATH, 'utf8');
+      log_tail = body.split(/\r?\n/).filter(Boolean).slice(-80);
+    } catch (e) {
+      log_error = String(e?.message || e);
+    }
+    // Try to query AdsPower for live browser status per profile (best-effort)
+    const adsCheck = async (userId) => {
+      try {
+        const r = await fetch(`${ADS}/api/v1/browser/active?user_id=${encodeURIComponent(userId)}`);
+        const j = await r.json();
+        return j?.data?.status === 'Active';
+      } catch { return false; }
+    };
+    const profiles = state?.profiles || [];
+    Promise.all(profiles.map(p => adsCheck(p.user_id).then(active => ({ ...p, browser_active: active }))))
+      .then(enriched => {
+        res.json({
+          fetched_at: new Date().toISOString(),
+          state_error,
+          log_error,
+          profiles: enriched,
+          log_tail,
+          stats: {
+            total_profiles: profiles.length,
+            active_profiles: profiles.filter(p => !p.skip).length,
+            dead_profiles: profiles.filter(p => p.skip).length,
+            total_sessions: profiles.reduce((acc, p) => acc + (p.session_log?.length || 0), 0),
+          },
+        });
+      })
+      .catch(err => {
+        res.json({
+          fetched_at: new Date().toISOString(),
+          state_error,
+          log_error,
+          profiles,
+          log_tail,
+          stats: { total_profiles: profiles.length },
+          ads_error: String(err?.message || err),
+        });
+      });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`contabo-worker on :${PORT} — auth ${AUTH_DISABLED ? 'DISABLED (dev)' : 'enabled'}`);
 });
