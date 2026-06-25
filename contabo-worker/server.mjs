@@ -5093,6 +5093,152 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
   }
 });
 
+// ── FB Groups: discover + join ─────────────────────────────────────────────
+// Both drive AdsPower + Playwright via a warmed profile's authenticated FB
+// session. Modeled on /fb-pool/post above (reuse FB_POST_PROFILE_MAP, fbPostAds,
+// chromium.connectOverCDP, ADS). Profile map extended with the bca-latam slots.
+Object.assign(FB_POST_PROFILE_MAP, {
+  'fb-bca-latam-main': 'k1dfw1g0',
+  'fb-bca-latam-secondary': 'k1dkhla0',
+});
+const _fbSleep = (ms) => new Promise(r => setTimeout(r, ms));
+function _fbParseMembers(text) {
+  if (!text) return null;
+  const m = String(text).match(/([\d.,]+)\s*([KMkm]|mil|rb)?/);
+  if (!m) return null;
+  let n = parseFloat(m[1].replace(/\./g, '').replace(',', '.'));
+  if (Number.isNaN(n)) { n = parseFloat(m[1].replace(/,/g, '')); }
+  if (Number.isNaN(n)) return null;
+  const unit = (m[2] || '').toLowerCase();
+  if (unit === 'k' || unit === 'mil' || unit === 'rb') n *= 1000;
+  else if (unit === 'm') n *= 1000000;
+  return Math.round(n);
+}
+async function _fbStartProfile(user_id) {
+  const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
+  if (active?.status === 'Active') {
+    await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
+    await _fbSleep(2000);
+  }
+  const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}`);
+  const ws = started?.ws?.puppeteer;
+  if (!ws) throw new Error('adspower start: no CDP url returned');
+  const browser = await chromium.connectOverCDP(ws);
+  const ctx = browser.contexts()[0] || (await browser.newContext());
+  const page = await ctx.newPage();
+  return { browser, page };
+}
+
+// POST /fb-pool/groups/discover — scrape FB Groups search via warmed profile.
+app.post('/fb-pool/groups/discover', auth(), async (req, res) => {
+  const { profile, query = 'Bali', max_results = 30, scroll_passes = 3 } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    const searchUrl = `https://www.facebook.com/search/groups/?q=${encodeURIComponent(query)}`;
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(4000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    for (let i = 0; i < scroll_passes; i++) {
+      await page.mouse.wheel(0, 4000).catch(() => {});
+      await _fbSleep(2500);
+    }
+    const raw = await page.evaluate((max) => {
+      const out = []; const seen = new Set();
+      for (const a of document.querySelectorAll('a[href*="/groups/"]')) {
+        const href = (a.href || '').split('?')[0];
+        const m = href.match(/facebook\.com\/groups\/([^/]+)\/?$/);
+        if (!m) continue;
+        const slug = m[1];
+        if (slug === 'search' || slug === 'feed' || seen.has(slug)) continue;
+        const name = (a.textContent || '').trim().slice(0, 140);
+        if (!name || name.length < 3) continue;
+        seen.add(slug);
+        let membersText = '';
+        let node = a.closest('div');
+        for (let d = 0; d < 6 && node; d++) {
+          const t = node.innerText || '';
+          const mm = t.match(/([\d.,KkMm ]+)\s*(members|membros|miembros|anggota|member)/i);
+          if (mm) { membersText = mm[0].trim(); break; }
+          node = node.parentElement;
+        }
+        out.push({ slug, url: `https://www.facebook.com/groups/${slug}`, name, members_text: membersText });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, max_results);
+    const groups = raw.map(g => ({ ...g, members: _fbParseMembers(g.members_text) }));
+    await page.close().catch(() => {});
+    return res.json({ ok: true, profile, query, count: groups.length, groups, scraped_at: new Date().toISOString() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
+// POST /fb-pool/groups/join — click Join on a FB group via warmed profile.
+const FB_JOIN_BUTTON_SELECTORS = [
+  'div[aria-label="Join group"][role="button"]',
+  'div[aria-label^="Join" i][role="button"]',
+  'div[role="button"]:has-text("Join group")',
+  'div[role="button"]:has-text("Join Group")',
+  'div[role="button"]:has-text("Join")',
+  'a[role="button"]:has-text("Join")',
+];
+const FB_JOINED_SELECTORS = [
+  'div[aria-label="Joined"][role="button"]',
+  'div[role="button"]:has-text("Joined")',
+  'div[aria-label*="Leave group" i]',
+];
+const FB_PENDING_SELECTORS = [
+  'div[role="button"]:has-text("Cancel request")',
+  'div[role="button"]:has-text("Requested")',
+  'div[role="button"]:has-text("Pending")',
+];
+app.post('/fb-pool/groups/join', auth(), async (req, res) => {
+  const { profile, group_url } = req.body ?? {};
+  if (!profile || !group_url) return res.status(422).json({ ok: false, error: 'profile, group_url required' });
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  let page = null;
+  const isVisible = async (sel, t = 2500) => { try { return await page.locator(sel).first().isVisible({ timeout: t }); } catch { return false; } };
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(group_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(3500);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    for (const sel of FB_JOINED_SELECTORS) {
+      if (await isVisible(sel)) { await page.close().catch(() => {}); return res.json({ ok: true, already_joined: true }); }
+    }
+    let clicked = false;
+    for (const sel of FB_JOIN_BUTTON_SELECTORS) {
+      try { await page.locator(sel).first().click({ timeout: 4000 }); clicked = true; break; } catch {}
+    }
+    if (!clicked) { await page.close().catch(() => {}); return res.status(200).json({ ok: false, error: 'join_button_missing' }); }
+    await _fbSleep(3500);
+    const questions = await isVisible('div[role="dialog"]:has-text("answer"), div[role="dialog"]:has-text("question")', 3000);
+    if (questions) { await page.close().catch(() => {}); return res.json({ ok: true, joined: false, needs_questions: true }); }
+    let joined = false, pending = false;
+    for (const sel of FB_JOINED_SELECTORS) { if (await isVisible(sel, 3000)) { joined = true; break; } }
+    if (!joined) { for (const sel of FB_PENDING_SELECTORS) { if (await isVisible(sel, 2000)) { pending = true; break; } } }
+    await page.close().catch(() => {});
+    if (joined) return res.json({ ok: true, joined: true });
+    if (pending) return res.json({ ok: true, joined: true, pending: true });
+    return res.json({ ok: true, joined: false, unverified: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 
 // ── FB warmup pool dashboard data ──────────────────────────────────────────
 // Surfaces state from C:\fb-verify\state.json + recent warmup.log lines so the
