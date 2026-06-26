@@ -5080,10 +5080,23 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
     await _fbSleep(1200);
     if (text) { await composer.fill(text); await _fbSleep(1000); }
     if (imgTmp) {
+      // click Photo/video to mount FB's multi-file photo input
       for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await page.locator(sel).first().click({ timeout: 3000 }); break; } catch {} }
-      await _fbSleep(1200);
-      const fileInput = page.locator('input[type="file"][accept*="image"], div[role="dialog"] input[type="file"], input[type="file"]').first();
-      await fileInput.setInputFiles(imgTmp.paths, { timeout: 20000 });
+      await _fbSleep(1800);
+      let multi = page.locator('input[type="file"][multiple]');
+      if (await multi.count() === 0) {
+        // retry the button click then re-look for the multi input
+        for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await page.locator(sel).first().click({ timeout: 2500 }); break; } catch {} }
+        await _fbSleep(1800);
+        multi = page.locator('input[type="file"][multiple]');
+      }
+      if (await multi.count() > 0) {
+        await multi.first().setInputFiles(imgTmp.paths, { timeout: 25000 });
+      } else {
+        // fallback: only a single-file input is present → upload the first image only
+        const single = page.locator('input[type="file"][accept*="image"], input[type="file"]').first();
+        await single.setInputFiles([imgTmp.paths[0]], { timeout: 20000 });
+      }
       await _fbSleep(4000 + 3000 * imgTmp.paths.length); // allow upload to render
     }
     let clicked = false;
