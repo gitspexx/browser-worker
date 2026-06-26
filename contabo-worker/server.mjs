@@ -5086,23 +5086,22 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       try { await page.locator(sel).first().click({ timeout: 4000 }); opened = true; break; } catch {}
     }
     if (!opened) throw new Error('create_post_entry_missing');
+    // grab the dialog that actually CONTAINS the composer (not a stray messenger/menu dialog)
     let dialog;
-    try { await page.waitForSelector('div[role="dialog"]', { timeout: 9000 }); dialog = page.locator('div[role="dialog"]').last(); }
-    catch { throw new Error('post_dialog_missing'); }
-    await _fbSleep(1800);
-    // 2) composer textbox INSIDE the dialog — find the visible editable
-    let composer = null;
-    for (const sel of ['div[role="textbox"][contenteditable="true"]', 'div[contenteditable="true"][role="textbox"]', 'div[aria-label*="mind" i][contenteditable="true"]', 'div[contenteditable="true"]']) {
-      try { const loc = dialog.locator(sel).first(); await loc.waitFor({ state: 'visible', timeout: 5000 }); composer = loc; break; } catch {}
+    try {
+      await page.waitForSelector('div[role="dialog"] div[contenteditable="true"]', { timeout: 10000 });
+      dialog = page.locator('div[role="dialog"]:has(div[contenteditable="true"])').last();
+    } catch {
+      const dialogs = await page.evaluate(() => [...document.querySelectorAll('div[role="dialog"]')].map(d => ({ lab: d.getAttribute('aria-label'), hasCE: !!d.querySelector('[contenteditable="true"]'), txt: (d.innerText || '').replace(/\s+/g, ' ').slice(0, 50) })).slice(0, 8)).catch(() => []);
+      return res.status(500).json({ ok: false, error: 'post_dialog_no_composer', opened, dialogs });
     }
-    if (!composer) {
-      const dialog_editables = await dialog.evaluate((d) => [...d.querySelectorAll('[contenteditable],[role="textbox"]')].map(e => ({ tag: e.tagName, role: e.getAttribute('role'), ce: e.getAttribute('contenteditable'), lab: e.getAttribute('aria-label'), vis: e.offsetParent !== null })).slice(0, 15)).catch(() => []);
-      return res.status(500).json({ ok: false, error: 'composer_missing_in_dialog', dialog_editables });
-    }
+    await _fbSleep(1500);
+    // 2) composer = the contenteditable inside that dialog
+    const composer = dialog.locator('div[contenteditable="true"]').first();
     if (text) {
-      await composer.click();
+      await composer.click().catch(() => {});
       await _fbSleep(500);
-      try { await composer.fill(text); } catch { await composer.pressSequentially(text, { delay: 8 }); }
+      try { await composer.fill(text); } catch { try { await composer.pressSequentially(text, { delay: 8 }); } catch {} }
       await _fbSleep(1000);
     }
     // 3) photos — Photo/video button + multi-file input, all scoped to the dialog
