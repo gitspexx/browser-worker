@@ -5021,11 +5021,10 @@ const FB_COMPOSER_SELECTORS = [
   'div[role="textbox"][contenteditable="true"]',
 ];
 const FB_POST_BUTTON_SELECTORS = [
-  'div[role="dialog"] div[aria-label="Post"][role="button"]',
   'div[aria-label="Post"][role="button"]',
-  'div[role="dialog"] div[aria-label="Post"]',
   'div[aria-label="Post"]',
   'div[role="button"]:has-text("Post")',
+  'span:has-text("Post")',
 ];
 async function fbPostAds(pathname) {
   const r = await fetch(`${ADS}${pathname}`);
@@ -5073,41 +5072,50 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    let composer = null;
-    for (const sel of FB_COMPOSER_SELECTORS) {
-      try { await page.waitForSelector(sel, { timeout: 4000 }); composer = page.locator(sel).first(); break; } catch {}
+    // 1) open the Create-Post dialog from the group feed (the clickable card,
+    //    NOT a comment textbox — comments also read "Write something").
+    const CREATE_ENTRY_SELECTORS = [
+      'div[role="button"]:has-text("Write something")',
+      'div[role="button"]:has-text("Write a public post")',
+      'div[aria-label*="Create a public post" i]',
+      'div[aria-label*="Write something" i][role="button"]',
+      'div[role="button"][aria-label*="mind" i]',
+    ];
+    let opened = false;
+    for (const sel of CREATE_ENTRY_SELECTORS) {
+      try { await page.locator(sel).first().click({ timeout: 4000 }); opened = true; break; } catch {}
     }
-    if (!composer) throw new Error('composer_missing');
-    await composer.click();
-    await _fbSleep(1200);
+    if (!opened) throw new Error('create_post_entry_missing');
+    let dialog;
+    try { await page.waitForSelector('div[role="dialog"]', { timeout: 9000 }); dialog = page.locator('div[role="dialog"]').last(); }
+    catch { throw new Error('post_dialog_missing'); }
+    await _fbSleep(1500);
+    // 2) composer textbox INSIDE the dialog
+    const composer = dialog.locator('div[role="textbox"][contenteditable="true"], div[aria-label*="Write something" i][role="textbox"]').first();
+    await composer.click().catch(() => {});
+    await _fbSleep(600);
     if (text) { await composer.fill(text); await _fbSleep(1000); }
+    // 3) photos — Photo/video button + multi-file input, all scoped to the dialog
     if (imgTmp) {
-      // click Photo/video to mount FB's multi-file photo input
-      for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await page.locator(sel).first().click({ timeout: 3000 }); break; } catch {} }
+      for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await dialog.locator(sel).first().click({ timeout: 3000 }); break; } catch {} }
       await _fbSleep(1800);
       let multi = page.locator('input[type="file"][multiple]');
       if (await multi.count() === 0) {
-        // retry the button click then re-look for the multi input
-        for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await page.locator(sel).first().click({ timeout: 2500 }); break; } catch {} }
+        for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await dialog.locator(sel).first().click({ timeout: 2500 }); break; } catch {} }
         await _fbSleep(1800);
         multi = page.locator('input[type="file"][multiple]');
       }
-      if (await multi.count() > 0) {
-        await multi.first().setInputFiles(imgTmp.paths, { timeout: 25000 });
-      } else {
-        // fallback: only a single-file input is present → upload the first image only
-        const single = page.locator('input[type="file"][accept*="image"], input[type="file"]').first();
-        await single.setInputFiles([imgTmp.paths[0]], { timeout: 20000 });
-      }
+      if (await multi.count() > 0) await multi.first().setInputFiles(imgTmp.paths, { timeout: 25000 });
+      else { const single = page.locator('input[type="file"][accept*="image"], input[type="file"]').first(); await single.setInputFiles([imgTmp.paths[0]], { timeout: 20000 }); }
       await _fbSleep(4000 + 3000 * imgTmp.paths.length); // allow upload to render
     }
-    // poll until the Post button is present + enabled (photos may still be uploading)
+    // 4) Post button INSIDE the dialog — poll until present + enabled
     let clicked = false;
     const _postDeadline = Date.now() + 45000;
     while (!clicked && Date.now() < _postDeadline) {
       for (const sel of FB_POST_BUTTON_SELECTORS) {
         try {
-          const btn = page.locator(sel).last();
+          const btn = dialog.locator(sel).last();
           if (await btn.count() === 0) continue;
           if ((await btn.getAttribute('aria-disabled')) === 'true') continue;
           await btn.click({ timeout: 2500 });
@@ -5117,13 +5125,13 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       if (!clicked) await _fbSleep(2000);
     }
     if (!clicked) {
-      const dialog_buttons = await page.evaluate(() => {
+      const dialog_buttons = await dialog.evaluate((d) => {
         const out = [];
-        for (const el of document.querySelectorAll('[role="dialog"] [role="button"], [aria-label][role="button"]')) {
+        for (const el of d.querySelectorAll('[role="button"],[aria-label]')) {
           const lab = el.getAttribute('aria-label'); const txt = (el.innerText || '').trim().slice(0, 24);
           if (lab || txt) out.push({ lab, txt, dis: el.getAttribute('aria-disabled') });
         }
-        return out.slice(0, 40);
+        return out.slice(0, 30);
       }).catch(() => []);
       return res.status(500).json({ ok: false, error: 'post_button_missing_or_disabled', dialog_buttons });
     }
