@@ -5116,7 +5116,17 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       }
       if (!clicked) await _fbSleep(2000);
     }
-    if (!clicked) throw new Error('post_button_missing_or_disabled');
+    if (!clicked) {
+      const dialog_buttons = await page.evaluate(() => {
+        const out = [];
+        for (const el of document.querySelectorAll('[role="dialog"] [role="button"], [aria-label][role="button"]')) {
+          const lab = el.getAttribute('aria-label'); const txt = (el.innerText || '').trim().slice(0, 24);
+          if (lab || txt) out.push({ lab, txt, dis: el.getAttribute('aria-disabled') });
+        }
+        return out.slice(0, 40);
+      }).catch(() => []);
+      return res.status(500).json({ ok: false, error: 'post_button_missing_or_disabled', dialog_buttons });
+    }
     try { await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 }); permalink = page.url(); } catch { permalink = null; }
     await page.close().catch(() => {});
     return res.json({ ok: true, posted_url: permalink });
