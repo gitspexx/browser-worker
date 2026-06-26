@@ -42,7 +42,9 @@ if($t -and $t -notmatch 'Select Bot'){
   Get-Process BotsolApp,chrome,chromedriver -EA SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 5
   Start-ScheduledTask -TaskName BotsolManualLaunch; Start-Sleep -Seconds 18
 }
-for($i=0;$i -lt 4;$i++){ if(SolveOnce){ break }; Start-Sleep -Seconds 2 }
+# chooser-solve REMOVED 2026-06-26: BotsolHwClick (robust UIA solver) owns the chooser now.
+# cc4 only corrects a WRONG bot (kill+relaunch above); hwclick solves the relaunched chooser.
+if((Find 'Select Bot') -ne [IntPtr]::Zero){ L 'chooser up -> BotsolHwClick owns it (no pixel-solve here)' }
 Start-Sleep -Milliseconds 800
 $t=Title "Crawler App"
 L "after solve title: $t"
