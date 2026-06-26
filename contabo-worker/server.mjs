@@ -5031,65 +5031,74 @@ async function fbPostAds(pathname) {
   if (j.code !== 0) throw new Error(`adspower ${pathname}: ${j.msg}`);
   return j.data || {};
 }
+const FB_PHOTO_BUTTON_SELECTORS = [
+  'div[aria-label="Photo/video"]',
+  'div[aria-label^="Photo" i][role="button"]',
+  'div[aria-label*="photo/video" i]',
+  'div[role="button"]:has-text("Photo/video")',
+];
+// download image_urls to a temp dir; returns {dir, paths}
+async function _fbDownloadImages(urls) {
+  const base = process.env.TEMP || process.env.TMP || '.';
+  const dir = fs.mkdtempSync(join(base, 'fbimg-'));
+  const paths = [];
+  for (let i = 0; i < urls.length; i++) {
+    const r = await fetch(urls[i]);
+    if (!r.ok) throw new Error(`image fetch ${r.status}: ${urls[i]}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    let ext = ((urls[i].split('?')[0].split('.').pop()) || 'jpg').toLowerCase();
+    if (!/^(jpg|jpeg|png|webp)$/.test(ext)) ext = 'jpg';
+    const p = join(dir, `img${i}.${ext}`);
+    fs.writeFileSync(p, buf);
+    paths.push(p);
+  }
+  return { dir, paths };
+}
 app.post('/fb-pool/post', auth(), async (req, res) => {
-  const { profile, group_url, text } = req.body ?? {};
-  if (!profile || !group_url || !text) {
-    return res.status(422).json({ error: 'profile, group_url, text all required' });
+  const { profile, group_url, text, image_urls } = req.body ?? {};
+  const imgs = Array.isArray(image_urls) ? image_urls.filter(u => typeof u === 'string' && u) : [];
+  if (!profile || !group_url || (!text && !imgs.length)) {
+    return res.status(422).json({ error: 'profile, group_url, and (text or image_urls) required' });
   }
   const user_id = FB_POST_PROFILE_MAP[profile];
-  if (!user_id) {
-    return res.status(400).json({ error: `unknown profile: ${profile}` });
-  }
-  let browser = null;
-  let permalink = null;
+  if (!user_id) return res.status(400).json({ error: `unknown profile: ${profile}` });
+  let page = null, permalink = null, imgTmp = null;
   try {
-    const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
-    if (active?.status === 'Active') {
-      await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}`);
-    const ws = started?.ws?.puppeteer;
-    if (!ws) throw new Error(`adspower start: no CDP url returned`);
-    browser = await chromium.connectOverCDP(ws);
-    const ctx = browser.contexts()[0] || (await browser.newContext());
-    const page = await ctx.newPage();
+    if (imgs.length) imgTmp = await _fbDownloadImages(imgs);
+    ({ page } = await _fbStartProfile(user_id));
     await page.goto(group_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await new Promise(r => setTimeout(r, 3000));
+    await _fbSleep(3000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
     let composer = null;
     for (const sel of FB_COMPOSER_SELECTORS) {
-      try {
-        await page.waitForSelector(sel, { timeout: 4000 });
-        composer = page.locator(sel).first();
-        break;
-      } catch {}
+      try { await page.waitForSelector(sel, { timeout: 4000 }); composer = page.locator(sel).first(); break; } catch {}
     }
     if (!composer) throw new Error('composer_missing');
     await composer.click();
-    await new Promise(r => setTimeout(r, 1000));
-    await composer.fill(text);
-    await new Promise(r => setTimeout(r, 1000));
+    await _fbSleep(1200);
+    if (text) { await composer.fill(text); await _fbSleep(1000); }
+    if (imgTmp) {
+      for (const sel of FB_PHOTO_BUTTON_SELECTORS) { try { await page.locator(sel).first().click({ timeout: 3000 }); break; } catch {} }
+      await _fbSleep(1200);
+      const fileInput = page.locator('input[type="file"][accept*="image"], div[role="dialog"] input[type="file"], input[type="file"]').first();
+      await fileInput.setInputFiles(imgTmp.paths, { timeout: 20000 });
+      await _fbSleep(4000 + 3000 * imgTmp.paths.length); // allow upload to render
+    }
     let clicked = false;
     for (const sel of FB_POST_BUTTON_SELECTORS) {
-      try {
-        await page.locator(sel).last().click({ timeout: 4000 });
-        clicked = true;
-        break;
-      } catch {}
+      try { await page.locator(sel).last().click({ timeout: 5000 }); clicked = true; break; } catch {}
     }
     if (!clicked) throw new Error('post_button_missing');
-    try {
-      await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 });
-      permalink = page.url();
-    } catch {
-      permalink = null;
-    }
-    await page.close();
+    try { await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 }); permalink = page.url(); } catch { permalink = null; }
+    await page.close().catch(() => {});
     return res.json({ ok: true, posted_url: permalink });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+    try { if (imgTmp?.dir) fs.rmSync(imgTmp.dir, { recursive: true, force: true }); } catch {}
   }
 });
 
