@@ -5021,9 +5021,11 @@ const FB_COMPOSER_SELECTORS = [
   'div[role="textbox"][contenteditable="true"]',
 ];
 const FB_POST_BUTTON_SELECTORS = [
+  'div[role="dialog"] div[aria-label="Post"][role="button"]',
   'div[aria-label="Post"][role="button"]',
+  'div[role="dialog"] div[aria-label="Post"]',
+  'div[aria-label="Post"]',
   'div[role="button"]:has-text("Post")',
-  'button:has-text("Post")',
 ];
 async function fbPostAds(pathname) {
   const r = await fetch(`${ADS}${pathname}`);
@@ -5099,11 +5101,22 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       }
       await _fbSleep(4000 + 3000 * imgTmp.paths.length); // allow upload to render
     }
+    // poll until the Post button is present + enabled (photos may still be uploading)
     let clicked = false;
-    for (const sel of FB_POST_BUTTON_SELECTORS) {
-      try { await page.locator(sel).last().click({ timeout: 5000 }); clicked = true; break; } catch {}
+    const _postDeadline = Date.now() + 45000;
+    while (!clicked && Date.now() < _postDeadline) {
+      for (const sel of FB_POST_BUTTON_SELECTORS) {
+        try {
+          const btn = page.locator(sel).last();
+          if (await btn.count() === 0) continue;
+          if ((await btn.getAttribute('aria-disabled')) === 'true') continue;
+          await btn.click({ timeout: 2500 });
+          clicked = true; break;
+        } catch {}
+      }
+      if (!clicked) await _fbSleep(2000);
     }
-    if (!clicked) throw new Error('post_button_missing');
+    if (!clicked) throw new Error('post_button_missing_or_disabled');
     try { await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 }); permalink = page.url(); } catch { permalink = null; }
     await page.close().catch(() => {});
     return res.json({ ok: true, posted_url: permalink });
