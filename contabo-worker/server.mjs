@@ -5144,7 +5144,21 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       }).catch(() => []);
       return res.status(500).json({ ok: false, error: 'post_button_missing_or_disabled', dialog_buttons });
     }
-    try { await page.waitForURL(/\/posts\/\d+/, { timeout: 30000 }); permalink = page.url(); } catch { permalink = null; }
+    // capture the new post's permalink (best-effort): FB may navigate to it,
+    // else scan the feed for the freshest /groups/.../posts|permalink/ link.
+    permalink = null;
+    try { await page.waitForURL(/\/(posts|permalink)\/\d+/, { timeout: 12000 }); permalink = page.url().split('?')[0]; } catch {}
+    if (!permalink) {
+      try {
+        await _fbSleep(5000);
+        permalink = await page.evaluate(() => {
+          const hit = [...document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]')]
+            .map(a => (a.href || '').split('?')[0])
+            .find(h => /\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(h));
+          return hit || null;
+        });
+      } catch {}
+    }
     await page.close().catch(() => {});
     return res.json({ ok: true, posted_url: permalink });
   } catch (e) {
