@@ -5363,7 +5363,18 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
         out.push({ post_url: href, post_text: text, post_author: author });
         if (out.length >= max) break;
       }
-      return { posts: out, debug: { articles: articles.length, sampleHrefs } };
+      const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
+      const pageLinkSample = [];
+      for (const l of pageLinks) { if (pageLinkSample.length >= 6) break; pageLinkSample.push((l.href || '').split('?')[0].slice(0, 120)); }
+      return { posts: out, debug: {
+        articles: articles.length,
+        sampleHrefs,
+        pageUrl: location.href.slice(0, 160),
+        title: (document.title || '').slice(0, 120),
+        pagePostLinks: pageLinks.length,
+        pageLinkSample,
+        bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 300),
+      } };
     }, max_posts);
     const posts = result.posts;
     await page.close().catch(() => {});
