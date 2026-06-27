@@ -5400,10 +5400,7 @@ async function _fbSearchHarvest(page, gid, max_posts) {
     }
     return false;
   }, { timeout: 25000 }).catch(() => {});
-  for (let i = 0; i < 3; i++) {
-    await page.evaluate(() => window.scrollBy(0, 1400)).catch(() => {});
-    await _fbSleep(1800);
-  }
+  await _fbSleep(2500); // let the timestamp hrefs settle
 
   const count = await page.$$eval('div[role="article"]', els => els.length).catch(() => 0);
   const n = Math.min(count, max_posts);
@@ -5421,32 +5418,42 @@ async function _fbSearchHarvest(page, gid, max_posts) {
       return a ? (a.innerText || '').trim().slice(0, 80) : '';
     }).catch(() => '');
 
-    // 1) fast path — href already present
-    let perm = await art.evaluate(e => {
-      for (const l of e.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]')) {
+    const readHref = () => art.evaluate(e => {
+      for (const l of e.querySelectorAll('a')) {
         const h = l.href || l.getAttribute('href') || '';
         if (/\/(?:posts|permalink)\/\d+|story_fbid=\d+/.test(h)) return h;
       }
       return null;
     }).catch(() => null);
-    if (perm) perm = _fbNormPermalink(perm, gid);
 
-    // 2) click-to-URL — click the result, read the permalink from the URL bar, go back
+    // 1) fast path
+    let raw = await readHref();
+    // 2) hover-reveal — FB sets the timestamp link's href only on hover
+    if (!raw) {
+      await art.hover().catch(() => {});
+      await _fbSleep(300);
+      const links = await art.$$('a[role="link"], a');
+      for (const l of links.slice(0, 8)) {
+        await l.hover().catch(() => {});
+        await _fbSleep(110);
+        raw = await readHref();
+        if (raw) break;
+      }
+    }
+    let perm = raw ? _fbNormPermalink(raw, gid) : null;
+
+    // 3) last resort: click the post text, read the permalink from the URL bar, go back
     if (!perm) {
       debugClicks++;
       const before = page.url();
-      await art.scrollIntoViewIfNeeded().catch(() => {});
-      await art.click({ timeout: 3000 }).catch(() => {});
+      const tgt = (await art.$('div[dir="auto"]')) || art;
+      await tgt.scrollIntoViewIfNeeded().catch(() => {});
+      await tgt.click({ timeout: 3000 }).catch(() => {});
       await page.waitForURL(/\/groups\/[^/]+\/(?:posts|permalink)\/\d+/, { timeout: 6000 }).catch(() => {});
-      const cur = page.url();
-      if (/\/(?:posts|permalink)\/\d+/.test(cur)) {
-        perm = _fbNormPermalink(cur, gid);
+      if (/\/(?:posts|permalink)\/\d+/.test(page.url())) perm = _fbNormPermalink(page.url(), gid);
+      if (page.url() !== before) {
         await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-        await _fbSleep(2800);
-      } else if (cur !== before) {
-        // landed somewhere unexpected (photo/profile) — recover
-        await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-        await _fbSleep(2200);
+        await _fbSleep(2600);
       }
     }
 
