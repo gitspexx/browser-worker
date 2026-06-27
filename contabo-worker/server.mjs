@@ -5335,14 +5335,15 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
     await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
-    // Scroll the document to force the lazy feed to fetch + render; bail early
-    // once post permalinks appear.
-    for (let i = 0; i < Math.max(scroll_passes, 6); i++) {
+    // Scroll the document to force the lazy feed to fetch + render. Keep going
+    // until we've loaded ~max post permalinks (or run out of passes) so each
+    // scan harvests a useful batch rather than the first post only.
+    for (let i = 0; i < Math.max(scroll_passes, 7); i++) {
       await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
       await page.keyboard.press('End').catch(() => {});
       await _fbSleep(2600);
       const hit = await page.evaluate(() => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length).catch(() => 0);
-      if (hit > 0) break;
+      if (hit >= max_posts) break;
     }
     const result = await page.evaluate(({ max, gid }) => {
       const out = []; const seen = new Set();
