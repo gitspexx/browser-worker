@@ -5330,13 +5330,30 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    for (let i = 0; i < scroll_passes; i++) { await page.mouse.wheel(0, 3500).catch(() => {}); await _fbSleep(2500); }
-    const posts = await page.evaluate((max) => {
+    await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
+    for (let i = 0; i < scroll_passes; i++) { await page.mouse.wheel(0, 3500).catch(() => {}); await _fbSleep(2800); }
+    const result = await page.evaluate((max) => {
       const out = []; const seen = new Set();
-      for (const a of document.querySelectorAll('div[role="article"]')) {
-        const link = a.querySelector('a[href*="/groups/"][href*="/posts/"], a[href*="/groups/"][href*="/permalink/"]');
-        const href = link ? (link.href || '').split('?')[0] : null;
-        if (!href || !/\/(posts|permalink)\/\d+/.test(href) || seen.has(href)) continue;
+      const articles = document.querySelectorAll('div[role="article"]');
+      const sampleHrefs = [];
+      // Pull a post permalink id out of any anchor we can find inside the article.
+      const permFrom = (a) => {
+        const anchors = a.querySelectorAll('a[href*="/groups/"]');
+        for (const link of anchors) {
+          const raw = (link.href || '').split('?')[0];
+          const m = raw.match(/\/groups\/[^/]+\/(?:posts|permalink)\/(\d+)/);
+          if (m) return raw;
+        }
+        return null;
+      };
+      for (const a of articles) {
+        // collect a few sample hrefs for diagnostics
+        if (sampleHrefs.length < 6) {
+          const any = a.querySelector('a[href*="/groups/"]');
+          if (any) sampleHrefs.push((any.href || '').split('?')[0].slice(0, 120));
+        }
+        const href = permFrom(a);
+        if (!href || seen.has(href)) continue;
         const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
         if (!text || text.length < 15) continue;
         let author = '';
@@ -5346,10 +5363,11 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
         out.push({ post_url: href, post_text: text, post_author: author });
         if (out.length >= max) break;
       }
-      return out;
+      return { posts: out, debug: { articles: articles.length, sampleHrefs } };
     }, max_posts);
+    const posts = result.posts;
     await page.close().catch(() => {});
-    return res.json({ ok: true, group_url, count: posts.length, posts, scraped_at: new Date().toISOString() });
+    return res.json({ ok: true, group_url, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
