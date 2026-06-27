@@ -5386,6 +5386,77 @@ async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
   } };
 }
 
+// Harvest IN-GROUP SEARCH results. Search cards expose no anchor href at all
+// (FB navigates them via JS), so the only reliable way to get a permalink is to
+// CLICK the result and read the URL bar, then go back. Slower but bulletproof.
+async function _fbSearchHarvest(page, gid, max_posts) {
+  await page.bringToFront().catch(() => {});
+  await _fbSleep(3500);
+  // Wait for real results to replace the skeleton ("Facebook Facebook…") cards.
+  await page.waitForFunction(() => {
+    for (const a of document.querySelectorAll('div[role="article"]')) {
+      const t = (a.innerText || '').replace(/Facebook/g, '').replace(/\s+/g, ' ').trim();
+      if (t.length > 40) return true;
+    }
+    return false;
+  }, { timeout: 25000 }).catch(() => {});
+  for (let i = 0; i < 3; i++) {
+    await page.evaluate(() => window.scrollBy(0, 1400)).catch(() => {});
+    await _fbSleep(1800);
+  }
+
+  const count = await page.$$eval('div[role="article"]', els => els.length).catch(() => 0);
+  const n = Math.min(count, max_posts);
+  const out = []; const seen = new Set();
+  let debugClicks = 0;
+  for (let i = 0; i < n; i++) {
+    // Re-query fresh each pass — goBack rebuilds the search DOM, stale handles die.
+    const arts = await page.$$('div[role="article"]');
+    if (i >= arts.length) break;
+    const art = arts[i];
+    const text = await art.evaluate(e => (e.innerText || '').replace(/Facebook/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 800)).catch(() => '');
+    if (!text || text.length < 20) continue;
+    const author = await art.evaluate(e => {
+      const a = e.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
+      return a ? (a.innerText || '').trim().slice(0, 80) : '';
+    }).catch(() => '');
+
+    // 1) fast path — href already present
+    let perm = await art.evaluate(e => {
+      for (const l of e.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]')) {
+        const h = l.href || l.getAttribute('href') || '';
+        if (/\/(?:posts|permalink)\/\d+|story_fbid=\d+/.test(h)) return h;
+      }
+      return null;
+    }).catch(() => null);
+    if (perm) perm = _fbNormPermalink(perm, gid);
+
+    // 2) click-to-URL — click the result, read the permalink from the URL bar, go back
+    if (!perm) {
+      debugClicks++;
+      const before = page.url();
+      await art.scrollIntoViewIfNeeded().catch(() => {});
+      await art.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForURL(/\/groups\/[^/]+\/(?:posts|permalink)\/\d+/, { timeout: 6000 }).catch(() => {});
+      const cur = page.url();
+      if (/\/(?:posts|permalink)\/\d+/.test(cur)) {
+        perm = _fbNormPermalink(cur, gid);
+        await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        await _fbSleep(2800);
+      } else if (cur !== before) {
+        // landed somewhere unexpected (photo/profile) — recover
+        await page.goBack({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        await _fbSleep(2200);
+      }
+    }
+
+    if (!perm || seen.has(perm)) continue;
+    seen.add(perm);
+    out.push({ post_url: perm, post_text: text, post_author: author });
+  }
+  return { posts: out, debug: { resultCards: count, attemptedClicks: debugClicks, pageUrl: (page.url() || '').slice(0, 140) } };
+}
+
 // POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
 app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
   const { profile, group_url, max_posts = 15, scroll_passes = 3 } = req.body ?? {};
@@ -5432,7 +5503,7 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    const result = await _fbHarvestPosts(page, gid, max_posts, scroll_passes);
+    const result = await _fbSearchHarvest(page, gid, max_posts);
     const posts = result.posts;
     await page.close().catch(() => {});
     return res.json({ ok: true, group_url, query, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
