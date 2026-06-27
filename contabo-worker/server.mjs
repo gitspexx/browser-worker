@@ -5315,6 +5315,62 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   }
 });
 
+// Shared: foreground the tab, scroll the lazy feed in, and extract post
+// permalinks + text from whatever article surface is loaded (feed OR search
+// results). Returns { posts, debug }.
+async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
+  await page.bringToFront().catch(() => {});
+  await _fbSleep(4000);
+  await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
+  for (let i = 0; i < Math.max(scroll_passes, 7); i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
+    await page.keyboard.press('End').catch(() => {});
+    await _fbSleep(2600);
+    const hit = await page.evaluate(() => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length).catch(() => 0);
+    if (hit >= max_posts) break;
+  }
+  return page.evaluate(({ max, gid }) => {
+    const out = []; const seen = new Set();
+    const norm = (raw) => {
+      try {
+        const u = new URL(raw, location.origin);
+        const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
+        const pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
+        if (!pid) return null;
+        return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
+      } catch (e) { return null; }
+    };
+    const articles = document.querySelectorAll('div[role="article"]');
+    const permFrom = (a) => {
+      for (const link of a.querySelectorAll('a[href*="/groups/"], a[href*="story_fbid="]')) {
+        const n = norm(link.href || link.getAttribute('href'));
+        if (n) return n;
+      }
+      return null;
+    };
+    for (const a of articles) {
+      const href = permFrom(a);
+      if (!href || seen.has(href)) continue;
+      const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+      if (!text || text.length < 15) continue;
+      let author = '';
+      const al = a.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
+      if (al) author = (al.innerText || '').trim().slice(0, 80);
+      seen.add(href);
+      out.push({ post_url: href, post_text: text, post_author: author });
+      if (out.length >= max) break;
+    }
+    const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
+    return { posts: out, debug: {
+      articles: articles.length,
+      pagePostLinks: pageLinks.length,
+      pageUrl: location.href.slice(0, 140),
+      title: (document.title || '').slice(0, 100),
+      bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
+    } };
+  }, { max: max_posts, gid });
+}
+
 // POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
 app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
   const { profile, group_url, max_posts = 15, scroll_passes = 3 } = req.body ?? {};
@@ -5327,67 +5383,44 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
     const gid = (group_url.match(/groups\/([^/?#]+)/) || [])[1] || '';
     const url = group_url.replace(/\/?$/, '/') + '?sorting_setting=CHRONOLOGICAL';
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    // Foreground the tab — browsers throttle lazy-load / IntersectionObserver in
-    // background tabs, which left the group feed unmounted (header + Featured only).
-    await page.bringToFront().catch(() => {});
-    await _fbSleep(4000);
+    await _fbSleep(2000);
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
-    // Scroll the document to force the lazy feed to fetch + render. Keep going
-    // until we've loaded ~max post permalinks (or run out of passes) so each
-    // scan harvests a useful batch rather than the first post only.
-    for (let i = 0; i < Math.max(scroll_passes, 7); i++) {
-      await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
-      await page.keyboard.press('End').catch(() => {});
-      await _fbSleep(2600);
-      const hit = await page.evaluate(() => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length).catch(() => 0);
-      if (hit >= max_posts) break;
-    }
-    const result = await page.evaluate(({ max, gid }) => {
-      const out = []; const seen = new Set();
-      const norm = (raw) => {
-        try {
-          const u = new URL(raw, location.origin);
-          const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
-          let pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
-          if (!pid) return null;
-          return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
-        } catch (e) { return null; }
-      };
-      const articles = document.querySelectorAll('div[role="article"]');
-      const permFrom = (a) => {
-        for (const link of a.querySelectorAll('a[href*="/groups/"], a[href*="story_fbid="]')) {
-          const n = norm(link.href || link.getAttribute('href'));
-          if (n) return n;
-        }
-        return null;
-      };
-      for (const a of articles) {
-        const href = permFrom(a);
-        if (!href || seen.has(href)) continue;
-        const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
-        if (!text || text.length < 15) continue;
-        let author = '';
-        const al = a.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
-        if (al) author = (al.innerText || '').trim().slice(0, 80);
-        seen.add(href);
-        out.push({ post_url: href, post_text: text, post_author: author });
-        if (out.length >= max) break;
-      }
-      const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
-      return { posts: out, debug: {
-        articles: articles.length,
-        pagePostLinks: pageLinks.length,
-        pageUrl: location.href.slice(0, 140),
-        title: (document.title || '').slice(0, 100),
-        bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
-      } };
-    }, { max: max_posts, gid });
+    const result = await _fbHarvestPosts(page, gid, max_posts, scroll_passes);
     const posts = result.posts;
     await page.close().catch(() => {});
     return res.json({ ok: true, group_url, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
+// POST /fb-pool/groups/search — scrape IN-GROUP SEARCH results for a query.
+// Reaches seeker posts in Featured-only groups whose landing feed won't mount
+// (the search results page is a different surface that does render articles).
+app.post('/fb-pool/groups/search', auth(), async (req, res) => {
+  const { profile, group_url, query, max_posts = 15, scroll_passes = 4 } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
+  if (!query) return res.status(422).json({ ok: false, error: 'query required' });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    const gid = (group_url.match(/groups\/([^/?#]+)/) || [])[1] || '';
+    const url = `https://www.facebook.com/groups/${gid}/search/?q=${encodeURIComponent(query)}`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(2500);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    const result = await _fbHarvestPosts(page, gid, max_posts, scroll_passes);
+    const posts = result.posts;
+    await page.close().catch(() => {});
+    return res.json({ ok: true, group_url, query, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
