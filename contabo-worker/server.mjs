@@ -5315,9 +5315,20 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   }
 });
 
-// Shared: foreground the tab, scroll the lazy feed in, and extract post
-// permalinks + text from whatever article surface is loaded (feed OR search
-// results). Returns { posts, debug }.
+function _fbNormPermalink(raw, gid) {
+  try {
+    const u = new URL(raw, 'https://www.facebook.com');
+    const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
+    const pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
+    if (!pid) return null;
+    return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
+  } catch (e) { return null; }
+}
+
+// Shared: foreground the tab, scroll the lazy feed in, then DRIVE the browser
+// to extract each post's permalink. FB only populates the timestamp link's href
+// on hover (static DOM shows "#"/nothing), so we hover candidate links per
+// article via real elementHandles. Returns { posts, debug }.
 async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
   await page.bringToFront().catch(() => {});
   await _fbSleep(4000);
@@ -5326,58 +5337,53 @@ async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
     await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
     await page.keyboard.press('End').catch(() => {});
     await _fbSleep(2600);
-    const hit = await page.evaluate(() => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length).catch(() => 0);
-    if (hit >= max_posts) break;
+    const n = await page.$$eval('div[role="article"]', els => els.length).catch(() => 0);
+    if (n >= max_posts + 4) break;
   }
-  return page.evaluate(({ max, gid }) => {
-    const out = []; const seen = new Set();
-    const norm = (raw) => {
-      try {
-        const u = new URL(raw, location.origin);
-        const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
-        const pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
-        if (!pid) return null;
-        return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
-      } catch (e) { return null; }
-    };
-    const articles = document.querySelectorAll('div[role="article"]');
-    const permFrom = (a) => {
-      for (const link of a.querySelectorAll('a[href*="/groups/"], a[href*="story_fbid="]')) {
-        const n = norm(link.href || link.getAttribute('href'));
-        if (n) return n;
+
+  const arts = await page.$$('div[role="article"]');
+  const out = []; const seen = new Set();
+  for (const art of arts) {
+    if (out.length >= max_posts) break;
+    const text = await art.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800)).catch(() => '');
+    if (!text || text.length < 15) continue;
+
+    // 1) any href already present in the article
+    let href = await art.evaluate(e => {
+      for (const l of e.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]')) {
+        const h = l.href || l.getAttribute('href') || '';
+        if (/\/(?:posts|permalink)\/\d+|story_fbid=\d+/.test(h)) return h;
       }
       return null;
-    };
-    for (const a of articles) {
-      const href = permFrom(a);
-      if (!href || seen.has(href)) continue;
-      const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
-      if (!text || text.length < 15) continue;
-      let author = '';
-      const al = a.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
-      if (al) author = (al.innerText || '').trim().slice(0, 80);
-      seen.add(href);
-      out.push({ post_url: href, post_text: text, post_author: author });
-      if (out.length >= max) break;
+    }).catch(() => null);
+
+    // 2) hover the timestamp candidates so FB lazily sets the real href
+    if (!href) {
+      const cands = await art.$$('a[role="link"]');
+      for (const c of cands.slice(0, 6)) {
+        try { await c.hover({ timeout: 1200 }); } catch (e) {}
+        await _fbSleep(200);
+        const h = await c.evaluate(e => e.href || e.getAttribute('href') || '').catch(() => '');
+        if (/\/(?:posts|permalink)\/\d+|story_fbid=\d+/.test(h)) { href = h; break; }
+      }
     }
-    const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
-    // Diagnostic: dump anchor hrefs from the first few articles so we can see
-    // how FB actually encodes the permalink on this surface.
-    const anchorSample = [];
-    for (const a of Array.from(articles).slice(0, 3)) {
-      const hs = [];
-      for (const l of a.querySelectorAll('a')) { if (hs.length >= 10) break; hs.push((l.getAttribute('href') || '').slice(0, 90)); }
-      anchorSample.push(hs);
-    }
-    return { posts: out, debug: {
-      articles: articles.length,
-      pagePostLinks: pageLinks.length,
-      pageUrl: location.href.slice(0, 140),
-      title: (document.title || '').slice(0, 100),
-      anchorSample,
-      bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
-    } };
-  }, { max: max_posts, gid });
+
+    const perm = href ? _fbNormPermalink(href, gid) : null;
+    if (!perm || seen.has(perm)) continue;
+    const author = await art.evaluate(e => {
+      const a = e.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
+      return a ? (a.innerText || '').trim().slice(0, 80) : '';
+    }).catch(() => '');
+    seen.add(perm);
+    out.push({ post_url: perm, post_text: text, post_author: author });
+  }
+
+  const pageLinks = await page.$$eval('a[href*="/posts/"], a[href*="/permalink/"]', els => els.length).catch(() => 0);
+  return { posts: out, debug: {
+    articles: arts.length,
+    pagePostLinks: pageLinks,
+    pageUrl: (page.url() || '').slice(0, 140),
+  } };
 }
 
 // POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
