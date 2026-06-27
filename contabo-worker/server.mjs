@@ -5324,58 +5324,61 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
   let page = null;
   try {
     ({ page } = await _fbStartProfile(user_id));
-    // The desktop React feed frequently won't mount the discussion list under
-    // automation (only header + Featured render). mbasic = server-rendered
-    // static HTML with real <a> permalinks — the reliable scrape surface.
     const gid = (group_url.match(/groups\/([^/?#]+)/) || [])[1] || '';
-    const url = `https://mbasic.facebook.com/groups/${gid}`;
+    const url = group_url.replace(/\/?$/, '/') + '?sorting_setting=CHRONOLOGICAL';
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await _fbSleep(2500);
-    if (/login\.php|\/login\/|checkpoint|two_step_verification/.test(page.url())) {
+    // Foreground the tab — browsers throttle lazy-load / IntersectionObserver in
+    // background tabs, which left the group feed unmounted (header + Featured only).
+    await page.bringToFront().catch(() => {});
+    await _fbSleep(4000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
+    // Scroll the document to force the lazy feed to fetch + render; bail early
+    // once post permalinks appear.
+    for (let i = 0; i < Math.max(scroll_passes, 6); i++) {
+      await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
+      await page.keyboard.press('End').catch(() => {});
+      await _fbSleep(2600);
+      const hit = await page.evaluate(() => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length).catch(() => 0);
+      if (hit > 0) break;
     }
     const result = await page.evaluate(({ max, gid }) => {
       const out = []; const seen = new Set();
-      // Normalize any mbasic post link to a desktop www permalink so the
-      // comment flow (which runs on www) can navigate to it.
       const norm = (raw) => {
         try {
           const u = new URL(raw, location.origin);
-          let pid = null;
-          const m = u.pathname.match(/\/permalink\/(\d+)/) || u.pathname.match(/\/posts\/(\d+)/);
-          if (m) pid = m[1];
-          if (!pid && u.searchParams.get('story_fbid')) pid = u.searchParams.get('story_fbid');
+          const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
+          let pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
           if (!pid) return null;
           return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
         } catch (e) { return null; }
       };
-      const linkSel = 'a[href*="/permalink/"], a[href*="story_fbid="], a[href*="/posts/"]';
-      let arts = document.querySelectorAll('#m_group_stories_container article, #m_group_stories_container > div > div');
-      if (!arts.length) arts = document.querySelectorAll('article');
-      for (const a of arts) {
-        let href = null;
-        for (const link of a.querySelectorAll(linkSel)) {
-          const n = norm(link.getAttribute('href') || link.href);
-          if (n) { href = n; break; }
+      const articles = document.querySelectorAll('div[role="article"]');
+      const permFrom = (a) => {
+        for (const link of a.querySelectorAll('a[href*="/groups/"], a[href*="story_fbid="]')) {
+          const n = norm(link.href || link.getAttribute('href'));
+          if (n) return n;
         }
+        return null;
+      };
+      for (const a of articles) {
+        const href = permFrom(a);
         if (!href || seen.has(href)) continue;
-        let text = (a.innerText || '').replace(/\s+/g, ' ')
-          .replace(/Full Story/gi, ' ').replace(/Like\s+Comment\s+Share/gi, ' ').trim().slice(0, 800);
+        const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
         if (!text || text.length < 15) continue;
         let author = '';
-        const al = a.querySelector('h3 a, h4 a, strong a, a');
+        const al = a.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
         if (al) author = (al.innerText || '').trim().slice(0, 80);
         seen.add(href);
         out.push({ post_url: href, post_text: text, post_author: author });
         if (out.length >= max) break;
       }
-      const allLinks = document.querySelectorAll(linkSel);
-      const sample = [];
-      for (const l of allLinks) { if (sample.length >= 6) break; sample.push((l.getAttribute('href') || '').slice(0, 100)); }
+      const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
       return { posts: out, debug: {
-        arts: arts.length,
-        pagePostLinks: allLinks.length,
-        sample,
+        articles: articles.length,
+        pagePostLinks: pageLinks.length,
         pageUrl: location.href.slice(0, 140),
         title: (document.title || '').slice(0, 100),
         bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
