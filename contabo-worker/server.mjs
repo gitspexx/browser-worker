@@ -5315,6 +5315,89 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   }
 });
 
+// POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
+app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
+  const { profile, group_url, max_posts = 15, scroll_passes = 3 } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    const url = group_url.replace(/\/?$/, '/') + '?sorting_setting=CHRONOLOGICAL';
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(4000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    for (let i = 0; i < scroll_passes; i++) { await page.mouse.wheel(0, 3500).catch(() => {}); await _fbSleep(2500); }
+    const posts = await page.evaluate((max) => {
+      const out = []; const seen = new Set();
+      for (const a of document.querySelectorAll('div[role="article"]')) {
+        const link = a.querySelector('a[href*="/groups/"][href*="/posts/"], a[href*="/groups/"][href*="/permalink/"]');
+        const href = link ? (link.href || '').split('?')[0] : null;
+        if (!href || !/\/(posts|permalink)\/\d+/.test(href) || seen.has(href)) continue;
+        const text = (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+        if (!text || text.length < 15) continue;
+        let author = '';
+        const al = a.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
+        if (al) author = (al.innerText || '').trim().slice(0, 80);
+        seen.add(href);
+        out.push({ post_url: href, post_text: text, post_author: author });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, max_posts);
+    await page.close().catch(() => {});
+    return res.json({ ok: true, group_url, count: posts.length, posts, scraped_at: new Date().toISOString() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
+// POST /fb-pool/comment — leave a comment on a specific FB post.
+const FB_COMMENT_BOX_SELECTORS = [
+  'div[aria-label^="Comment as" i][role="textbox"]',
+  'div[aria-label^="Write a comment" i][role="textbox"]',
+  'div[aria-label*="comment" i][contenteditable="true"]',
+  'form div[contenteditable="true"][role="textbox"]',
+];
+app.post('/fb-pool/comment', auth(), async (req, res) => {
+  const { profile, post_url, text } = req.body ?? {};
+  if (!profile || !post_url || !text) return res.status(422).json({ ok: false, error: 'profile, post_url, text required' });
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim(); // Enter submits — keep single line
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(3500);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    let box = null;
+    for (const sel of FB_COMMENT_BOX_SELECTORS) {
+      try { await page.waitForSelector(sel, { timeout: 4000 }); box = page.locator(sel).first(); break; } catch {}
+    }
+    if (!box) throw new Error('comment_box_missing');
+    await box.click();
+    await _fbSleep(1000);
+    await box.type(oneLine, { delay: 18 });
+    await _fbSleep(1200);
+    await page.keyboard.press('Enter');
+    await _fbSleep(4000);
+    await page.close().catch(() => {});
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 
 // ── FB warmup pool dashboard data ──────────────────────────────────────────
 // Surfaces state from C:\fb-verify\state.json + recent warmup.log lines so the
