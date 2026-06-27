@@ -5361,11 +5361,20 @@ async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
       if (out.length >= max) break;
     }
     const pageLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]');
+    // Diagnostic: dump anchor hrefs from the first few articles so we can see
+    // how FB actually encodes the permalink on this surface.
+    const anchorSample = [];
+    for (const a of Array.from(articles).slice(0, 3)) {
+      const hs = [];
+      for (const l of a.querySelectorAll('a')) { if (hs.length >= 10) break; hs.push((l.getAttribute('href') || '').slice(0, 90)); }
+      anchorSample.push(hs);
+    }
     return { posts: out, debug: {
       articles: articles.length,
       pagePostLinks: pageLinks.length,
       pageUrl: location.href.slice(0, 140),
       title: (document.title || '').slice(0, 100),
+      anchorSample,
       bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
     } };
   }, { max: max_posts, gid });
