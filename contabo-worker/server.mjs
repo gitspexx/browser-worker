@@ -5331,7 +5331,16 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
     await page.waitForSelector('div[role="article"]', { timeout: 20000 }).catch(() => {});
-    for (let i = 0; i < scroll_passes; i++) { await page.mouse.wheel(0, 3500).catch(() => {}); await _fbSleep(2800); }
+    // Scroll the actual document (mouse.wheel at 0,0 doesn't move FB's virtualized
+    // feed) so the lazy-loaded discussion posts render + their XHR fires.
+    for (let i = 0; i < scroll_passes; i++) {
+      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2)).catch(() => {});
+      await _fbSleep(2600);
+    }
+    await page.waitForFunction(
+      () => document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]').length > 0,
+      { timeout: 15000 },
+    ).catch(() => {});
     const result = await page.evaluate((max) => {
       const out = []; const seen = new Set();
       const articles = document.querySelectorAll('div[role="article"]');
