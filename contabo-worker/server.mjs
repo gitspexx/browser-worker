@@ -5334,7 +5334,7 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
     if (/login\.php|\/login\/|checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    const result = await page.evaluate((max, gid) => {
+    const result = await page.evaluate(({ max, gid }) => {
       const out = []; const seen = new Set();
       // Normalize any mbasic post link to a desktop www permalink so the
       // comment flow (which runs on www) can navigate to it.
@@ -5380,7 +5380,7 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
         title: (document.title || '').slice(0, 100),
         bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
       } };
-    }, max_posts, gid);
+    }, { max: max_posts, gid });
     const posts = result.posts;
     await page.close().catch(() => {});
     return res.json({ ok: true, group_url, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
