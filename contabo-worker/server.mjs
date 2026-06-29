@@ -5738,16 +5738,20 @@ app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
       try { await page.locator(sel).first().click({ timeout: 2500 }); edited = true; break; } catch {}
     }
     if (!edited) return res.status(200).json({ ok: false, error: 'edit_item_missing' });
-    await _fbSleep(1300);
+    await page.waitForSelector('div[role="textbox"][contenteditable="true"]', { timeout: 5000 }).catch(() => {});
+    await _fbSleep(1200);
     // The inline edit box is pre-filled with the OLD comment text — pick the
-    // contenteditable that matches it (avoids grabbing a reply/message composer).
+    // contenteditable that matches it (dash-normalized so the em dash doesn't
+    // break the match), avoiding any reply/message composer.
+    const norm = (s) => (s || '').replace(/[—–―]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    const wantPlain = norm(old_text).slice(0, 28);
     let box = null;
     const boxes = await page.$$('div[role="textbox"][contenteditable="true"]');
     for (const b of boxes) {
-      const t = await b.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
-      if (want && t.includes(want)) { box = b; break; }
+      const t = norm(await b.evaluate(e => e.innerText || '').catch(() => ''));
+      if (wantPlain && t.includes(wantPlain)) { box = b; break; }
     }
-    if (!box) return res.status(200).json({ ok: false, error: 'edit_box_missing' });
+    if (!box) return res.status(200).json({ ok: false, error: 'edit_box_missing', boxes: boxes.length });
     await box.click({ timeout: 4000 }).catch(() => {});
     await _fbSleep(300);
     await page.keyboard.press('Control+A');
