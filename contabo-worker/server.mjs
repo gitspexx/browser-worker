@@ -5144,19 +5144,37 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
       }).catch(() => []);
       return res.status(500).json({ ok: false, error: 'post_button_missing_or_disabled', dialog_buttons });
     }
-    // capture the new post's permalink (best-effort): FB may navigate to it,
-    // else scan the feed for the freshest /groups/.../posts|permalink/ link.
+    // capture the new post's permalink: FB may navigate straight to it, else
+    // find our just-posted post in the feed (text match) and hover its
+    // timestamp to reveal the href (FB sets it lazily), same as the harvester.
     permalink = null;
-    try { await page.waitForURL(/\/(posts|permalink)\/\d+/, { timeout: 12000 }); permalink = page.url().split('?')[0]; } catch {}
+    try { await page.waitForURL(/\/(posts|permalink)\/\d+/, { timeout: 10000 }); permalink = page.url().split('?')[0]; } catch {}
     if (!permalink) {
       try {
-        await _fbSleep(5000);
-        permalink = await page.evaluate(() => {
-          const hit = [...document.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]')]
-            .map(a => (a.href || '').split('?')[0])
-            .find(h => /\/groups\/[^/]+\/(posts|permalink)\/\d+/.test(h));
-          return hit || null;
-        });
+        await _fbSleep(4000);
+        const want = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
+        const arts = await page.$$('div[role="article"]');
+        for (const a of arts.slice(0, 8)) {
+          const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
+          if (want && !t.includes(want)) continue;
+          let h = await a.evaluate(e => {
+            for (const l of e.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"]')) {
+              const x = l.href || l.getAttribute('href') || '';
+              if (/\/groups\/[^/]+\/(?:posts|permalink)\/\d+/.test(x)) return x;
+            }
+            return null;
+          }).catch(() => null);
+          if (!h) {
+            const links = await a.$$('a[role="link"], a');
+            for (const l of links.slice(0, 8)) {
+              await l.hover().catch(() => {});
+              await _fbSleep(120);
+              const x = await l.evaluate(e => e.href || e.getAttribute('href') || '').catch(() => '');
+              if (/\/groups\/[^/]+\/(?:posts|permalink)\/\d+/.test(x)) { h = x; break; }
+            }
+          }
+          if (h) { permalink = h.split('?')[0]; break; }
+        }
       } catch {}
     }
     await page.close().catch(() => {});
