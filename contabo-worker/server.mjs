@@ -5552,9 +5552,45 @@ app.post('/fb-pool/comment', auth(), async (req, res) => {
     await box.type(oneLine, { delay: 18 });
     await _fbSleep(1200);
     await page.keyboard.press('Enter');
-    await _fbSleep(4000);
+    await _fbSleep(5000);
+
+    // Capture our just-posted comment's permalink. The comment's timestamp link
+    // carries ?comment_id=<cid>; FB sets that href lazily, so hover to reveal it.
+    // Doubles as confirmation the comment actually landed in the thread.
+    const postBase = post_url.split('?')[0].replace(/\/?$/, '/');
+    const want = oneLine.replace(/\s+/g, ' ').trim().slice(0, 45).toLowerCase();
+    let comment_url = null;
+    let confirmed = false;
+    try {
+      const arts = await page.$$('div[role="article"]');
+      for (const a of arts) {
+        const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
+        if (!want || !t.includes(want)) continue;
+        confirmed = true;
+        let cid = await a.evaluate(e => {
+          for (const l of e.querySelectorAll('a[href*="comment_id="]')) {
+            const m = (l.href || l.getAttribute('href') || '').match(/comment_id=(\d+)/);
+            if (m) return m[1];
+          }
+          return null;
+        }).catch(() => null);
+        if (!cid) {
+          const links = await a.$$('a[role="link"], a');
+          for (const l of links.slice(0, 10)) {
+            await l.hover().catch(() => {});
+            await _fbSleep(120);
+            const h = await l.evaluate(e => e.href || e.getAttribute('href') || '').catch(() => '');
+            const m = h.match(/comment_id=(\d+)/);
+            if (m) { cid = m[1]; break; }
+          }
+        }
+        if (cid) comment_url = `${postBase}?comment_id=${cid}`;
+        break;
+      }
+    } catch {}
+
     await page.close().catch(() => {});
-    return res.json({ ok: true });
+    return res.json({ ok: true, posted: confirmed, post_url: postBase, comment_url });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
