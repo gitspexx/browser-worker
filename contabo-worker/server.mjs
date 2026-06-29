@@ -5539,6 +5539,64 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
   }
 });
 
+// POST /fb-pool/comment-find — READ-ONLY: locate our comment on a post by text
+// and return its permalink (comment_id). Used to backfill comment_url for
+// comments whose deep-link wasn't captured at post time + to inspect format.
+app.post('/fb-pool/comment-find', auth(), async (req, res) => {
+  const { profile, post_url, text } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!post_url || !text) return res.status(422).json({ ok: false, error: 'post_url, text required' });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await _fbSleep(4000);
+    // surface all comments (newest) if a control exists
+    try {
+      const sortBtn = page.locator('div[role="button"]:has-text("Most relevant"), div[role="button"]:has-text("All comments"), span:has-text("Most relevant")').first();
+      await sortBtn.click({ timeout: 2500 });
+      await _fbSleep(1500);
+    } catch {}
+    for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, 1200)).catch(() => {}); await _fbSleep(1200); }
+
+    const postBase = post_url.split('?')[0].replace(/\/?$/, '/');
+    const want = String(text).replace(/\s+/g, ' ').trim().slice(0, 45).toLowerCase();
+    let comment_url = null;
+    const anchorDbg = [];
+    const arts = await page.$$('div[role="article"]');
+    for (const a of arts) {
+      const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
+      if (!t.includes(want)) continue;
+      let cid = await a.evaluate(e => {
+        for (const l of e.querySelectorAll('a[href*="comment_id="]')) {
+          const m = (l.href || l.getAttribute('href') || '').match(/comment_id=(\d+)/);
+          if (m) return m[1];
+        }
+        return null;
+      }).catch(() => null);
+      if (!cid) {
+        const links = await a.$$('a[role="link"], a');
+        for (const l of links.slice(0, 14)) {
+          await l.hover().catch(() => {});
+          await _fbSleep(140);
+          const h = await l.evaluate(e => e.href || e.getAttribute('href') || '').catch(() => '');
+          if (h) anchorDbg.push(h.slice(0, 120));
+          const m = h.match(/comment_id=(\d+)/);
+          if (m) { cid = m[1]; break; }
+        }
+      }
+      if (cid) { comment_url = `${postBase}?comment_id=${cid}`; break; }
+    }
+    await page.close().catch(() => {});
+    return res.json({ ok: true, comment_url, anchors: anchorDbg.slice(0, 14) });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/comment — leave a comment on a specific FB post.
 const FB_COMMENT_BOX_SELECTORS = [
   'div[aria-label^="Comment as" i][role="textbox"]',
