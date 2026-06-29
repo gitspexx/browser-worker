@@ -5600,6 +5600,92 @@ app.post('/fb-pool/inbox', auth(), async (req, res) => {
   }
 });
 
+// POST /fb-pool/thread — READ-ONLY: open a Messenger thread and scrape its
+// recent messages (text + direction) so GrowthOps can show the conversation.
+app.post('/fb-pool/thread', auth(), async (req, res) => {
+  const { profile, thread_url, max_messages = 40 } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!thread_url) return res.status(422).json({ ok: false, error: 'thread_url required' });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(thread_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.bringToFront().catch(() => {});
+    await _fbSleep(5000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    // scroll the conversation up a little to pull recent history
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
+    const messages = await page.evaluate((max) => {
+      const out = [];
+      // message bubbles carry an aria-label like "Name sent: text. time" /
+      // "You sent: text". Prefer those; fall back to row text.
+      const seen = new Set();
+      for (const el of document.querySelectorAll('[aria-label]')) {
+        const aria = el.getAttribute('aria-label') || '';
+        const m = aria.match(/^(You|[^:]{1,40})\s+(?:sent|replied)(?:\s+(?:to|by))?[:\s]+([\s\S]{2,500})/i);
+        if (!m) continue;
+        const mine = /^you\b/i.test(m[1].trim());
+        const text = m[2].replace(/\s+/g, ' ').replace(/\.\s*\d+\s*(?:m|h|w|d|y)\s*$/i, '').trim().slice(0, 500);
+        const key = (mine ? 'M:' : 'T:') + text;
+        if (!text || seen.has(key)) continue;
+        seen.add(key);
+        out.push({ mine, text });
+      }
+      return out.slice(-max);
+    }, max_messages);
+    await page.close().catch(() => {});
+    return res.json({ ok: true, count: messages.length, messages, scraped_at: new Date().toISOString() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
+// POST /fb-pool/send-message — send a Messenger reply in a thread.
+const FB_MSG_COMPOSER_SELECTORS = [
+  'div[aria-label="Message" i][role="textbox"]',
+  'div[aria-label*="Message" i][contenteditable="true"]',
+  'div[contenteditable="true"][role="textbox"]',
+];
+app.post('/fb-pool/send-message', auth(), async (req, res) => {
+  const { profile, thread_url, text } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!thread_url || !text) return res.status(422).json({ ok: false, error: 'thread_url, text required' });
+  const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim();
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(thread_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.bringToFront().catch(() => {});
+    await _fbSleep(4000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    let box = null;
+    for (const sel of FB_MSG_COMPOSER_SELECTORS) {
+      try { await page.waitForSelector(sel, { timeout: 4000 }); box = page.locator(sel).last(); break; } catch {}
+    }
+    if (!box) throw new Error('composer_missing');
+    await box.click();
+    await _fbSleep(800);
+    await box.type(oneLine, { delay: 16 });
+    await _fbSleep(800);
+    await page.keyboard.press('Enter');
+    await _fbSleep(3000);
+    await page.close().catch(() => {});
+    return res.json({ ok: true, sent: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/comment-find — READ-ONLY: locate our comment on a post by text
 // and return its permalink (comment_id). Used to backfill comment_url for
 // comments whose deep-link wasn't captured at post time + to inspect format.
