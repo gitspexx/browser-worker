@@ -5198,14 +5198,17 @@ Object.assign(FB_POST_PROFILE_MAP, {
 const _fbSleep = (ms) => new Promise(r => setTimeout(r, ms));
 function _fbParseMembers(text) {
   if (!text) return null;
-  const m = String(text).match(/([\d.,]+)\s*([KMkm]|mil|rb)?/);
+  // Strip the locale members-word FIRST, else the unit matcher reads the leading
+  // "m" of "members"/"membros" as the millions unit (386 membros -> 386,000,000).
+  const cleaned = String(text).replace(/\b(members?|membros|miembros|anggota|orang)\b/ig, '').trim();
+  const m = cleaned.match(/([\d.,]+)\s*([Kk]|mil|rb|jt|[Mm])?\b/);
   if (!m) return null;
   let n = parseFloat(m[1].replace(/\./g, '').replace(',', '.'));
   if (Number.isNaN(n)) { n = parseFloat(m[1].replace(/,/g, '')); }
   if (Number.isNaN(n)) return null;
   const unit = (m[2] || '').toLowerCase();
   if (unit === 'k' || unit === 'mil' || unit === 'rb') n *= 1000;
-  else if (unit === 'm') n *= 1000000;
+  else if (unit === 'm' || unit === 'jt') n *= 1000000;
   return Math.round(n);
 }
 async function _fbStartProfile(user_id) {
