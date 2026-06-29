@@ -5618,26 +5618,40 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
     }
     // scroll the conversation up a little to pull recent history
     for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
-    const messages = await page.evaluate((max) => {
-      const out = [];
-      // message bubbles carry an aria-label like "Name sent: text. time" /
-      // "You sent: text". Prefer those; fall back to row text.
-      const seen = new Set();
-      for (const el of document.querySelectorAll('[aria-label]')) {
-        const aria = el.getAttribute('aria-label') || '';
-        const m = aria.match(/^(You|[^:]{1,40})\s+(?:sent|replied)(?:\s+(?:to|by))?[:\s]+([\s\S]{2,500})/i);
-        if (!m) continue;
-        const mine = /^you\b/i.test(m[1].trim());
-        const text = m[2].replace(/\s+/g, ' ').replace(/\.\s*\d+\s*(?:m|h|w|d|y)\s*$/i, '').trim().slice(0, 500);
-        const key = (mine ? 'M:' : 'T:') + text;
-        if (!text || seen.has(key)) continue;
+    const result = await page.evaluate((max) => {
+      const out = []; const seen = new Set();
+      // Each message row in Messenger is a [role="row"]; the bubble text lives in
+      // div[dir="auto"]. Direction: outgoing rows render right-aligned (we read
+      // the row's computed alignment / flex justify).
+      const rows = document.querySelectorAll('div[role="row"]');
+      const rowDbg = [];
+      for (const r of rows) {
+        const bub = r.querySelector('div[dir="auto"]');
+        const text = (bub ? bub.innerText : '').replace(/\s+/g, ' ').trim();
+        if (rowDbg.length < 8 && (r.innerText || '').trim()) rowDbg.push((r.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80));
+        if (!text || text.length < 2 || text.length > 600) continue;
+        if (/^(active now|sent|seen|delivered|enter|\d+:\d+|like)$/i.test(text)) continue;
+        // direction: walk up for a right-aligned container
+        let mine = false;
+        let n = r;
+        for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+          const st = getComputedStyle(n);
+          if (st.justifyContent === 'flex-end' || st.alignItems === 'flex-end' || st.textAlign === 'right') { mine = true; break; }
+        }
+        const key = text + '|' + mine;
+        if (seen.has(key)) continue;
         seen.add(key);
         out.push({ mine, text });
       }
-      return out.slice(-max);
+      const ariaDbg = [];
+      for (const el of document.querySelectorAll('[aria-label]')) {
+        const a = el.getAttribute('aria-label') || '';
+        if (/sent|replied|message/i.test(a) && ariaDbg.length < 10) ariaDbg.push(a.slice(0, 90));
+      }
+      return { messages: out.slice(-max), debug: { rows: rows.length, rowSamples: rowDbg, ariaSamples: ariaDbg } };
     }, max_messages);
     await page.close().catch(() => {});
-    return res.json({ ok: true, count: messages.length, messages, scraped_at: new Date().toISOString() });
+    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: result.debug, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
