@@ -5618,6 +5618,11 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
     }
     // scroll the conversation up a little to pull recent history
     for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
+    const frameDbg = [];
+    for (const f of page.frames()) {
+      const len = await f.evaluate(() => (document.body && document.body.innerText || '').length).catch(() => -1);
+      frameDbg.push({ url: (f.url() || '').slice(0, 80), bodyLen: len });
+    }
     const result = await page.evaluate((max) => {
       const out = []; const seen = new Set();
       // Each message row in Messenger is a [role="row"]; the bubble text lives in
@@ -5659,7 +5664,7 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
       } };
     }, max_messages);
     await page.close().catch(() => {});
-    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: result.debug, scraped_at: new Date().toISOString() });
+    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: { ...result.debug, frames: frameDbg }, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
