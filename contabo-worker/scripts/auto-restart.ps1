@@ -1,7 +1,7 @@
-# Guarded auto-restart: (A) re-queue hung cat, (A2) stuck-chooser escalation, (B-D) hang restart. Posts button panel to #botsol.
+﻿# Guarded auto-restart: (A) re-queue hung cat, (A2) stuck-chooser escalation, (B-D) hang restart. Posts button panel to #botsol.
 $log='C:\worker\logs\auto-restart.txt'
 function L($m){ "$((Get-Date -Format 'u'))  $m" | Add-Content $log }
-$HANG_MIN=50; $COOLDOWN_MIN=15; $CHOOSER_STUCK_MIN=15
+$HANG_MIN=18; $COOLDOWN_MIN=15; $CHOOSER_STUCK_MIN=15
 $stamp='C:\worker\last-auto-restart.txt'
 $pend='C:\worker\requeue-pending.txt'
 $cm='C:\worker\chooser-alerted.marker'
