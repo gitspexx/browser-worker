@@ -5692,7 +5692,7 @@ app.post('/fb-pool/send-message', auth(), async (req, res) => {
 // POST /fb-pool/comment-edit — edit our own comment in place (find by old text,
 // open the ⋯ menu -> Edit, replace the text, save). Used to strip em dashes.
 app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
-  const { profile, post_url, old_text, new_text } = req.body ?? {};
+  const { profile, post_url, comment_url, old_text, new_text } = req.body ?? {};
   const user_id = FB_POST_PROFILE_MAP[profile];
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url || !old_text || !new_text) return res.status(422).json({ ok: false, error: 'post_url, old_text, new_text required' });
@@ -5701,30 +5701,36 @@ app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
   let page = null;
   try {
     ({ page } = await _fbStartProfile(user_id));
-    await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(comment_url || post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.bringToFront().catch(() => {});
     await _fbSleep(4500);
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    // locate our comment article by text
-    const arts = await page.$$('div[role="article"]');
+    // scroll to load comments, then locate our comment article by text
     let target = null;
-    for (const a of arts) {
-      const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
-      if (want && t.includes(want)) { target = a; break; }
+    for (let pass = 0; pass < 5 && !target; pass++) {
+      const arts = await page.$$('div[role="article"]');
+      for (const a of arts) {
+        const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
+        if (want && t.includes(want)) { target = a; break; }
+      }
+      if (!target) { await page.evaluate(() => window.scrollBy(0, 1200)).catch(() => {}); await _fbSleep(1600); }
     }
     if (!target) return res.status(200).json({ ok: false, error: 'comment_not_found' });
     await target.scrollIntoViewIfNeeded().catch(() => {});
     await target.hover().catch(() => {});
     await _fbSleep(900);
-    // the ⋯ / More options button inside the comment
-    let opened = false;
-    for (const sel of ['div[aria-label="More" i][role="button"]', 'div[aria-label*="omment options" i][role="button"]', 'div[aria-label*="ptions" i][role="button"]']) {
-      const btn = target.locator(sel).first();
-      try { await btn.click({ timeout: 2500 }); opened = true; break; } catch {}
+    // the ⋯ / More options button inside the comment (ElementHandle.$ + CSS only)
+    let moreBtn = null;
+    for (const sel of ['div[aria-label="More" i][role="button"]', 'div[aria-label*="omment options" i][role="button"]', 'div[aria-label*="ptions" i][role="button"]', 'div[aria-haspopup="menu"][role="button"]']) {
+      moreBtn = await target.$(sel);
+      if (moreBtn) break;
     }
-    if (!opened) return res.status(200).json({ ok: false, error: 'more_button_missing' });
+    if (!moreBtn) return res.status(200).json({ ok: false, error: 'more_button_missing' });
+    await moreBtn.hover().catch(() => {});
+    await moreBtn.click({ timeout: 2500 }).catch(() => {});
+    await _fbSleep(900);
     await _fbSleep(800);
     // Edit menuitem
     let edited = false;
