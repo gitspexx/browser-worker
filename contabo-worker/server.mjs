@@ -5014,10 +5014,6 @@ const FB_POST_PROFILE_MAP = {
   'fb-bali-main': 'k1cula5r',
   'fb-bali-secondary': 'k1cuj237',
   'fb-marketplace-br': 'k1cuj24r',
-  // BCA LATAM lead-gen pool (BR). Real cookie-loaded accounts, see growthops
-  // api/proxies.py. main = FB acct 61587450263096, secondary = 61587176166500.
-  'fb-bca-latam-main': 'k1dfw1g0',
-  'fb-bca-latam-secondary': 'k1dfw5bu',
 };
 const FB_COMPOSER_SELECTORS = [
   'div[aria-label*="Write something" i][role="textbox"]',
@@ -5260,7 +5256,7 @@ app.post('/fb-pool/groups/discover', auth(), async (req, res) => {
         let node = a.closest('div');
         for (let d = 0; d < 6 && node; d++) {
           const t = node.innerText || '';
-          const mm = t.match(/([\d.,KkMm ]+)\s*(members|membros|miembros|anggota|member)/i);
+          const mm = t.match(/([\d.,]+)\s*(mil|rb|jt|k|m)?\s*(members|membros|miembros|anggota|member|orang)/i);
           if (mm) { membersText = mm[0].trim(); break; }
           node = node.parentElement;
         }
