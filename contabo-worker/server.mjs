@@ -5689,6 +5689,69 @@ app.post('/fb-pool/send-message', auth(), async (req, res) => {
   }
 });
 
+// POST /fb-pool/comment-edit — edit our own comment in place (find by old text,
+// open the ⋯ menu -> Edit, replace the text, save). Used to strip em dashes.
+app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
+  const { profile, post_url, old_text, new_text } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!post_url || !old_text || !new_text) return res.status(422).json({ ok: false, error: 'post_url, old_text, new_text required' });
+  const want = String(old_text).replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
+  const fresh = String(new_text).replace(/\s*\n\s*/g, ' ').trim();
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.bringToFront().catch(() => {});
+    await _fbSleep(4500);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    // locate our comment article by text
+    const arts = await page.$$('div[role="article"]');
+    let target = null;
+    for (const a of arts) {
+      const t = await a.evaluate(e => (e.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase()).catch(() => '');
+      if (want && t.includes(want)) { target = a; break; }
+    }
+    if (!target) return res.status(200).json({ ok: false, error: 'comment_not_found' });
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await target.hover().catch(() => {});
+    await _fbSleep(900);
+    // the ⋯ / More options button inside the comment
+    let opened = false;
+    for (const sel of ['div[aria-label="More" i][role="button"]', 'div[aria-label*="omment options" i][role="button"]', 'div[aria-label*="ptions" i][role="button"]']) {
+      const btn = target.locator(sel).first();
+      try { await btn.click({ timeout: 2500 }); opened = true; break; } catch {}
+    }
+    if (!opened) return res.status(200).json({ ok: false, error: 'more_button_missing' });
+    await _fbSleep(800);
+    // Edit menuitem
+    let edited = false;
+    for (const sel of ['div[role="menuitem"]:has-text("Edit")', 'span:has-text("Edit")']) {
+      try { await page.locator(sel).first().click({ timeout: 2500 }); edited = true; break; } catch {}
+    }
+    if (!edited) return res.status(200).json({ ok: false, error: 'edit_item_missing' });
+    await _fbSleep(1300);
+    const box = page.locator('div[role="textbox"][contenteditable="true"], div[aria-label*="Edit" i][contenteditable="true"]').last();
+    await box.click({ timeout: 4000 });
+    await _fbSleep(300);
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Delete');
+    await _fbSleep(300);
+    await box.type(fresh, { delay: 14 });
+    await _fbSleep(600);
+    await page.keyboard.press('Enter');
+    await _fbSleep(3000);
+    await page.close().catch(() => {});
+    return res.json({ ok: true, edited: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/comment-find — READ-ONLY: locate our comment on a post by text
 // and return its permalink (comment_id). Used to backfill comment_url for
 // comments whose deep-link wasn't captured at post time + to inspect format.
