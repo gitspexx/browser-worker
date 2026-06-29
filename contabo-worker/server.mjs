@@ -5648,7 +5648,15 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
         const a = el.getAttribute('aria-label') || '';
         if (/sent|replied|message/i.test(a) && ariaDbg.length < 10) ariaDbg.push(a.slice(0, 90));
       }
-      return { messages: out.slice(-max), debug: { rows: rows.length, rowSamples: rowDbg, ariaSamples: ariaDbg } };
+      return { messages: out.slice(-max), debug: {
+        rows: rows.length, rowSamples: rowDbg, ariaSamples: ariaDbg,
+        pageUrl: location.href.slice(0, 160),
+        title: (document.title || '').slice(0, 90),
+        dirAuto: document.querySelectorAll('div[dir="auto"]').length,
+        gridcells: document.querySelectorAll('div[role="gridcell"], div[role="presentation"]').length,
+        ariaTotal: document.querySelectorAll('[aria-label]').length,
+        bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
+      } };
     }, max_messages);
     await page.close().catch(() => {});
     return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: result.debug, scraped_at: new Date().toISOString() });
