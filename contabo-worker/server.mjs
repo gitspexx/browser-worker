@@ -5014,6 +5014,10 @@ const FB_POST_PROFILE_MAP = {
   'fb-bali-main': 'k1cula5r',
   'fb-bali-secondary': 'k1cuj237',
   'fb-marketplace-br': 'k1cuj24r',
+  // BCA LATAM lead-gen pool (BR). Real cookie-loaded accounts, see growthops
+  // api/proxies.py. main = FB acct 61587450263096, secondary = 61587176166500.
+  'fb-bca-latam-main': 'k1dfw1g0',
+  'fb-bca-latam-secondary': 'k1dfw5bu',
 };
 const FB_COMPOSER_SELECTORS = [
   'div[aria-label*="Write something" i][role="textbox"]',
