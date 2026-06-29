@@ -5620,8 +5620,11 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
     for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
     const frameDbg = [];
     for (const f of page.frames()) {
-      const len = await f.evaluate(() => (document.body && document.body.innerText || '').length).catch(() => -1);
-      frameDbg.push({ url: (f.url() || '').slice(0, 80), bodyLen: len });
+      const info = await f.evaluate(() => ({
+        len: (document.body && document.body.innerText || '').length,
+        snip: (document.body && document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
+      })).catch(() => ({ len: -1, snip: '' }));
+      frameDbg.push({ url: (f.url() || '').slice(0, 70), bodyLen: info.len, snip: info.snip });
     }
     const result = await page.evaluate((max) => {
       const out = []; const seen = new Set();
