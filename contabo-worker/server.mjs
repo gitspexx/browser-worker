@@ -5612,72 +5612,35 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
     ({ page } = await _fbStartProfile(user_id));
     await page.goto(thread_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.bringToFront().catch(() => {});
-    await _fbSleep(9000);
+    await _fbSleep(7000);
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
-    // scroll the conversation up a little to pull recent history
     for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
-    // BROAD diagnostic: every short text leaf in the main pane, in DOM order.
-    const broad = await page.evaluate(() => {
-      const out = [];
-      for (const el of document.querySelectorAll('div[dir="auto"], span')) {
+    const result = await page.evaluate((max) => {
+      // The open conversation lives in role="main" (the chat list is role="navigation").
+      const pane = document.querySelector('div[role="main"]') || document.body;
+      const CHROME = /^(active now|enter|sent|seen|delivered|like|reply|\d+:\d+|\d+\s*(?:m|h|w|d|y)|conversation details|messages are missing|you created this group|learn more|profile|mute|search|chat info|customize chat|media & files|privacy & support|message|aa)$/i;
+      const out = []; const seen = new Set();
+      let started = false;
+      for (const el of pane.querySelectorAll('div[dir="auto"], span')) {
         if (el.querySelector('div[dir="auto"], span')) continue; // leaves only
         const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-        if (t.length >= 2 && t.length <= 300) out.push(t);
+        if (t.length < 2 || t.length > 600) continue;
+        // skip everything up to and including the E2EE banner (header noise)
+        if (!started) { if (/end-to-end encryption/i.test(t)) started = true; continue; }
+        if (CHROME.test(t)) continue;
+        if (/secured with end-to-end/i.test(t)) continue;
+        if (seen.has(t)) continue;
+        seen.add(t);
+        out.push({ text: t });
       }
-      return out.slice(0, 60);
-    }).catch(() => []);
-    const frameDbg = [];
-    for (const f of page.frames()) {
-      const info = await f.evaluate(() => ({
-        len: (document.body && document.body.innerText || '').length,
-        snip: (document.body && document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260),
-      })).catch(() => ({ len: -1, snip: '' }));
-      frameDbg.push({ url: (f.url() || '').slice(0, 70), bodyLen: info.len, snip: info.snip });
-    }
-    const result = await page.evaluate((max) => {
-      const out = []; const seen = new Set();
-      // Each message row in Messenger is a [role="row"]; the bubble text lives in
-      // div[dir="auto"]. Direction: outgoing rows render right-aligned (we read
-      // the row's computed alignment / flex justify).
-      const rows = document.querySelectorAll('div[role="row"]');
-      const rowDbg = [];
-      for (const r of rows) {
-        const bub = r.querySelector('div[dir="auto"]');
-        const text = (bub ? bub.innerText : '').replace(/\s+/g, ' ').trim();
-        if (rowDbg.length < 8 && (r.innerText || '').trim()) rowDbg.push((r.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80));
-        if (!text || text.length < 2 || text.length > 600) continue;
-        if (/^(active now|sent|seen|delivered|enter|\d+:\d+|like)$/i.test(text)) continue;
-        // direction: walk up for a right-aligned container
-        let mine = false;
-        let n = r;
-        for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
-          const st = getComputedStyle(n);
-          if (st.justifyContent === 'flex-end' || st.alignItems === 'flex-end' || st.textAlign === 'right') { mine = true; break; }
-        }
-        const key = text + '|' + mine;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push({ mine, text });
-      }
-      const ariaDbg = [];
-      for (const el of document.querySelectorAll('[aria-label]')) {
-        const a = el.getAttribute('aria-label') || '';
-        if (/sent|replied|message/i.test(a) && ariaDbg.length < 10) ariaDbg.push(a.slice(0, 90));
-      }
-      return { messages: out.slice(-max), debug: {
-        rows: rows.length, rowSamples: rowDbg, ariaSamples: ariaDbg,
-        pageUrl: location.href.slice(0, 160),
-        title: (document.title || '').slice(0, 90),
-        dirAuto: document.querySelectorAll('div[dir="auto"]').length,
-        gridcells: document.querySelectorAll('div[role="gridcell"], div[role="presentation"]').length,
-        ariaTotal: document.querySelectorAll('[aria-label]').length,
-        bodySnippet: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
-      } };
+      let empty = false;
+      if (!out.length && /messages are missing|secured with end-to-end/i.test(pane.innerText || '')) empty = true;
+      return { messages: out.slice(-max), empty };
     }, max_messages);
     await page.close().catch(() => {});
-    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: { ...result.debug, frames: frameDbg, broad }, scraped_at: new Date().toISOString() });
+    return res.json({ ok: true, count: result.messages.length, messages: result.messages, empty: result.empty, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
