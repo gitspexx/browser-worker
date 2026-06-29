@@ -5539,6 +5539,57 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
   }
 });
 
+// POST /fb-pool/inbox — READ-ONLY: scrape a warmup profile's Messenger thread
+// list (people DMing us after seeing comments/posts) so GrowthOps can show it.
+app.post('/fb-pool/inbox', auth(), async (req, res) => {
+  const { profile, max_threads = 25 } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    await page.goto('https://www.facebook.com/messages/t/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.bringToFront().catch(() => {});
+    await _fbSleep(5000);
+    if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+      return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
+    }
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, 1200)).catch(() => {}); await _fbSleep(1500); }
+    const threads = await page.evaluate((max) => {
+      const out = []; const seen = new Set();
+      // Each conversation is a link to /messages/t/<id>; the row also exposes an
+      // aria-label like "Name. message snippet. time. Unread." on the listitem.
+      for (const a of document.querySelectorAll('a[href*="/messages/t/"], a[href*="/t/"], div[role="row"] a[role="link"]')) {
+        const href = (a.href || '').split('?')[0];
+        const m = href.match(/\/t\/([^/?#]+)/);
+        if (!m) continue;
+        const tid = m[1];
+        if (!tid || tid === 'new' || seen.has(tid)) continue;
+        const row = a.closest('[role="row"], [role="listitem"], li') || a;
+        const aria = (row.getAttribute && (row.getAttribute('aria-label') || a.getAttribute('aria-label'))) || '';
+        const txt = (row.innerText || a.innerText || '').replace(/\s+/g, ' ').trim();
+        const unread = /unread/i.test(aria) || (row.querySelector && !!row.querySelector('[aria-label*="nread" i], .x1s688f'));
+        seen.add(tid);
+        out.push({
+          thread_id: tid,
+          thread_url: `https://www.facebook.com/messages/t/${tid}`,
+          aria: aria.slice(0, 200),
+          text: txt.slice(0, 200),
+          unread: !!unread,
+        });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, max_threads);
+    await page.close().catch(() => {});
+    return res.json({ ok: true, profile, count: threads.length, threads, scraped_at: new Date().toISOString() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/comment-find — READ-ONLY: locate our comment on a post by text
 // and return its permalink (comment_id). Used to backfill comment_url for
 // comments whose deep-link wasn't captured at post time + to inspect format.
