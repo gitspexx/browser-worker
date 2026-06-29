@@ -5612,12 +5612,22 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
     ({ page } = await _fbStartProfile(user_id));
     await page.goto(thread_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.bringToFront().catch(() => {});
-    await _fbSleep(5000);
+    await _fbSleep(9000);
     if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
     // scroll the conversation up a little to pull recent history
     for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, -1000)).catch(() => {}); await _fbSleep(900); }
+    // BROAD diagnostic: every short text leaf in the main pane, in DOM order.
+    const broad = await page.evaluate(() => {
+      const out = [];
+      for (const el of document.querySelectorAll('div[dir="auto"], span')) {
+        if (el.querySelector('div[dir="auto"], span')) continue; // leaves only
+        const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (t.length >= 2 && t.length <= 300) out.push(t);
+      }
+      return out.slice(0, 60);
+    }).catch(() => []);
     const frameDbg = [];
     for (const f of page.frames()) {
       const info = await f.evaluate(() => ({
@@ -5667,7 +5677,7 @@ app.post('/fb-pool/thread', auth(), async (req, res) => {
       } };
     }, max_messages);
     await page.close().catch(() => {});
-    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: { ...result.debug, frames: frameDbg }, scraped_at: new Date().toISOString() });
+    return res.json({ ok: true, count: result.messages.length, messages: result.messages, debug: { ...result.debug, frames: frameDbg, broad }, scraped_at: new Date().toISOString() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
