@@ -5568,13 +5568,23 @@ app.post('/fb-pool/inbox', auth(), async (req, res) => {
         const row = a.closest('[role="row"], [role="listitem"], li') || a;
         const aria = (row.getAttribute && (row.getAttribute('aria-label') || a.getAttribute('aria-label'))) || '';
         const txt = (row.innerText || a.innerText || '').replace(/\s+/g, ' ').trim();
-        const unread = /unread/i.test(aria) || (row.querySelector && !!row.querySelector('[aria-label*="nread" i], .x1s688f'));
+        const spans = [...row.querySelectorAll('span[dir="auto"]')].map(s => (s.innerText || '').trim()).filter(Boolean);
+        const name = (spans[0] || txt.split('·')[0] || '').slice(0, 80);
+        const tm = txt.match(/(\b\d+\s*(?:m|h|w|d|y)\b|just now|yesterday|\b\d{1,2}:\d{2}\b)\s*$/i);
+        const last_ts = tm ? tm[1] : '';
+        let preview = txt;
+        if (name) preview = preview.split(name).join(' ');
+        preview = preview.replace(/Messages and calls are secured.*?encryption\.?/i, '')
+          .replace(/·/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        if (last_ts) preview = preview.replace(new RegExp(last_ts + '$'), '').trim();
+        const unread = /unread/i.test(aria) || (row.querySelector && !!row.querySelector('[aria-label*="nread" i]'));
         seen.add(tid);
         out.push({
           thread_id: tid,
           thread_url: `https://www.facebook.com/messages/t/${tid}`,
-          aria: aria.slice(0, 200),
-          text: txt.slice(0, 200),
+          contact_name: name,
+          preview: preview.slice(0, 200),
+          last_ts,
           unread: !!unread,
         });
         if (out.length >= max) break;
