@@ -1333,6 +1333,69 @@ async function drainDownload(download) {
 // Each handler: async (page, payload) → result object. Handlers receive a
 // Playwright Page already wired to the profile (AdsPower or bypass).
 const handlers = {
+  // Instagram cold-DM executor. Called via /submit with an AdsPower profileId that
+  // belongs to a WARMED account (GrowthOps owns account selection + the warm-gate +
+  // pacing). Opens the target profile, clicks Message, types the exact text.
+  // Safe by default: submit=false fills + screenshots only; submit:true actually sends.
+  async instagram_dm(page, { targetHandle, message, submit = false }) {
+    const handle = String(targetHandle || '').replace(/^@/, '').trim();
+    const text = String(message || '').trim();
+    if (!handle || !text) throw new Error('targetHandle and message required');
+
+    await page.goto(`https://www.instagram.com/${handle}/`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(3500);
+    if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
+      return { portal: 'instagram_dm', sent: false, error: 'auth_required', url: page.url() };
+    }
+    // Dismiss cookie / notification interstitials that block the profile.
+    for (const t of ['Allow all cookies', 'Decline optional cookies', 'Not Now', 'Not now']) {
+      const b = page.locator(`button:has-text("${t}")`).first();
+      if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(500); }
+    }
+    // Open the DM thread from the profile's Message button.
+    const msgBtn = page.locator('div[role="button"]:has-text("Message"), button:has-text("Message")').first();
+    if (!(await msgBtn.count().catch(() => 0))) {
+      return { portal: 'instagram_dm', sent: false, error: 'message_button_missing', url: page.url() };
+    }
+    await msgBtn.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+    // The "Turn on Notifications" dialog often pops after opening the thread.
+    const notNow = page.locator('button:has-text("Not Now"), button:has-text("Not now")').first();
+    if (await notNow.count().catch(() => 0)) { await notNow.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(800); }
+
+    // Locate the DM composer (IG rotates these — try a fallback chain).
+    const composerSels = [
+      'textarea[placeholder="Message..." i]',
+      'div[aria-label="Message" i][role="textbox"]',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[role="textbox"][contenteditable="true"]',
+    ];
+    let box = null;
+    for (const s of composerSels) {
+      try { await page.waitForSelector(s, { timeout: 4000 }); box = page.locator(s).last(); break; } catch {}
+    }
+    if (!box) return { portal: 'instagram_dm', sent: false, error: 'composer_missing', url: page.url() };
+
+    // Type multi-line copy without sending early: Shift+Enter between lines.
+    await box.click();
+    await page.waitForTimeout(600);
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      await box.type(lines[i], { delay: 16 });
+      if (i < lines.length - 1) await page.keyboard.press('Shift+Enter');
+    }
+    await page.waitForTimeout(600);
+
+    const shot = path.join(OUT, `ig-dm-${handle}.png`);
+    await page.screenshot({ path: shot }).catch(() => {});
+
+    if (!submit) {
+      return { portal: 'instagram_dm', sent: false, filled: true, handle, preview: shot, note: 'filled only — pass submit:true to send' };
+    }
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(3000);
+    return { portal: 'instagram_dm', sent: true, handle, preview: shot };
+  },
   async peek(page, { body, claimId }) {
     await page.goto('https://help.peek.com/hc/en-us/requests/new', { waitUntil: 'domcontentloaded' });
     await page.fill('#request_anonymous_requester_email', 'alex@specchio.xyz').catch(() => {});
