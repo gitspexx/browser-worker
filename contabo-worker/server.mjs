@@ -1456,7 +1456,10 @@ const handlers = {
   // host) via IG's edit-profile page. Used to brand a warmed account.
   async instagram_set_profile(page, { bio, picPath, name }) {
     await page.goto('https://www.instagram.com/accounts/edit/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(4500);
+    // The edit page is a SPA that shows a Meta splash first — wait for the form
+    // (a textarea) to hydrate before touching anything.
+    await page.waitForSelector('textarea', { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(2000);
     if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
       return { portal: 'instagram_set_profile', done: false, error: 'auth_required', url: page.url() };
     }
