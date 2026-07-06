@@ -1433,18 +1433,32 @@ const handlers = {
     if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
       return { portal: 'instagram_engage', done: false, error: 'auth_required', url: page.url() };
     }
-    for (const t of ['Allow all cookies', 'Decline optional cookies', 'Not Now', 'Not now']) {
-      const b = page.locator(`button:has-text("${t}")`).first();
-      if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(400); }
+    // Dismiss interstitials that cover the profile (login-save, cookie, "Post
+    // Profile Photo?", notifications). Loop a couple of times — they can stack.
+    for (let pass = 0; pass < 3; pass++) {
+      let any = false;
+      for (const t of ['Not Now', 'Not now', 'Cancel', 'Allow all cookies', 'Decline optional cookies', 'Dismiss']) {
+        const b = page.locator(`button:has-text("${t}"), div[role="button"]:has-text("${t}")`).first();
+        if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(600); any = true; }
+      }
+      if (!any) break;
     }
     // Already following/requested → nothing to do (still counts as warmed).
     const already = page.locator('button:has-text("Following"), button:has-text("Requested")').first();
     if (await already.count().catch(() => 0)) {
       return { portal: 'instagram_engage', done: true, action: 'follow', already: true, handle };
     }
-    const followBtn = page.locator('button:has-text("Follow"):not(:has-text("Following"))').first();
-    if (!(await followBtn.count().catch(() => 0))) {
-      return { portal: 'instagram_engage', done: false, error: 'follow_button_missing', url: page.url() };
+    // Wait for the Follow button (page/modal may still be settling).
+    let followBtn = null;
+    for (let k = 0; k < 4; k++) {
+      const b = page.locator('button:has-text("Follow"):not(:has-text("Following")), div[role="button"]:has-text("Follow"):not(:has-text("Following"))').first();
+      if (await b.count().catch(() => 0)) { followBtn = b; break; }
+      await page.waitForTimeout(2000);
+    }
+    if (!followBtn) {
+      const fs = path.join(OUT, `ig-follow-fail-${handle}.png`);
+      await page.screenshot({ path: fs }).catch(() => {});
+      return { portal: 'instagram_engage', done: false, error: 'follow_button_missing', url: page.url(), preview: fs };
     }
     await followBtn.click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(2500);
