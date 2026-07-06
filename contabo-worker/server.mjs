@@ -1476,14 +1476,20 @@ const handlers = {
         const fileInput = page.locator('input[type="file"]').first();
         if (await fileInput.count()) {
           await fileInput.setInputFiles(picPath);
-          // Wait for the "Profile Photo" crop modal's Save/Apply, then click to commit.
-          const commit = page.locator('button:has-text("Save"), div[role="button"]:has-text("Save"), button:has-text("Apply"), div[role="button"]:has-text("Apply")').first();
+          // Wait for the "Profile Photo" crop modal's Save, then commit it. IG's
+          // Save is a small role=button; force-click + Enter fallback.
           let clicked = false;
           for (let k = 0; k < 8 && !clicked; k++) {
             await page.waitForTimeout(1500);
-            if (await commit.count().catch(() => 0)) { await commit.click({ timeout: 4000 }).catch(() => {}); clicked = true; }
+            const save = page.getByRole('button', { name: /^(Save|Apply)$/ }).first();
+            if (await save.count().catch(() => 0)) {
+              await save.click({ timeout: 4000, force: true }).catch(() => {});
+              await page.keyboard.press('Enter').catch(() => {});
+              clicked = true;
+            }
           }
-          await page.waitForTimeout(2500);
+          if (!clicked) await page.keyboard.press('Enter').catch(() => {});
+          await page.waitForTimeout(3000);
           result.pic_set = clicked;
         }
       } catch (e) { result.pic_error = String(e.message || e); }
