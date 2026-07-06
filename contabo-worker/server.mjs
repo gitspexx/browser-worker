@@ -1455,6 +1455,9 @@ const handlers = {
   // Set profile bio (and optionally profile pic from a local file on the worker
   // host) via IG's edit-profile page. Used to brand a warmed account.
   async instagram_set_profile(page, { bio, picPath, name }) {
+    // Force a desktop viewport — some profiles open a narrow window where IG's
+    // crop-modal Save button is unreachable.
+    await page.setViewportSize({ width: 1366, height: 900 }).catch(() => {});
     await page.goto('https://www.instagram.com/accounts/edit/', { waitUntil: 'domcontentloaded', timeout: 45000 });
     // The edit page is a SPA that shows a Meta splash first — wait for the form
     // (a textarea) to hydrate before touching anything.
