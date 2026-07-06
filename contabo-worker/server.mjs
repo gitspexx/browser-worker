@@ -1352,10 +1352,20 @@ const handlers = {
       const b = page.locator(`button:has-text("${t}")`).first();
       if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(500); }
     }
-    // Open the DM thread from the profile's Message button.
-    const msgBtn = page.locator('div[role="button"]:has-text("Message"), button:has-text("Message")').first();
+    // Open the DM thread from the profile's Message button. Use EXACT text
+    // 'Message' so we don't match the "Messages" inbox nav/flyout. Close any
+    // stray inbox flyout first (Escape).
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(400);
+    let msgBtn = page.getByRole('button', { name: 'Message', exact: true }).first();
     if (!(await msgBtn.count().catch(() => 0))) {
-      return { portal: 'instagram_dm', sent: false, error: 'message_button_missing', url: page.url() };
+      // Fallback: a div[role=button] whose trimmed text is exactly "Message".
+      msgBtn = page.locator('div[role="button"]').filter({ hasText: /^Message$/ }).first();
+    }
+    if (!(await msgBtn.count().catch(() => 0))) {
+      const nb = path.join(OUT, `ig-dm-nobtn-${handle}.png`);
+      await page.screenshot({ path: nb }).catch(() => {});
+      return { portal: 'instagram_dm', sent: false, error: 'message_button_missing', url: page.url(), preview: nb };
     }
     await msgBtn.click({ timeout: 5000 }).catch(() => {});
     // Opening a thread navigates to /direct/ and can take a while to hydrate.
