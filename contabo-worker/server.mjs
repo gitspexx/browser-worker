@@ -1396,6 +1396,36 @@ const handlers = {
     await page.waitForTimeout(3000);
     return { portal: 'instagram_dm', sent: true, handle, preview: shot };
   },
+  // Warm-up engagement (follow) from the SAME warmed account that will DM later,
+  // so the target has a real prior relationship before the cold DM lands.
+  async instagram_engage(page, { targetHandle, action = 'follow' }) {
+    const handle = String(targetHandle || '').replace(/^@/, '').trim();
+    if (!handle) throw new Error('targetHandle required');
+    await page.goto(`https://www.instagram.com/${handle}/`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(3500);
+    if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
+      return { portal: 'instagram_engage', done: false, error: 'auth_required', url: page.url() };
+    }
+    for (const t of ['Allow all cookies', 'Decline optional cookies', 'Not Now', 'Not now']) {
+      const b = page.locator(`button:has-text("${t}")`).first();
+      if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(400); }
+    }
+    // Already following/requested → nothing to do (still counts as warmed).
+    const already = page.locator('button:has-text("Following"), button:has-text("Requested")').first();
+    if (await already.count().catch(() => 0)) {
+      return { portal: 'instagram_engage', done: true, action: 'follow', already: true, handle };
+    }
+    const followBtn = page.locator('button:has-text("Follow"):not(:has-text("Following"))').first();
+    if (!(await followBtn.count().catch(() => 0))) {
+      return { portal: 'instagram_engage', done: false, error: 'follow_button_missing', url: page.url() };
+    }
+    await followBtn.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    const ok = (await page.locator('button:has-text("Following"), button:has-text("Requested")').first().count().catch(() => 0)) > 0;
+    const shot = path.join(OUT, `ig-follow-${handle}.png`);
+    await page.screenshot({ path: shot }).catch(() => {});
+    return { portal: 'instagram_engage', done: ok, action: 'follow', handle, preview: shot };
+  },
   async peek(page, { body, claimId }) {
     await page.goto('https://help.peek.com/hc/en-us/requests/new', { waitUntil: 'domcontentloaded' });
     await page.fill('#request_anonymous_requester_email', 'alex@specchio.xyz').catch(() => {});
