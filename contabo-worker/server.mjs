@@ -1358,23 +1358,39 @@ const handlers = {
       return { portal: 'instagram_dm', sent: false, error: 'message_button_missing', url: page.url() };
     }
     await msgBtn.click({ timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(4000);
+    // Opening a thread navigates to /direct/ and can take a while to hydrate.
+    await page.waitForURL(/\/direct\//, { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(5000);
     // The "Turn on Notifications" dialog often pops after opening the thread.
-    const notNow = page.locator('button:has-text("Not Now"), button:has-text("Not now")').first();
-    if (await notNow.count().catch(() => 0)) { await notNow.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(800); }
+    for (const t of ['Not Now', 'Not now']) {
+      const b = page.locator(`button:has-text("${t}")`).first();
+      if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(800); }
+    }
 
-    // Locate the DM composer (IG rotates these — try a fallback chain).
+    // Locate the DM composer (IG rotates these — try a broad fallback chain, and
+    // wait up to ~12s total for the thread to hydrate).
     const composerSels = [
       'textarea[placeholder="Message..." i]',
       'div[aria-label="Message" i][role="textbox"]',
+      'div[aria-label*="essage" i][contenteditable="true"]',
       'div[contenteditable="true"][role="textbox"]',
       'div[role="textbox"][contenteditable="true"]',
+      'div[contenteditable="true"]',
+      'textarea',
     ];
     let box = null;
-    for (const s of composerSels) {
-      try { await page.waitForSelector(s, { timeout: 4000 }); box = page.locator(s).last(); break; } catch {}
+    for (let attempt = 0; attempt < 3 && !box; attempt++) {
+      for (const s of composerSels) {
+        const loc = page.locator(s).last();
+        if (await loc.count().catch(() => 0)) { box = loc; break; }
+      }
+      if (!box) await page.waitForTimeout(2500);
     }
-    if (!box) return { portal: 'instagram_dm', sent: false, error: 'composer_missing', url: page.url() };
+    if (!box) {
+      const failShot = path.join(OUT, `ig-dm-fail-${handle}.png`);
+      await page.screenshot({ path: failShot }).catch(() => {});
+      return { portal: 'instagram_dm', sent: false, error: 'composer_missing', url: page.url(), preview: failShot };
+    }
 
     // Type multi-line copy without sending early: Shift+Enter between lines.
     await box.click();
