@@ -1452,6 +1452,47 @@ const handlers = {
     await page.screenshot({ path: shot }).catch(() => {});
     return { portal: 'instagram_engage', done: ok, action: 'follow', handle, preview: shot };
   },
+  // Set profile bio (and optionally profile pic from a local file on the worker
+  // host) via IG's edit-profile page. Used to brand a warmed account.
+  async instagram_set_profile(page, { bio, picPath, name }) {
+    await page.goto('https://www.instagram.com/accounts/edit/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(4500);
+    if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
+      return { portal: 'instagram_set_profile', done: false, error: 'auth_required', url: page.url() };
+    }
+    for (const t of ['Not Now', 'Not now', 'Allow all cookies', 'Decline optional cookies']) {
+      const b = page.locator(`button:has-text("${t}")`).first();
+      if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(400); }
+    }
+    const result = { portal: 'instagram_set_profile', bio_set: false, pic_set: false };
+    if (picPath) {
+      try {
+        const fileInput = page.locator('input[type="file"]').first();
+        if (await fileInput.count()) {
+          await fileInput.setInputFiles(picPath);
+          await page.waitForTimeout(3500);
+          for (const t of ['Apply', 'Set as profile photo', 'Save', 'Done']) {
+            const b = page.locator(`button:has-text("${t}"), div[role="button"]:has-text("${t}")`).first();
+            if (await b.count().catch(() => 0)) { await b.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(1500); break; }
+          }
+          result.pic_set = true;
+        }
+      } catch (e) { result.pic_error = String(e.message || e); }
+    }
+    if (bio) {
+      const bioSels = ['textarea[aria-label*="Bio" i]', 'textarea[maxlength="150"]', 'textarea[name="biography"]', 'textarea'];
+      let box = null;
+      for (const s of bioSels) { const l = page.locator(s).first(); if (await l.count().catch(() => 0)) { box = l; break; } }
+      if (box) { await box.click().catch(() => {}); await box.fill('').catch(() => {}); await box.fill(String(bio)).catch(() => {}); await page.waitForTimeout(600); result.bio_set = true; }
+      else result.bio_error = 'bio_field_missing';
+    }
+    const submit = page.locator('button:has-text("Submit"), div[role="button"]:has-text("Submit"), button[type="submit"]').first();
+    if (await submit.count().catch(() => 0)) { await submit.click({ timeout: 5000 }).catch(() => {}); await page.waitForTimeout(3000); result.submitted = true; }
+    const shot = path.join(OUT, `ig-profile-${name || 'acct'}.png`);
+    await page.screenshot({ path: shot }).catch(() => {});
+    result.preview = shot; result.done = result.bio_set || result.pic_set;
+    return result;
+  },
   async peek(page, { body, claimId }) {
     await page.goto('https://help.peek.com/hc/en-us/requests/new', { waitUntil: 'domcontentloaded' });
     await page.fill('#request_anonymous_requester_email', 'alex@specchio.xyz').catch(() => {});
