@@ -1342,6 +1342,7 @@ const handlers = {
     const text = String(message || '').trim();
     if (!handle || !text) throw new Error('targetHandle and message required');
 
+    await page.setViewportSize({ width: 1366, height: 900 }).catch(() => {});
     await page.goto(`https://www.instagram.com/${handle}/`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(3500);
     if (/\/accounts\/login|\/challenge|\/checkpoint/.test(page.url())) {
