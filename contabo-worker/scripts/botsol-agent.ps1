@@ -157,7 +157,12 @@ function Insert-ScrapeJob {
         if ($resp -and $resp.Count -gt 0) { return $resp[0] }
         return $resp
     } catch {
-        Write-Log "Insert-ScrapeJob failed: $($_.Exception.Message)" 'error'
+        # Surface the PostgREST error body too - message alone hides constraint
+        # violations (a 23514 went undiagnosed for 9 days on message-only logging).
+        $errMsg = $_.Exception.Message
+        $respBody = ''
+        try { $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $respBody = $sr.ReadToEnd() } catch {}
+        Write-Log "Insert-ScrapeJob failed: $errMsg body=$respBody" 'error'
         return $null
     }
 }
@@ -182,7 +187,12 @@ function Update-ScrapeJob {
             -Body $body -TimeoutSec 15
         return $resp
     } catch {
-        Write-Log "Update-ScrapeJob($Id) failed: $($_.Exception.Message)" 'error'
+        # Surface the PostgREST error body too - message alone hides constraint
+        # violations (a 23514 went undiagnosed for 9 days on message-only logging).
+        $errMsg = $_.Exception.Message
+        $respBody = ''
+        try { $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $respBody = $sr.ReadToEnd() } catch {}
+        Write-Log "Update-ScrapeJob($Id) failed: $errMsg body=$respBody" 'error'
         return $null
     }
 }
@@ -200,6 +210,17 @@ function Process-RetryRequests {
         $rows = Invoke-RestMethod -Uri $uri -Headers (Get-SupaHeaders) -TimeoutSec 15
         if (-not $rows -or $rows.Count -eq 0) { return }
         Write-Log "retry: $($rows.Count) queued botsol jobs to process"
+        # Guard rails (2026-07-08 audit):
+        #  - never restore the file of the CURRENTLY ACTIVE run (restore-during-run race)
+        #  - collapse duplicate country+source_file rows to one per tick (first row wins)
+        $qsRetry = Read-QueueState
+        $activeCountry = ''
+        $activeFile    = ''
+        if ($qsRetry) {
+            if ($qsRetry.current_country)     { $activeCountry = [string]$qsRetry.current_country }
+            if ($qsRetry.current_source_file) { $activeFile    = [string]$qsRetry.current_source_file }
+        }
+        $seenRetry = @{}
         foreach ($r in $rows) {
             $jid = $r.id
             $country = $r.country
@@ -207,6 +228,17 @@ function Process-RetryRequests {
             if (-not $country -or -not $srcFile) {
                 Write-Log "retry: row $jid missing country/source_file, marking failed" 'warn'
                 Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='retry rejected: missing country/source_file' } | Out-Null
+                continue
+            }
+            $comboKey = "$country|$srcFile"
+            if ($seenRetry.ContainsKey($comboKey)) {
+                Write-Log "retry: duplicate row $jid for $country/$srcFile - collapsing (first row wins)" 'warn'
+                Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='duplicate retry collapsed' } | Out-Null
+                continue
+            }
+            $seenRetry[$comboKey] = $true
+            if ($activeCountry -and $activeFile -and $country -eq $activeCountry -and $srcFile -eq $activeFile) {
+                Write-Log "retry: $country/$srcFile is the ACTIVE run - skipping restore this tick (row stays queued)" 'warn'
                 continue
             }
             $countryDir = Join-Path $KEYWORDS_ROOT $country
@@ -232,7 +264,16 @@ function Process-RetryRequests {
             # Mark as retry_pending - purely informational. Agent IDLE flow will
             # create a NEW scrape_jobs row when it picks up the file. The old row
             # stays as 'retry_pending' for audit. (We don't delete it.)
-            Update-ScrapeJob -Id $jid -Patch @{ status='retry_pending' } | Out-Null
+            # Capture the PATCH result: Update-ScrapeJob returns $null on failure
+            # (e.g. status check constraint rejects 'retry_pending'). Don't log
+            # success unconditionally; fall back to 'failed' so the row isn't
+            # re-picked as queued every tick forever.
+            $upd = Update-ScrapeJob -Id $jid -Patch @{ status='retry_pending' }
+            if ($null -eq $upd) {
+                Write-Log "retry: retry_pending PATCH rejected for $jid ($country/$srcFile) - marking failed instead" 'warn'
+                Update-ScrapeJob -Id $jid -Patch @{ status='failed'; error='retry consumed (retry_pending rejected)' } | Out-Null
+                continue
+            }
             Write-Log ":arrows_counterclockwise: Botsol retry queued for $country / $srcFile (file restored from done/)"
         }
     } catch {
@@ -804,6 +845,21 @@ function Handle-NumericPrompt {
                     try {
                         $aid = [string]$k.Current.AutomationId
                         $en  = [bool]$k.Current.IsEnabled
+                        # FIX 2026-07-08 (45.5h outage): a frmBoolInput Yes/No question can mount at
+                        # ANY point in the Start sequence (newer Botsol builds reorder the email /
+                        # unique-businesses questions). While it is up, the NEXT prompt never mounts,
+                        # so the plain-IDLE flow died at file_select after 45s -- the DONE->IDLE
+                        # recovery path only worked because its frmBoolInput happened to land inside
+                        # the dedicated 8s Dismiss-BoolInput window. Dismiss it inline (Yes) here so
+                        # EVERY Handle-NumericPrompt wait self-clears a blocking bool; absent on
+                        # older Botsol versions = no-op (this branch simply never matches).
+                        if ($en -and ($aid -eq 'frmBoolInput' -or $aid -like 'frmBool*')) {
+                            $bBtn = Find-DialogButton -Dialog $k -NameMatch '^&?Yes$'
+                            if ($bBtn -and (Invoke-Element $bBtn)) {
+                                Write-Log "$Tag BoolInput child dialog (aid=$aid) dismissed via 'Yes' while waiting for prompt"
+                                Start-Sleep -Milliseconds 500
+                            }
+                        }
                         # Match any frm* child (frmInput, frmIntInput, frmSelectFile, frmFileInput, ...)
                         # OR Botsol's actual InputInteger / InputString AIDs (observed live 2026-05-03).
                         # The Edit-presence check below filters out frmBoolInput (no Edit, just Yes/No).
@@ -896,6 +952,11 @@ function Handle-NumericPrompt {
                         $sip.Select()
                         Write-Log "$Tag selected '$rnm' radio to enable input edit"
                         Start-Sleep -Milliseconds 400
+                    } else {
+                        # Log the already-selected case too (2026-07-08): the failing plain-IDLE
+                        # path never showed the radio line, which masked whether the radio dialog
+                        # was present at all. This makes the two states distinguishable in the log.
+                        Write-Log "$Tag '$rnm' radio already selected"
                     }
                 } catch {
                     try { $rb.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); Start-Sleep -Milliseconds 400 } catch {}
@@ -1699,6 +1760,45 @@ try {
                     } | Out-Null
                 }
                 Post-Slack ":x: Botsol file-select failed for $($next.Country)/$($next.Stem)"
+
+                # Consecutive-failure cap (2026-07-08 audit): one bad dialog used to wedge the
+                # pipeline for days (45.5h on egypt/eat_r2_1.txt) because the same file was
+                # retried forever. Track fails in queue-state; after 3 in a row on the SAME
+                # file, quarantine it so the queue picker takes the next one. Counter lives in
+                # botsol-queue-state.json (file_select_fail_count + file_select_fail_file) and
+                # is naturally reset by the fresh state written on a successful start.
+                $failKey   = "$($next.Country)/$($next.FileName)"
+                $failCount = 0
+                if ($state -and $state.file_select_fail_file -and ([string]$state.file_select_fail_file -eq $failKey)) {
+                    try { $failCount = [int]$state.file_select_fail_count } catch { $failCount = 0 }
+                }
+                $failCount++
+                # Never quarantine while a scrape is RUNNING (Stop enabled = crawl in flight).
+                if ($failCount -ge 3 -and -not $stopEn) {
+                    try {
+                        $quarDir = Join-Path (Join-Path $KEYWORDS_ROOT $next.Country) 'quarantine'
+                        Ensure-Dir $quarDir
+                        if (Test-Path -LiteralPath $next.FullPath) {
+                            Move-Item -LiteralPath $next.FullPath -Destination (Join-Path $quarDir $next.FileName) -Force
+                        }
+                        Write-Log "file-select failed $failCount consecutive times on $failKey -> moved to quarantine/ (queue continues with next file)" 'error'
+                        Post-Slack (":rotating_light: *DANGER: Botsol quarantined* ``$failKey`` after $failCount consecutive file-select failures. File moved to quarantine/; the queue continues with the next file. :point_right: inspect the file + BotsolApp dialogs on 66.70.134.73.")
+                    } catch {
+                        Write-Log "quarantine move failed for $failKey : $($_.Exception.Message)" 'error'
+                    }
+                    $fsState = @{}
+                    if ($state) { foreach ($p in $state.PSObject.Properties) { $fsState[$p.Name] = $p.Value } }
+                    $fsState.file_select_fail_count = 0
+                    $fsState.file_select_fail_file  = ''
+                    Write-QueueState $fsState
+                } else {
+                    $fsState = @{}
+                    if ($state) { foreach ($p in $state.PSObject.Properties) { $fsState[$p.Name] = $p.Value } }
+                    $fsState.file_select_fail_count = $failCount
+                    $fsState.file_select_fail_file  = $failKey
+                    Write-QueueState $fsState
+                    Write-Log "file-select consecutive failure $failCount of 3 for $failKey (retrying next tick)" 'warn'
+                }
                 exit 0
             }
 

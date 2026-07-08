@@ -37,6 +37,8 @@ function Load-State {
         last_run_ts               = 0
         last_heartbeat_ts         = 0
         last_stall_alert_ts       = 0
+        last_botsol_pid           = 0
+        pid_change_streak         = 0
     }
     $state = $null
     if (Test-Path $StatePath) {
@@ -115,6 +117,27 @@ if (-not $botsolProc) {
     }
 } else {
     Write-Log ("BotsolApp running (PID {0})" -f $botsolProc.Id)
+    # --- Check 0b: PID crash-loop detector ---
+    # A different PID on every check means BotsolApp keeps dying + relaunching (144 PID
+    # changes on 2026-07-07). Alert once per episode: exactly when the consecutive-change
+    # counter hits 4; a stable check resets it.
+    $curBotsolPid = [int](@($botsolProc)[0].Id)   # @() guards the multi-process case mid-crash-loop
+    $lastBotsolPid = 0
+    try { $lastBotsolPid = [int]$state.last_botsol_pid } catch {}
+    $pidStreak = 0
+    try { $pidStreak = [int]$state.pid_change_streak } catch {}
+    if ($lastBotsolPid -ne 0 -and $curBotsolPid -ne $lastBotsolPid) {
+        $pidStreak = $pidStreak + 1
+        Write-Log ("BotsolApp PID changed ({0} -> {1}); consecutive-change streak={2}" -f $lastBotsolPid, $curBotsolPid, $pidStreak)
+        if ($pidStreak -eq 4) {
+            Post-Slack (":rotating_light: *Botsol CRASH-LOOPING* on $env:COMPUTERNAME: PID changed on $pidStreak consecutive checks — BotsolApp keeps dying and restarting, no scraping is happening. Manual attention needed.")
+        }
+    } else {
+        if ($pidStreak -gt 0) { Write-Log ("BotsolApp PID stable ({0}); crash-loop streak reset (was {1})" -f $curBotsolPid, $pidStreak) }
+        $pidStreak = 0
+    }
+    $state.last_botsol_pid = $curBotsolPid
+    $state.pid_change_streak = $pidStreak
 }
 
 # Enumerate top-level windows
@@ -174,6 +197,7 @@ Write-Log ("Chrome windows found: {0}" -f $chromeWindows.Count)
 
 $lastReload = [int]$state.last_chrome_reload_ts
 $reloadedThisRun = $false
+$chromeScanErrLogged = $false   # UIA FindFirst on Chrome throws every run (broken for weeks) — log once per run, debug level
 
 foreach ($cw in $chromeWindows) {
     if ($reloadedThisRun) { break }
@@ -231,7 +255,12 @@ foreach ($cw in $chromeWindows) {
             Write-Log 'Aw, Snap! detected but no Reload button invoked (button not found or Invoke failed)'
         }
     } catch {
-        Write-Log ("Chrome scan error: {0}" -f $_.Exception.Message)
+        # Aw-Snap scan is best-effort/decorative when UIA is broken: degrade to 'chrome=?'
+        # instead of erroring once per window per run.
+        if (-not $chromeScanErrLogged) {
+            Write-Log ("DEBUG: Chrome scan degraded (chrome=?), Aw-Snap check skipped this run: {0}" -f $_.Exception.Message)
+            $chromeScanErrLogged = $true
+        }
     }
 }
 
@@ -281,7 +310,22 @@ if (($now - $lastHb) -ge $HeartbeatIntervalSec) {
 - now scraping: $cur
 - categories left in queue: $pendingCount
 "@
-    Post-Slack $hbMsg
+    # Staleness gate: a live process means nothing if the output pipeline is dead (45h of
+    # hearts through zero output on 2026-07-05/07). Newest archived CSV older than 3h
+    # (a single keyword file can legitimately take ~2h) => STALLED alert instead of the heart.
+    $newestArc = $null
+    try {
+        $newestArc = Get-ChildItem 'C:\Botsol\archive' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    } catch {}
+    $arcAgeH = -1
+    if ($newestArc) { $arcAgeH = [math]::Round(((Get-Date) - $newestArc.LastWriteTime).TotalHours, 1) }
+    if ($newestArc -and $arcAgeH -ge 3) {
+        Post-Slack (":rotating_light: *Botsol STALLED* on $env:COMPUTERNAME: no archived CSV since $($newestArc.LastWriteTime.ToString('yyyy-MM-dd HH:mm')) (${arcAgeH}h ago) — output pipeline dead. Currently reported: $cur, $pendingCount categories left in queue.")
+        Write-Log "heartbeat suppressed: archive stale ${arcAgeH}h (newest: $($newestArc.Name)) — posted STALLED alert instead"
+    } else {
+        Post-Slack $hbMsg
+    }
     $state.last_heartbeat_ts = $now
 }
 

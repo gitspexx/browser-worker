@@ -14,12 +14,22 @@ $shotDir='C:\worker\logs\unstick'; if(-not(Test-Path $shotDir)){ New-Item -ItemT
 $STALL_MIN_TICKS = 5      # ~10 min frozen before we act (after the agent's ~12min soft watch starts)
 $COOLDOWN_MIN    = 12     # one attempt per freeze episode
 $stamp='C:\worker\unstick-v2.stamp'
+$hbStamp='C:\worker\unstick-v2-heartbeat.stamp'    # hourly "alive" log line, so silence = not-running
+$escStamp='C:\worker\unstick-v2-escalate.stamp'    # last dead-Chrome escalation (max 1 per 60 min)
+$arPend='C:\worker\requeue-pending.txt'            # auto-restart's re-queue marker ($pend in auto-restart.ps1)
+
+# hourly heartbeat: one log line so "no log output" is distinguishable from "task not running"
+function HB($n){
+  $due=$true
+  if(Test-Path $hbStamp){ try{ if(((Get-Date)-(Get-Item $hbStamp).LastWriteTime).TotalMinutes -lt 60){ $due=$false } }catch{} }
+  if($due){ L "alive, conditions not met (ticks=$n)"; Set-Content $hbStamp (Get-Date -Format o) }
+}
 
 # --- gate (a): confirmed stall from the agent's queue-state ---
 $qs = Get-Content 'C:\worker\botsol-queue-state.json' -Raw -EA SilentlyContinue | ConvertFrom-Json
 $ticks=0; try{ $ticks=[int]$qs.stall_ticks }catch{}
-if($ticks -lt $STALL_MIN_TICKS){ exit 0 }
-if(Test-Path $stamp){ try{ if(((Get-Date)-(Get-Item $stamp).LastWriteTime).TotalMinutes -lt $COOLDOWN_MIN){ exit 0 } }catch{} }
+if($ticks -lt $STALL_MIN_TICKS){ HB $ticks; exit 0 }
+if(Test-Path $stamp){ try{ if(((Get-Date)-(Get-Item $stamp).LastWriteTime).TotalMinutes -lt $COOLDOWN_MIN){ HB $ticks; exit 0 } }catch{} }
 
 Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
@@ -56,7 +66,28 @@ function Shot($tag){
 $cb=[Uv+EnumProc]{ param($h,$l) [Uv]::Cb($h,$l) }
 [Uv]::MapsAlive=$false; [Uv]::EnumWindows($cb,[IntPtr]::Zero) | Out-Null
 $cc="$($qs.current_country)/$($qs.current_source_file)"
-if(-not [Uv]::MapsAlive){ L "stall ticks=$ticks on $cc but NO live Google-Maps Chrome window -> Chrome likely DEAD, skipping (auto-restart will handle)"; exit 0 }
+if(-not [Uv]::MapsAlive){
+  L "stall ticks=$ticks on $cc but NO live Google-Maps Chrome window -> Chrome likely DEAD, skipping (auto-restart will handle)"
+  # NON-DESTRUCTIVE escalation (no kills, ever): "auto-restart will handle" is only true while
+  # its re-queue marker is pending. On 2026-07-06 it had given up 90 min earlier, so every tick
+  # skipped here forever. If nothing is pending (marker absent, or renamed .gaveup by
+  # auto-restart's give-up branch) -> Slack a human, at most once per 60 min.
+  if(-not (Test-Path $arPend)){
+    $why='no re-queue marker at all'
+    if(Test-Path "$arPend.gaveup"){ $why='auto-restart GAVE UP (requeue-pending.txt.gaveup present)' }
+    $canAlert=$true
+    if(Test-Path $escStamp){ try{ if(((Get-Date)-(Get-Item $escStamp).LastWriteTime).TotalMinutes -lt 60){ $canAlert=$false } }catch{} }
+    if($canAlert){
+      L "ESCALATE: stall persists with dead Chrome and NO auto-restart pending ($why) -> Slack alert"
+      $wh=$null; foreach($e in (Get-Content 'C:\worker\orchestrator.env' -EA SilentlyContinue)){ if($e -match '^\s*SLACK_WEBHOOK\s*=\s*(.+?)\s*$'){ $wh=$Matches[1] } }
+      if($wh){ try{ Invoke-RestMethod -Uri $wh -Method Post -ContentType 'application/json' -TimeoutSec 12 -Body (@{text=(":rotating_light: *unstick-v2: stall with dead Chrome and NO auto-restart pending -- manual intervention needed* on $env:COMPUTERNAME. $cc frozen (ticks=$ticks), scraper Chrome window gone, $why. No self-heal will fire -- RDP in and restart BotsolApp.")}|ConvertTo-Json -Compress)|Out-Null }catch{} }
+      Set-Content $escStamp (Get-Date -Format o)
+    } else {
+      L "escalation suppressed (last dead-Chrome alert <60min ago)"
+    }
+  }
+  exit 0
+}
 
 # --- act: real-click Botsol Stop ---
 $AE=[System.Windows.Automation.AutomationElement];$TS=[System.Windows.Automation.TreeScope]

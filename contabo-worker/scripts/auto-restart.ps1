@@ -43,6 +43,12 @@ function PostPanel($text){
   ) } | ConvertTo-Json -Depth 12
   try{ Invoke-RestMethod -Uri $bw -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15 | Out-Null }catch{}
 }
+function PostDanger($text){
+  $wh=$null
+  foreach($ln in (Get-Content 'C:\worker\orchestrator.env' -EA SilentlyContinue)){ if($ln -match '^\s*SLACK_WEBHOOK\s*=\s*(.+?)\s*$'){ $wh=$matches[1] } }
+  if(-not $wh){ return }
+  try{ Invoke-RestMethod -Uri $wh -Method Post -Body (@{ text=$text } | ConvertTo-Json -Compress) -ContentType 'application/json' -TimeoutSec 15 | Out-Null }catch{}
+}
 function Cooling(){ if(Test-Path $stamp){ try{ $l=[datetime]::Parse((Get-Content $stamp -Raw).Trim()); if(((Get-Date)-$l).TotalMinutes -lt $COOLDOWN_MIN){ return $true } }catch{} }; return $false }
 function Restart($why){ Get-Process BotsolApp -EA SilentlyContinue | Stop-Process -Force; Get-Process chrome,chromedriver -EA SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 4; Start-ScheduledTask -TaskName BotsolManualLaunch; Set-Content $stamp ((Get-Date).ToString('o')); L $why }
 
@@ -55,7 +61,13 @@ if(Test-Path $pend){
       $p=($rqcat -replace '/','\'); $cc=($p -split '\\')[0]; $ff=($p -split '\\')[-1]
       $donef="$base\$cc\done\$ff"; $actf="$base\$cc\$ff"
       if(Test-Path $donef){ Move-Item $donef $actf -Force; Remove-Item $pend -Force; L "re-queued $rqcat (done->active)" }
-      elseif($age -ge 40){ Remove-Item $pend -Force; L "re-queue ${rqcat}: gave up after ${age}min" }
+      elseif($age -ge 40){
+        # give-up must be LOUD + leave evidence: rename marker to .gaveup (stops the retry loop,
+        # alerts exactly once) instead of silently deleting it. 45.5h outage on 2026-07-06 started here.
+        try{ Move-Item $pend "$pend.gaveup" -Force }catch{ Remove-Item $pend -Force }
+        L "re-queue ${rqcat}: gave up after ${age}min -> marker renamed to requeue-pending.txt.gaveup + DANGER alert"
+        PostDanger(":rotating_light: *DANGER: Botsol re-queue ABANDONED* on $env:COMPUTERNAME -- '${rqcat}' could not be re-queued after $([int]$age)min (done-file never appeared). Auto-restart will NOT retry it. Marker kept at C:\worker\requeue-pending.txt.gaveup -- manual attention needed: re-queue the category by hand in C:\Botsol\pipeline\keywords_v2.")
+      }
     }
   } else { Remove-Item $pend -Force }
 }
