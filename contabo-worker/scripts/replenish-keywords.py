@@ -38,6 +38,7 @@ HIGH_YIELD = {
 # NEW cities per round (beyond the ~10 already scraped in round-1). Country dir name -> cities.
 NEW_CITIES_BY_ROUND = {
     "r2": {
+    "albania":     ["Fier", "Elbasan", "Lushnje", "Kavaje", "Lezhe", "Kukes", "Patos", "Peshkopi", "Kruje", "Burrel", "Librazhd", "Gramsh", "Ballsh", "Corovode", "Permet", "Delvine", "Bajram Curri", "Rreshen"],
     "italy":       ["Bologna", "Verona", "Genoa", "Bari", "Palermo", "Catania", "Turin", "Padua", "Perugia", "Lecce", "Siena", "Pisa", "Bergamo", "Modena", "Parma", "Trieste", "Rimini", "Sorrento"],
     "spain":       ["Zaragoza", "Malaga", "Murcia", "Bilbao", "Alicante", "Cordoba", "Valladolid", "Vigo", "Gijon", "Santander", "Pamplona", "Salamanca", "San Sebastian", "Cadiz", "Tarragona", "Logrono", "Toledo", "Girona"],
     "germany":     ["Cologne", "Frankfurt", "Stuttgart", "Dusseldorf", "Leipzig", "Dresden", "Hannover", "Nuremberg", "Bremen", "Bonn", "Heidelberg", "Freiburg", "Mainz", "Augsburg", "Munster", "Karlsruhe", "Wiesbaden", "Regensburg"],
@@ -98,6 +99,56 @@ NEW_CITIES_BY_ROUND = {
     "thailand":    ["Khon Kaen", "Nakhon Ratchasima", "Ubon Ratchathani", "Phitsanulok", "Nakhon Si Thammarat", "Rayong", "Pattaya", "Cha-am", "Prachuap Khiri Khan", "Ranong", "Satun", "Buriram", "Nong Khai", "Sakon Nakhon", "Phrae", "Phayao", "Kamphaeng Phet", "Ratchaburi"],
     "turkey":      ["Adana", "Mersin", "Kayseri", "Samsun", "Denizli", "Diyarbakir", "Erzurum", "Van", "Kutahya", "Afyonkarahisar", "Bolu", "Rize", "Ordu", "Sinop", "Amasya", "Safranbolu", "Datca", "Kalkan"],
     "vietnam":     ["Cat Ba", "Mai Chau", "Dong Hoi", "Phong Nha", "Kon Tum", "Tuy Hoa", "Phan Thiet", "Rach Gia", "Ca Mau", "My Tho", "Ben Tre", "Chau Doc", "Long Xuyen", "Vinh", "Thanh Hoa", "Nam Dinh", "Cao Bang", "Lang Son"],
+    },
+    # r4: deep reserve tier 1 — fresh quaternary cities for the high-city-count rotation countries.
+    # No overlap with that country's r2, r3, or generator round-1 cities[0:10]. Auto-fuel advances into
+    # r4 once r2/r3 files are consumed (NEW_CITIES = NEW_CITIES_BY_ROUND.get(ROUND, {}) handles it — no code change).
+    "r4": {
+    "germany":     ["Saarbrucken", "Wolfsburg", "Ingolstadt", "Oldenburg", "Osnabruck", "Paderborn", "Heilbronn", "Pforzheim", "Gelsenkirchen", "Wuppertal", "Bochum", "Halle", "Magdeburg", "Chemnitz", "Jena", "Konstanz", "Duisburg", "Krefeld"],
+    "india":       ["Gangtok", "Nainital", "Ooty", "Mount Abu", "Bikaner", "Ranthambore", "Khajuraho", "Kodaikanal", "Coorg", "Wayanad", "Hampi Bazaar", "Kasol", "Spiti", "Tirupati", "Madikeri", "Gokarna", "Mahabalipuram", "Bhubaneswar"],
+    "indonesia":   ["Gili Air", "Amed", "Lovina", "Munduk", "Sidemen", "Wakatobi", "Jimbaran", "Nusa Lembongan", "Tanjung Benoa", "Sumbawa", "Belitung", "Karimunjawa", "Derawan", "Bunaken", "Tomohon", "Wonosobo", "Probolinggo", "Jepara"],
+    "italy":       ["Cremona", "Pavia", "Alghero", "Sassari", "Viterbo", "Assisi", "Orvieto", "Gubbio", "Spoleto", "Cefalu", "Syracuse", "Ragusa", "Noto", "Tropea", "Portofino", "Rapallo", "Sirmione", "Merano"],
+    "japan":       ["Fukushima", "Yamagata", "Wakayama", "Naha", "Ishigaki", "Miyakojima", "Karuizawa", "Ise", "Nagaoka", "Iwaki", "Yonago", "Tottori", "Fukui", "Mito", "Chiba", "Kofu", "Nagasaki Bay", "Onomichi"],
+    "philippines": ["Siquijor", "Dapitan", "Dipolog", "Bantayan", "Panglao", "Anilao", "Calaguas", "Bataan", "Guimaras", "Kalibo", "San Juan", "Sabang", "Port Barton", "Balabac", "Apo Island", "Donsol", "Sipalay", "Alona Beach"],
+    "portugal":    ["Sagres", "Loule", "Portalegre", "Castelo Branco", "Chaves", "Lamego", "Monsaraz", "Marvao", "Estremoz", "Silves", "Caldas da Rainha", "Fatima", "Alcobaca", "Batalha", "Mira", "Ovar", "Amarante", "Penafiel"],
+    "spain":       ["Zamora", "Soria", "Palencia", "Teruel", "Albacete", "Ourense", "Jaen", "Ciudad Real", "Guadalajara", "Badajoz", "Lugo", "Pontevedra", "Melilla", "Ceuta", "Aranjuez", "Sitges", "Cangas de Onis", "Nerja"],
+    "thailand":    ["Sing Buri", "Ang Thong", "Chachoengsao", "Nakhon Pathom", "Suphan Buri", "Uttaradit", "Tak", "Mae Sot", "Betong", "Krabi Town", "Chanthaburi", "Trat", "Loei", "Chaiyaphum", "Roi Et", "Sisaket", "Yasothon", "Kalasin"],
+    "turkey":      ["Sivas", "Malatya", "Nevsehir", "Aksaray", "Kastamonu", "Tokat", "Nigde", "Corum", "Kirsehir", "Yozgat", "Usak", "Isparta", "Burdur", "Aydin", "Manisa", "Balikesir", "Tekirdag", "Edirne"],
+    "vietnam":     ["Bac Ha", "Moc Chau", "Con Dao", "Hoa Lu", "Tam Coc", "Sam Son", "Cua Lo", "Dien Bien Phu", "Ninh Binh City", "Ha Tien", "Chau Doc Market", "Sa Dec", "Vinh Long", "Tra Vinh", "Bao Loc", "Gia Nghia", "Tam Ky", "Dong Ha"],
+    "egypt":       ["Damietta", "Minya", "Beni Suef", "Qena", "Zagazig", "Kom Ombo", "Edfu", "Rosetta", "Taba", "Ras Sedr", "Safaga", "Quseir", "Assiut", "Bawiti", "Farafra", "Marsa Matruh", "El Alamein", "Ain Sokhna"],
+    "morocco":     ["Nador", "Oujda", "Beni Mellal", "Taroudant", "Zagora", "Tinghir", "Midelt", "Larache", "Kenitra", "Khenifra", "Errachidia", "Sidi Ifni", "Mirleft", "Imlil", "Ait Benhaddou", "Skoura", "Tafraoute", "Moulay Idriss"],
+    "mexico":      ["Puebla", "Durango", "Chihuahua", "Colima", "Tepoztlan", "Tequila", "Cholula", "Izamal", "Palenque", "Chetumal", "Loreto", "Ensenada", "Cuetzalan", "Real de Catorce", "Huatulco", "Zihuatanejo", "Ixtapa", "Cozumel"],
+    "colombia":    ["Minca", "San Gil", "Barichara", "Cocora", "Nabusimake", "Tolu", "Melgar", "Ubate", "Chia", "Cajica", "Pance", "Guaduas", "Ocana", "Girardota", "Andres", "Chinacota", "Aguachica", "Ciudad Bolivar"],
+    "brazil":      ["Torres", "Garopaba", "Bombinhas", "Canela", "Balneario Camboriu", "Maragogi", "Canoa Quebrada", "Sao Miguel dos Milagres", "Barra Grande", "Aracaju", "Cuiaba", "Campo Grande", "Teresina", "Joinville", "Blumenau", "Diamantina", "Capitolio", "Brotas"],
+    "argentina":   ["Villa General Belgrano", "Cachi", "Humahuaca", "Chos Malal", "Las Grutas", "Villa Gesell", "Necochea", "Tandil", "Concordia", "Gualeguaychu", "Trelew", "Villa Carlos Paz", "Merlo", "Esquel", "Rio Gallegos", "Posadas", "Corrientes", "Santa Fe"],
+    "china":       ["Chengde", "Datong", "Pingyao", "Luoyang", "Zhengzhou", "Jinan", "Wuxi", "Yantai", "Weihai", "Jiuzhaigou", "Emeishan", "Zhangye", "Dunhuang", "Turpan", "Kashgar", "Zhouzhuang", "Wuzhen", "Tongli"],
+    "russia":      ["Suzdal", "Vladimir", "Pskov", "Veliky Novgorod", "Murmansk", "Vologda", "Kostroma", "Ryazan", "Kaluga", "Petrozavodsk", "Arkhangelsk", "Ulan-Ude", "Khabarovsk", "Astrakhan", "Tomsk", "Barnaul", "Kemerovo", "Smolensk"],
+    "south_korea": ["Boseong", "Damyang", "Gyeongsan", "Yangyang", "Gapyeong", "Namhae", "Geoje", "Hongseong", "Buyeo", "Gongju", "Gunsan", "Jecheon", "Wonju", "Uljin", "Yeongju", "Mungyeong", "Hadong", "Goseong"],
+    },
+    # r5: deep reserve tier 2 — further fresh cities. No overlap with that country's r2, r3, r4, or
+    # generator round-1 cities[0:10]. Exhausting r5 with zero files means the country's defined pools are
+    # spent and the autofuel script should alert to author r6+ cities.
+    "r5": {
+    "germany":     ["Passau", "Lindau", "Fussen", "Baden-Baden", "Tubingen", "Marburg", "Schwerin", "Flensburg", "Gorlitz", "Quedlinburg", "Goslar", "Wismar", "Stralsund", "Meissen", "Weimar", "Bremerhaven", "Cottbus", "Zwickau"],
+    "india":       ["Kanyakumari", "Rameswaram", "Tirunelveli", "Vellore", "Thanjavur", "Ajmer", "Chittorgarh", "Bundi", "Mandawa", "Orchha", "Gwalior", "Nashik", "Aurangabad", "Kolhapur", "Vadodara", "Rajkot", "Dehradun", "Mussoorie"],
+    "indonesia":   ["Wonosari", "Magelang", "Salatiga", "Pematangsiantar", "Palu", "Kendari", "Gorontalo", "Jayapura", "Sorong", "Manokwari", "Mataram", "Praya", "Ende", "Maumere", "Ruteng", "Bajawa", "Waingapu", "Atambua"],
+    "italy":       ["Ragusa Ibla", "Agrigento", "Trapani", "Marsala", "Enna", "Caltanissetta", "Reggio Calabria", "Cosenza", "Catanzaro", "Crotone", "Potenza", "Campobasso", "Isernia", "Teramo", "Pescara", "Chieti", "L'Aquila", "Frosinone"],
+    "japan":       ["Kurume", "Saga", "Sasebo", "Nobeoka", "Kirishima", "Amami", "Shimonoseki", "Iwakuni", "Tsuwano", "Hagi", "Izumo", "Matsue", "Kurayoshi", "Maizuru", "Toba", "Suzuka", "Owase", "Shingu"],
+    "philippines": ["Batanes", "Basco", "Currimao", "Pagudpud", "San Fernando La Union", "Baler", "Infanta", "Real", "Mati", "Surigao", "Butuan City", "Ozamiz", "Pagadian", "Cotabato", "Marbel", "Kidapawan", "Digos", "Tandag"],
+    "portugal":    ["Vila do Conde", "Povoa de Varzim", "Barcelos", "Ponte de Lima", "Melgaco", "Miranda do Douro", "Almeida", "Sabugal", "Serpa", "Moura", "Mertola", "Odemira", "Aljezur", "Vila Real de Santo Antonio", "Grandola", "Alcacer do Sal", "Palmela", "Torres Vedras"],
+    "spain":       ["Vitoria-Gasteiz", "Huesca", "Ferrol", "Manresa", "Vic", "Figueres", "Cadaques", "Mojacar", "Ubeda", "Baeza", "Antequera", "Estepona", "Fuengirola", "Torremolinos", "Denia", "Javea", "Calpe", "Peniscola"],
+    "thailand":    ["Nakhon Sawan", "Uthai Thani", "Kanchanaburi Town", "Saraburi", "Nakhon Nayok", "Prachin Buri", "Sa Kaeo", "Samut Songkhram", "Samut Sakhon", "Phatthalung", "Yala", "Narathiwat", "Pattani", "Phang Nga", "Krabi Beach", "Phanom Rung", "Mukdahan", "Nakhon Phanom"],
+    "turkey":      ["Sapanca", "Abant", "Uzungol", "Amasra", "Bartin", "Zonguldak", "Duzce", "Sakarya", "Kocaeli", "Yalova", "Bilecik", "Kutahya Town", "Corum City", "Cankiri", "Karabuk", "Bayburt", "Gumushane", "Artvin"],
+    "vietnam":     ["Ninh Thuan Beach", "Bao Loc Falls", "Buon Ho", "Dak Nong", "Kbang", "An Khe", "Song Cau", "La Gi", "Ham Tan", "Cam Ranh", "Dien Khanh", "Thap Cham", "Phan Rang", "Duc Trong", "Di Linh", "Lam Ha", "Cat Tien", "Gia Lai"],
+    "egypt":       ["Baltim", "Damanhur", "Kafr El Sheikh", "Abydos", "Dendera", "Rashid", "Idfu", "Esna", "Armant", "Nag Hammadi", "Girga", "Akhmim", "Bilbeis", "Banha", "Shibin El Kom", "Desouk", "Kafr El Dawwar", "Talkha"],
+    "morocco":     ["Ouzoud", "Fnideq", "Al Hoceima", "Safi", "Settat", "Berkane", "Guelmim", "Tan-Tan", "Laayoune", "Smara", "Ksar el-Kebir", "Sefrou", "Taza", "Khemisset", "Sidi Kacem", "Ben Guerir", "Youssoufia", "Berrechid"],
+    "mexico":      ["Tepic", "Saltillo", "Hermosillo", "Ciudad Victoria", "Tlaxcala", "Comitan", "Tapachula", "Valle de Bravo", "Malinalco", "Bernal", "Mineral del Chico", "Creel", "Batopilas", "Alamos", "Patzcuaro", "Uruapan", "Tequisquiapan", "Xilitla"],
+    "colombia":    ["Amalfi", "Sonson", "Aguadas", "Salamina", "Concepcion", "Envigado", "Sabaneta", "La Ceja", "Retiro", "Marinilla", "Rionegro", "Carmen de Viboral", "Santa Fe de Antioquia", "Guarne", "Tamesis", "Fredonia", "Concordia Antioquia", "Betulia"],
+    "brazil":      ["Socorro", "Serra Negra", "Aguas de Lindoia", "Holambra", "Sao Roque", "Atibaia", "Ibitipoca", "Conservatoria", "Penedo", "Visconde de Maua", "Sana", "Nova Friburgo", "Teresopolis", "Domingos Martins", "Venda Nova", "Pomerode", "Nova Petropolis", "Bento Goncalves"],
+    "argentina":   ["Reconquista", "Villa Union", "Chilecito", "Belen", "Andalgala", "Tafi del Valle", "Amaicha del Valle", "Molinos", "Angastaco", "Seclantas", "El Bolson", "Lago Puelo", "Cholila", "Trevelin", "Gaiman", "Rawson", "Viedma", "Carmen de Patagones"],
+    "china":       ["Yangzhou", "Zhenjiang", "Nantong", "Changzhou", "Xuzhou", "Fuzhou", "Quanzhou", "Zhuhai", "Foshan", "Zhaoqing", "Yichang", "Enshi", "Fenghuang", "Kaili", "Anshun", "Libo", "Xingyi", "Beihai"],
+    "russia":      ["Cheboksary", "Izhevsk", "Kirov", "Penza", "Orenburg", "Tolyatti", "Ivanovo", "Bryansk", "Kursk", "Belgorod", "Lipetsk", "Tambov", "Vladikavkaz", "Nalchik", "Pyatigorsk", "Grozny", "Makhachkala", "Cherepovets"],
+    "south_korea": ["Sacheon", "Miryang", "Yeongcheon", "Sangju", "Gimcheon", "Yeongju City", "Yeongyang", "Bonghwa", "Uljin Beach", "Yeonggwang", "Wando", "Jindo", "Haenam", "Gangjin", "Jangheung", "Boryeong", "Seosan", "Taean"],
     },
 }
 
