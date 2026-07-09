@@ -88,6 +88,7 @@ NEW_CITIES_BY_ROUND = {
     },
     # r3: fresh tertiary cities — none repeat that country's r2 list above or the generator's round-1 cities[0:10]
     "r3": {
+    "ecuador":     ["Santo Domingo", "Portoviejo", "Duran", "Milagro", "Quevedo", "Babahoyo", "Sangolqui", "Guaranda", "Azogues", "Macas", "Zamora", "Tulcan", "Cayambe", "Jipijapa", "Chone", "Bahia de Caraquez", "Gualaquiza", "Puyango"],
     "germany":     ["Aachen", "Kiel", "Lubeck", "Rostock", "Erfurt", "Wurzburg", "Bamberg", "Trier", "Koblenz", "Ulm", "Braunschweig", "Kassel", "Dortmund", "Essen", "Mannheim", "Potsdam", "Gottingen", "Bayreuth"],
     "india":       ["Chennai", "Bangalore", "Chandigarh", "Lucknow", "Indore", "Bhopal", "Nagpur", "Surat", "Coimbatore", "Madurai", "Jaisalmer", "Pushkar", "Manali", "Dharamshala", "Leh", "Hampi", "Alleppey", "Varkala"],
     "indonesia":   ["Sanur", "Uluwatu", "Nusa Dua", "Nusa Penida", "Kuta Lombok", "Senggigi", "Palembang", "Pekanbaru", "Pontianak", "Samarinda", "Denpasar", "Batu", "Cirebon", "Bukittinggi", "Lake Toba", "Ternate", "Ambon", "Kupang"],

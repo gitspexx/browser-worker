@@ -146,12 +146,25 @@ foreach ($country in $rotation) {
 $days = [math]::Round($totalPending / $FILES_PER_DAY, 1)
 L "summary: totalPending=$totalPending across $($rotation.Count) countries ~= ${days}d fuel; toppedUp=$($toppedUp.Count) exhausted=$($exhausted.Count) addedFiles=$addedFiles"
 
+# ---------- exhausted-alert dedupe: only alert on NEWLY exhausted countries ----------
+$stateDir = 'C:\worker\state'
+$exStateFile = Join-Path $stateDir 'autofuel-exhausted.json'
+$priorExhausted = @()
+if (Test-Path $exStateFile) {
+    try { $priorExhausted = @(Get-Content $exStateFile -Raw | ConvertFrom-Json) } catch { $priorExhausted = @() }
+}
+$newExhausted = @($exhausted | Where-Object { $priorExhausted -notcontains $_ })
+# persist current set; refueled countries drop off so they can re-alert if they exhaust again later
+if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+try { ,@($exhausted) | ConvertTo-Json -Compress | Set-Content -Path $exStateFile -Encoding ASCII } catch { L "warn: could not write $exStateFile" }
+if ($exhausted.Count -gt 0 -and $newExhausted.Count -eq 0) { L "exhausted unchanged ($($exhausted -join ', ')) - already alerted, suppressing repeat" }
+
 # ---------- one Slack summary ----------
 $topList = ($toppedUp | Select-Object -Unique) -join ', '
-$exList  = ($exhausted | Select-Object -Unique) -join ', '
+$newExList = ($newExhausted | Select-Object -Unique) -join ', '
 $msg = $null
-if ($exhausted.Count -gt 0) {
-    $msg = ":rotating_light: *Botsol fuel: $($exhausted.Count) countries exhausted defined city pools - author new r6+ cities* ($exList). Total ~${days}d left."
+if ($newExhausted.Count -gt 0) {
+    $msg = ":rotating_light: *Botsol fuel: $($newExhausted.Count) newly-exhausted countries - author new cities* ($newExList). Total ~${days}d left."
 } elseif ($days -lt 5) {
     $tu = if ($topList) { $topList } else { 'none' }
     $msg = ":warning: *Botsol fuel low*: ~${days}d ($totalPending files). Topped up: $tu."
