@@ -66,7 +66,7 @@ if(Test-Path $pend){
         # alerts exactly once) instead of silently deleting it. 45.5h outage on 2026-07-06 started here.
         try{ Move-Item $pend "$pend.gaveup" -Force }catch{ Remove-Item $pend -Force }
         L "re-queue ${rqcat}: gave up after ${age}min -> marker renamed to requeue-pending.txt.gaveup + DANGER alert"
-        PostDanger(":rotating_light: *DANGER: Botsol re-queue ABANDONED* on $env:COMPUTERNAME -- '${rqcat}' could not be re-queued after $([int]$age)min (done-file never appeared). Auto-restart will NOT retry it. Marker kept at C:\worker\requeue-pending.txt.gaveup -- manual attention needed: re-queue the category by hand in C:\Botsol\pipeline\keywords_v2.")
+        PostDanger(":rotating_light: *DANGER: BOTSOL RE-QUEUE ABANDONED* on $env:COMPUTERNAME -- '${rqcat}' could not be re-queued after $([int]$age)min (done-file never appeared). Auto-restart will NOT retry it. Marker kept at C:\worker\requeue-pending.txt.gaveup -- manual attention needed: re-queue the category by hand in C:\Botsol\pipeline\keywords_v2.")
       }
     }
   } else { Remove-Item $pend -Force }

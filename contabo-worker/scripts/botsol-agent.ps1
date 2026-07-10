@@ -1388,7 +1388,7 @@ try {
                                 if (Test-Path $src) { Move-Item -LiteralPath $src -Destination (Join-Path $sk ([string]$state.current_source_file)) -Force }
                             } catch {}
                             Write-Log "HUNG: $hkey hung $att times -> moved to skipped/ (partial salvaged); queue will progress past it" 'warn'
-                            Post-Slack (":no_entry: *Botsol gave up on* ``$hkey`` after $att hangs (partial leads salvaged + ingested). Moved to skipped so the queue continues. :point_right: restart BotsolApp -> click bot + Select to resume with the NEXT category.")
+                            Post-Slack (":no_entry: *BOTSOL GAVE UP ON* ``$hkey`` after $att hangs (partial leads salvaged + ingested). Moved to skipped so the queue continues. :point_right: restart BotsolApp -> click bot + Select to resume with the NEXT category.")
                         } else {
                             Write-Log "HUNG: $hkey attempt $att of 3 -> left PENDING for re-scrape after restart"
                             Post-Slack (":rotating_light: *BOTSOL STUCK - MANUAL RESTART NEEDED* on $env:COMPUTERNAME. ``$hkey`` froze (~$mins min; scraper Chrome died) - attempt $att of 3. Loaded rows salvaged; it re-scrapes after restart. :point_right: RDP into 66.70.134.73 -> relaunch BotsolApp -> click bot + Select. (Agent will NOT touch Stop.)")
@@ -1459,7 +1459,7 @@ try {
                             error  = "extract script not found: $EXTRACT_SCRIPT"
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol SQLite extract script missing for $country/$srcFile"
+                    Post-Slack ":x: BOTSOL SQLITE EXTRACT SCRIPT MISSING for $country/$srcFile"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "extract script missing"
                     exit 0
                 }
@@ -1478,7 +1478,7 @@ try {
                             error  = "sqlite extract exit=$($proc.ExitCode)"
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol SQLite extract failed for $country/$srcFile (exit=$($proc.ExitCode))"
+                    Post-Slack ":x: BOTSOL SQLITE EXTRACT FAILED for $country/$srcFile (exit=$($proc.ExitCode))"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "sqlite extract failed"
                     exit 0
                 }
@@ -1493,7 +1493,7 @@ try {
                             error  = 'invoke export failed'
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol export click failed for $country/$srcFile"
+                    Post-Slack ":x: BOTSOL EXPORT CLICK FAILED for $country/$srcFile"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "export click failed"
                     exit 0
                 }
@@ -1507,7 +1507,7 @@ try {
                             error  = 'save dialog timeout'
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol save dialog timeout for $country/$srcFile"
+                    Post-Slack ":x: BOTSOL SAVE DIALOG TIMEOUT for $country/$srcFile"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "save dialog timeout"
                     exit 0
                 }
@@ -1521,7 +1521,7 @@ try {
                             error  = 'set filename failed'
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol set filename failed for $country/$srcFile"
+                    Post-Slack ":x: BOTSOL SET FILENAME FAILED for $country/$srcFile"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "set filename failed"
                     exit 0
                 }
@@ -1535,7 +1535,7 @@ try {
                             error  = 'click save failed'
                         } | Out-Null
                     }
-                    Post-Slack ":x: Botsol click Save failed for $country/$srcFile"
+                    Post-Slack ":x: BOTSOL CLICK SAVE FAILED for $country/$srcFile"
                     Abandon-CurrentRun -country $country -srcFile $srcFile -reason "click save failed"
                     exit 0
                 }
@@ -1574,7 +1574,7 @@ try {
                         error  = 'output file missing or too small'
                     } | Out-Null
                 }
-                Post-Slack ":x: Botsol export produced no usable file: $country/$srcFile"
+                Post-Slack ":x: BOTSOL EXPORT PRODUCED NO USABLE FILE: $country/$srcFile"
                 Abandon-CurrentRun -country $country -srcFile $srcFile -reason "export no usable file"
                 exit 0
             }
@@ -1710,7 +1710,7 @@ try {
                         error  = 'invoke start failed'
                     } | Out-Null
                 }
-                Post-Slack ":x: Botsol Start click failed"
+                Post-Slack ":x: BOTSOL START CLICK FAILED"
                 exit 0
             }
 
@@ -1730,7 +1730,7 @@ try {
                 if ($jobId) {
                     Update-ScrapeJob -Id $jobId -Patch @{ status='failed'; error='prompt1 failed' } | Out-Null
                 }
-                Post-Slack ":x: Botsol prompt1 (result cap) failed for $($next.Country)/$($next.Stem)"
+                Post-Slack ":x: BOTSOL PROMPT1 (RESULT CAP) FAILED for $($next.Country)/$($next.Stem)"
                 exit 0
             }
             if (-not (Handle-NumericPrompt -Value $KEYWORD_LIMIT -TimeoutSec 30 -Tag 'prompt2_keyword_limit')) {
@@ -1738,7 +1738,7 @@ try {
                 if ($jobId) {
                     Update-ScrapeJob -Id $jobId -Patch @{ status='failed'; error='prompt2 failed' } | Out-Null
                 }
-                Post-Slack ":x: Botsol prompt2 (delay) failed for $($next.Country)/$($next.Stem)"
+                Post-Slack ":x: BOTSOL PROMPT2 (DELAY) FAILED for $($next.Country)/$($next.Stem)"
                 exit 0
             }
 
@@ -1759,7 +1759,7 @@ try {
                         error  = 'file-select dialog failed'
                     } | Out-Null
                 }
-                Post-Slack ":x: Botsol file-select failed for $($next.Country)/$($next.Stem)"
+                Post-Slack ":x: BOTSOL FILE-SELECT FAILED for $($next.Country)/$($next.Stem)"
 
                 # Consecutive-failure cap (2026-07-08 audit): one bad dialog used to wedge the
                 # pipeline for days (45.5h on egypt/eat_r2_1.txt) because the same file was
@@ -1782,7 +1782,7 @@ try {
                             Move-Item -LiteralPath $next.FullPath -Destination (Join-Path $quarDir $next.FileName) -Force
                         }
                         Write-Log "file-select failed $failCount consecutive times on $failKey -> moved to quarantine/ (queue continues with next file)" 'error'
-                        Post-Slack (":rotating_light: *DANGER: Botsol quarantined* ``$failKey`` after $failCount consecutive file-select failures. File moved to quarantine/; the queue continues with the next file. :point_right: inspect the file + BotsolApp dialogs on 66.70.134.73.")
+                        Post-Slack (":rotating_light: *DANGER: BOTSOL QUARANTINED* ``$failKey`` after $failCount consecutive file-select failures. File moved to quarantine/; the queue continues with the next file. :point_right: inspect the file + BotsolApp dialogs on 66.70.134.73.")
                     } catch {
                         Write-Log "quarantine move failed for $failKey : $($_.Exception.Message)" 'error'
                     }
@@ -1933,6 +1933,6 @@ try {
 } catch {
     $msg = $_.Exception.Message
     Write-Log "unhandled error: $msg" 'error'
-    try { Post-Slack ":x: botsol-agent unhandled error: $msg" } catch {}
+    try { Post-Slack ":x: BOTSOL-AGENT UNHANDLED ERROR: $msg" } catch {}
     exit 0
 }

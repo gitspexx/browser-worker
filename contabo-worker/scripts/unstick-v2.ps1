@@ -80,7 +80,7 @@ if(-not [Uv]::MapsAlive){
     if($canAlert){
       L "ESCALATE: stall persists with dead Chrome and NO auto-restart pending ($why) -> Slack alert"
       $wh=$null; foreach($e in (Get-Content 'C:\worker\orchestrator.env' -EA SilentlyContinue)){ if($e -match '^\s*SLACK_WEBHOOK\s*=\s*(.+?)\s*$'){ $wh=$Matches[1] } }
-      if($wh){ try{ Invoke-RestMethod -Uri $wh -Method Post -ContentType 'application/json' -TimeoutSec 12 -Body (@{text=(":rotating_light: *unstick-v2: stall with dead Chrome and NO auto-restart pending -- manual intervention needed* on $env:COMPUTERNAME. $cc frozen (ticks=$ticks), scraper Chrome window gone, $why. No self-heal will fire -- RDP in and restart BotsolApp.")}|ConvertTo-Json -Compress)|Out-Null }catch{} }
+      if($wh){ try{ Invoke-RestMethod -Uri $wh -Method Post -ContentType 'application/json' -TimeoutSec 12 -Body (@{text=(":rotating_light: *UNSTICK-V2: STALL WITH DEAD CHROME AND NO AUTO-RESTART PENDING -- MANUAL INTERVENTION NEEDED* on $env:COMPUTERNAME. $cc frozen (ticks=$ticks), scraper Chrome window gone, $why. No self-heal will fire -- RDP in and restart BotsolApp.")}|ConvertTo-Json -Compress)|Out-Null }catch{} }
       Set-Content $escStamp (Get-Date -Format o)
     } else {
       L "escalation suppressed (last dead-Chrome alert <60min ago)"

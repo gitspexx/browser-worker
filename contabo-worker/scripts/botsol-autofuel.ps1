@@ -164,7 +164,7 @@ $topList = ($toppedUp | Select-Object -Unique) -join ', '
 $newExList = ($newExhausted | Select-Object -Unique) -join ', '
 $msg = $null
 if ($newExhausted.Count -gt 0) {
-    $msg = ":rotating_light: *Botsol fuel: $($newExhausted.Count) newly-exhausted countries - author new cities* ($newExList). Total ~${days}d left."
+    $msg = ":rotating_light: *BOTSOL FUEL: $($newExhausted.Count) NEWLY-EXHAUSTED COUNTRIES - AUTHOR NEW CITIES* ($newExList). Total ~${days}d left."
 } elseif ($days -lt 5) {
     $tu = if ($topList) { $topList } else { 'none' }
     $msg = ":warning: *Botsol fuel low*: ~${days}d ($totalPending files). Topped up: $tu."

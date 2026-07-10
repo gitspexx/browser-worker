@@ -110,7 +110,7 @@ if (-not $botsolProc) {
             Start-Sleep -Seconds 12   # let the window initialize before the UIA checks below
         } catch {
             Write-Log ("ERROR: failed to relaunch BotsolApp: {0}" -f $_.Exception.Message)
-            Post-Slack ":x: *BotsolApp down and watchdog relaunch FAILED* on $env:COMPUTERNAME — needs manual RDP launch."
+            Post-Slack ":x: *BOTSOLAPP DOWN AND WATCHDOG RELAUNCH FAILED* on $env:COMPUTERNAME — needs manual RDP launch."
         }
     } else {
         Write-Log "ERROR: BotsolApp not running and exe missing at $BotsolExe"
@@ -130,7 +130,7 @@ if (-not $botsolProc) {
         $pidStreak = $pidStreak + 1
         Write-Log ("BotsolApp PID changed ({0} -> {1}); consecutive-change streak={2}" -f $lastBotsolPid, $curBotsolPid, $pidStreak)
         if ($pidStreak -eq 4) {
-            Post-Slack (":rotating_light: *Botsol CRASH-LOOPING* on $env:COMPUTERNAME: PID changed on $pidStreak consecutive checks — BotsolApp keeps dying and restarting, no scraping is happening. Manual attention needed.")
+            Post-Slack (":rotating_light: *BOTSOL CRASH-LOOPING* on $env:COMPUTERNAME: PID changed on $pidStreak consecutive checks — BotsolApp keeps dying and restarting, no scraping is happening. Manual attention needed.")
         }
     } else {
         if ($pidStreak -gt 0) { Write-Log ("BotsolApp PID stable ({0}); crash-loop streak reset (was {1})" -f $curBotsolPid, $pidStreak) }
@@ -321,7 +321,7 @@ if (($now - $lastHb) -ge $HeartbeatIntervalSec) {
     $arcAgeH = -1
     if ($newestArc) { $arcAgeH = [math]::Round(((Get-Date) - $newestArc.LastWriteTime).TotalHours, 1) }
     if ($newestArc -and $arcAgeH -ge 3) {
-        Post-Slack (":rotating_light: *Botsol STALLED* on $env:COMPUTERNAME: no archived CSV since $($newestArc.LastWriteTime.ToString('yyyy-MM-dd HH:mm')) (${arcAgeH}h ago) — output pipeline dead. Currently reported: $cur, $pendingCount categories left in queue.")
+        Post-Slack (":rotating_light: *BOTSOL STALLED* on $env:COMPUTERNAME: no archived CSV since $($newestArc.LastWriteTime.ToString('yyyy-MM-dd HH:mm')) (${arcAgeH}h ago) — output pipeline dead. Currently reported: $cur, $pendingCount categories left in queue.")
         Write-Log "heartbeat suppressed: archive stale ${arcAgeH}h (newest: $($newestArc.Name)) — posted STALLED alert instead"
     } else {
         Post-Slack $hbMsg
