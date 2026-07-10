@@ -16,6 +16,21 @@ const exec = promisify(execCb);
 // When absent in dev, auth is bypassed with a warning.
 const ADS = process.env.ADS_URL ?? 'http://127.0.0.1:50325';
 const OUT = process.env.SCREENSHOT_DIR ?? 'C:\\worker\\screenshots';
+
+// AdsPower Local API is capped at ~1 request/sec. Serialize EVERY AdsPower
+// call through one gate with >=1.1s spacing, so overlapping fb-pool tasks
+// (discover + join + comment-scan all driving profiles) never trip
+// "Too many request per second" — the top cause of BR join failures.
+let _adsLast = 0;
+let _adsQueue = Promise.resolve();
+function _adsGate() {
+  _adsQueue = _adsQueue.then(async () => {
+    const wait = 1100 - (Date.now() - _adsLast);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    _adsLast = Date.now();
+  });
+  return _adsQueue;
+}
 const PORT = Number(process.env.PORT ?? 7070);
 
 const TOKEN_ENV = process.env.WORKER_TOKENS ?? '';
@@ -49,6 +64,7 @@ function auth(requiredRole = null) {
 
 // ── AdsPower helpers ────────────────────────────────────────────────────────
 async function ads(pathname) {
+  await _adsGate();
   const r = await fetch(ADS + pathname);
   const j = await r.json();
   if (j.code !== 0) throw new Error('AdsPower: ' + j.msg);
@@ -5217,6 +5233,7 @@ const FB_POST_BUTTON_SELECTORS = [
   'span:has-text("Post")',
 ];
 async function fbPostAds(pathname) {
+  await _adsGate();
   const r = await fetch(`${ADS}${pathname}`);
   const j = await r.json();
   if (j.code !== 0) throw new Error(`adspower ${pathname}: ${j.msg}`);
