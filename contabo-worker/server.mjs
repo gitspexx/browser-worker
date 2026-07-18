@@ -1574,36 +1574,50 @@ const handlers = {
         const b = page.locator(`button:has-text("${t}")`).first();
         if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(1200); break; }
       }
+      // Number is a HOVER reveal (tooltip/title), not just a click. Grab checks
+      // tel/wa links, tooltip text, title/aria-label attrs, and body text.
       const grab = async () => page.evaluate(() => {
+        const phoneRe = /\+[0-9][0-9 ()\-]{7,16}[0-9]/;
         const telHref = ([...document.querySelectorAll('a')].find(a => (a.href || '').startsWith('tel:')) || {}).href || null;
         const waHref = ([...document.querySelectorAll('a')].find(a => /wa\.me|whatsapp\.com\/send/i.test(a.href || '')) || {}).href || null;
-        const num = (document.body.innerText.match(/\+[0-9][0-9 ()\-]{7,16}[0-9]/) || [])[0] || null;
-        return { telHref, waHref, num };
+        let attr = null;
+        for (const el of document.querySelectorAll('[title],[aria-label],[data-tooltip]')) {
+          const v = el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || '';
+          const m = v.match(phoneRe); if (m) { attr = m[0]; break; }
+        }
+        const tip = ([...document.querySelectorAll('[role="tooltip"],.tooltip')].map(t => t.textContent || '').join(' ').match(phoneRe) || [])[0] || null;
+        const body = (document.body.innerText.match(phoneRe) || [])[0] || null;
+        return { telHref, waHref, num: attr || tip || body };
       }).catch(() => ({}));
-      // Open the contact panel. getByRole('button') is precise (:has-text can
-      // match the heading). Text is localised by the profile geo (BR => PT).
+      // Open the contact panel. getByRole('button') is precise; text is localised
+      // by the profile geo (BR => "Ver opções de contato").
       const open = page.getByRole('button', { name: /contato|contact|contacto|kontakt|contatto/i }).first();
       if (await open.count().catch(() => 0)) {
         await open.scrollIntoViewIfNeeded().catch(() => {});
         await open.click({ timeout: 4000, force: true }).catch(() => {});
         await page.waitForTimeout(4000);
       }
-      const subSel = ['call', 'ligar', 'chamar', 'llamar', 'message', 'mensagem', 'mensaje', 'whatsapp', 'phone', 'telefone', 'number']
-        .flatMap(s => [`button:has-text("${s}")`, `a:has-text("${s}")`]).join(', ');
-      const subs = page.locator(subSel);
-      const n = Math.min(await subs.count().catch(() => 0), 3);
-      for (let k = 0; k < n; k++) {
-        const sc = subs.nth(k);
-        const href = await sc.getAttribute('href').catch(() => null);
-        if (href && (href.startsWith('tel:') || /wa\.me|whatsapp/i.test(href))) continue;
-        await sc.click({ timeout: 2500 }).catch(() => {});
-        await page.waitForTimeout(2000);
+      // Hover the call/message/phone actions — the number renders on hover.
+      const actSel = ['call', 'ligar', 'chamar', 'llamar', 'message', 'mensagem', 'mensaje', 'whatsapp', 'phone', 'telefone', 'number', 'fornecedor', 'provider']
+        .flatMap(s => [`button:has-text("${s}")`, `a:has-text("${s}")`, `[role="button"]:has-text("${s}")`]).join(', ');
+      const acts = page.locator(actSel);
+      const n = Math.min(await acts.count().catch(() => 0), 4);
+      let cc = await grab();
+      for (let k = 0; k < n && !(cc.telHref || cc.waHref || cc.num); k++) {
+        const el = acts.nth(k);
+        const href = await el.getAttribute('href').catch(() => null);
+        if (href && (href.startsWith('tel:') || /wa\.me|whatsapp/i.test(href))) { cc = await grab(); break; }
+        await el.hover({ timeout: 2500 }).catch(() => {});
+        await page.waitForTimeout(1500);
+        cc = await grab();
+        if (cc.telHref || cc.waHref || cc.num) break;
+        await el.click({ timeout: 2500 }).catch(() => {});
+        await page.waitForTimeout(1800);
+        cc = await grab();
       }
-      // NOTE: GYG gates the operator phone/WhatsApp behind a logged-in GYG
-      // account — automated (no login) the panel opens but the number never
-      // renders, so these stay null. Operator name + supplier page are the
-      // reliable outputs; enrich contact via IG/email downstream.
-      const cc = await grab();
+      // NOTE: on a residential IP (CF passes) the hover reveals the number; on a
+      // blocked IP the panel/tooltip never renders → stays null. Verify with a
+      // WhatsApp check downstream before trusting as a WA number.
       result.phone = cc.telHref ? cc.telHref.replace('tel:', '') : (cc.num || null);
       result.whatsapp = cc.waHref || null;
     }
