@@ -1567,23 +1567,45 @@ const handlers = {
 
     if (revealContact && prov.supplierUrl) {
       await page.goto(prov.supplierUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await page.waitForTimeout(3500);
-      const open = page.locator('button:has-text("View contact options"), button:has-text("Contact options"), button:has-text("Contact")').first();
-      if (await open.count().catch(() => 0)) { await open.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(3000); }
-      for (const t of ['Call your activity provider', 'Message your activity provider', 'Show number', 'Show phone number']) {
-        const c = page.locator(`a:has-text("${t}"), button:has-text("${t}")`).first();
-        if (await c.count().catch(() => 0)) { await c.click({ timeout: 2500 }).catch(() => {}); await page.waitForTimeout(2500); }
+      await page.waitForTimeout(4000);
+      // The supplier page shows its own cookie-consent modal that overlays and
+      // blocks the contact button — dismiss it first (language-agnostic).
+      for (const t of ['Accept and continue', 'Aceitar e continuar', 'Accept all', 'Aceitar tudo', 'Concordo', 'Aceptar', 'Akzeptieren', 'Accetta', 'Accept', 'Aceitar', 'OK']) {
+        const b = page.locator(`button:has-text("${t}")`).first();
+        if (await b.count().catch(() => 0)) { await b.click({ timeout: 2000 }).catch(() => {}); await page.waitForTimeout(1200); break; }
       }
-      const contact = await page.evaluate(() => {
-        const html = document.documentElement.innerHTML;
+      const grab = async () => page.evaluate(() => {
         const telHref = ([...document.querySelectorAll('a')].find(a => (a.href || '').startsWith('tel:')) || {}).href || null;
         const waHref = ([...document.querySelectorAll('a')].find(a => /wa\.me|whatsapp\.com\/send/i.test(a.href || '')) || {}).href || null;
-        const wa = waHref || (html.match(/wa\.me\/\+?\d+|whatsapp\.com\/send\?phone=\+?\d+/i) || [])[0] || null;
-        const tel = telHref ? telHref.replace('tel:', '') : (document.body.innerText.match(/\+[0-9][0-9 ()\-]{7,16}[0-9]/) || [])[0] || null;
-        return { phone: tel, whatsapp: wa };
-      });
-      result.phone = contact.phone;
-      result.whatsapp = contact.whatsapp;
+        const num = (document.body.innerText.match(/\+[0-9][0-9 ()\-]{7,16}[0-9]/) || [])[0] || null;
+        return { telHref, waHref, num };
+      }).catch(() => ({}));
+      // Open the contact panel. getByRole('button') is precise (:has-text can
+      // match the heading). Text is localised by the profile geo (BR => PT).
+      const open = page.getByRole('button', { name: /contato|contact|contacto|kontakt|contatto/i }).first();
+      if (await open.count().catch(() => 0)) {
+        await open.scrollIntoViewIfNeeded().catch(() => {});
+        await open.click({ timeout: 4000, force: true }).catch(() => {});
+        await page.waitForTimeout(4000);
+      }
+      const subSel = ['call', 'ligar', 'chamar', 'llamar', 'message', 'mensagem', 'mensaje', 'whatsapp', 'phone', 'telefone', 'number']
+        .flatMap(s => [`button:has-text("${s}")`, `a:has-text("${s}")`]).join(', ');
+      const subs = page.locator(subSel);
+      const n = Math.min(await subs.count().catch(() => 0), 3);
+      for (let k = 0; k < n; k++) {
+        const sc = subs.nth(k);
+        const href = await sc.getAttribute('href').catch(() => null);
+        if (href && (href.startsWith('tel:') || /wa\.me|whatsapp/i.test(href))) continue;
+        await sc.click({ timeout: 2500 }).catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+      // NOTE: GYG gates the operator phone/WhatsApp behind a logged-in GYG
+      // account — automated (no login) the panel opens but the number never
+      // renders, so these stay null. Operator name + supplier page are the
+      // reliable outputs; enrich contact via IG/email downstream.
+      const cc = await grab();
+      result.phone = cc.telHref ? cc.telHref.replace('tel:', '') : (cc.num || null);
+      result.whatsapp = cc.waHref || null;
     }
 
     if (!result.operator) {
