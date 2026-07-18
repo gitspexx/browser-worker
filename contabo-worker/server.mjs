@@ -1539,6 +1539,62 @@ const handlers = {
     result.preview = shot; result.done = result.bio_set || result.pic_set;
     return result;
   },
+  // GYG Stage-2: open a GetYourGuide product page in a real (AdsPower) browser —
+  // which the listing scrape can't do — read the operator + supplier page, then
+  // reveal the operator's phone/WhatsApp behind the Cloudflare-gated contact
+  // flow. Returns { operator, supplierUrl, phone, whatsapp }.
+  async gyg_operator(page, { productUrl, revealContact = true }) {
+    const url = String(productUrl || '').trim();
+    if (!url) throw new Error('productUrl required');
+    await page.setViewportSize({ width: 1366, height: 900 }).catch(() => {});
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(4000);
+    for (const t of ['Accept all', 'Accept', 'Allow all', 'Agree', 'OK', 'Got it']) {
+      const b = page.locator(`button:has-text("${t}")`).first();
+      if (await b.count().catch(() => 0)) { await b.click({ timeout: 1500 }).catch(() => {}); break; }
+    }
+    // Cloudflare interstitial — with a real AdsPower fingerprint it usually
+    // auto-clears; give it a beat.
+    if (/just a moment|attention required|checking your browser/i.test(await page.title().catch(() => ''))) {
+      await page.waitForTimeout(7000);
+    }
+    // Operator name + supplier page link (/…-sNNNNN/) — only present after JS hydration.
+    const prov = await page.evaluate(() => {
+      const a = [...document.querySelectorAll('a')].find(x => /-s\d{4,}\/?($|\?)/.test(x.getAttribute('href') || '') || /-s\d{4,}\//.test(x.href || ''));
+      return { operator: a ? (a.textContent || '').trim().slice(0, 80) : null, supplierUrl: a ? a.href : null };
+    });
+    const result = { portal: 'gyg_operator', done: true, url, operator: prov.operator, supplierUrl: prov.supplierUrl, phone: null, whatsapp: null };
+
+    if (revealContact && prov.supplierUrl) {
+      await page.goto(prov.supplierUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(3500);
+      const open = page.locator('button:has-text("View contact options"), button:has-text("Contact options"), button:has-text("Contact")').first();
+      if (await open.count().catch(() => 0)) { await open.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(3000); }
+      for (const t of ['Call your activity provider', 'Message your activity provider', 'Show number', 'Show phone number']) {
+        const c = page.locator(`a:has-text("${t}"), button:has-text("${t}")`).first();
+        if (await c.count().catch(() => 0)) { await c.click({ timeout: 2500 }).catch(() => {}); await page.waitForTimeout(2500); }
+      }
+      const contact = await page.evaluate(() => {
+        const html = document.documentElement.innerHTML;
+        const telHref = ([...document.querySelectorAll('a')].find(a => (a.href || '').startsWith('tel:')) || {}).href || null;
+        const waHref = ([...document.querySelectorAll('a')].find(a => /wa\.me|whatsapp\.com\/send/i.test(a.href || '')) || {}).href || null;
+        const wa = waHref || (html.match(/wa\.me\/\+?\d+|whatsapp\.com\/send\?phone=\+?\d+/i) || [])[0] || null;
+        const tel = telHref ? telHref.replace('tel:', '') : (document.body.innerText.match(/\+[0-9][0-9 ()\-]{7,16}[0-9]/) || [])[0] || null;
+        return { phone: tel, whatsapp: wa };
+      });
+      result.phone = contact.phone;
+      result.whatsapp = contact.whatsapp;
+    }
+
+    if (!result.operator) {
+      result.done = false;
+      result.error = 'operator_not_found';
+      const fs = path.join(OUT, `gyg-fail-${Date.now()}.png`);
+      await page.screenshot({ path: fs }).catch(() => {});
+      result.preview = fs;
+    }
+    return result;
+  },
   async peek(page, { body, claimId }) {
     await page.goto('https://help.peek.com/hc/en-us/requests/new', { waitUntil: 'domcontentloaded' });
     await page.fill('#request_anonymous_requester_email', 'alex@specchio.xyz').catch(() => {});
