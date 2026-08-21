@@ -6096,7 +6096,17 @@ async function _fbGetPost(page, post_url) {
   // all and live in role=main. Never fall back to <body>: on Marketplace that
   // swallows the entire grid of ~20 unrelated listings -- a scooter, an
   // iPhone, three other villas -- and stores it as THIS listing's text.
-  const scope = (await page.$('div[role="article"]')) || (await page.$('div[role="main"]'));
+  // A group permalink renders SEVERAL role=article nodes: the composer, the
+  // post, and one per comment. page.$ returns the first, which is usually the
+  // empty composer -- and an empty scope reports empty_post on a post that
+  // rendered perfectly. Take the largest by text instead.
+  let scope = null;
+  let scopeLen = 0;
+  for (const a of await page.$$('div[role="article"]')) {
+    const len = await a.evaluate((e) => (e.innerText || '').length).catch(() => 0);
+    if (len > scopeLen) { scopeLen = len; scope = a; }
+  }
+  if (!scope) scope = await page.$('div[role="main"]');
   if (!scope) return { ok: false, error: 'no_post_container', url: canonical };
 
   const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
