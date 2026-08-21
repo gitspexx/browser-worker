@@ -6069,7 +6069,7 @@ async function _fbGetPost(page, post_url) {
   // through a rotating residential exit routinely takes longer than that, and
   // reading too early yields a blank body -- which the guards below correctly
   // but uselessly report as empty_post on a perfectly good listing.
-  await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
+  await page.waitForSelector('div[role="article"], div[role="main"]', { timeout: 25000 }).catch(() => {});
   await _fbSleep(1200);
 
   const canonical = page.url();
@@ -6079,30 +6079,25 @@ async function _fbGetPost(page, post_url) {
     try { await page.locator(sel).first().click({ timeout: 1500 }); await _fbSleep(600); } catch (e) {}
   }
 
-  // Fall back to <body>, NOT to `page`: page.evaluate(fn) calls fn with no
-  // argument, so `e.innerText` throws and the .catch() below turns a missing
-  // article into a silent empty post that looks like a successful scrape.
-  // Every downstream consumer (Kasa) then stores a listing with no text.
-  const art = (await page.$('div[role="article"]')) || (await page.$('body'));
-  const scope = art;
-
-  // A private group we have not joined renders the group landing page, not the
-  // post: no role=article, and the body is the join wall. Returning ok:true with
-  // that text would hand Kasa a listing whose raw_text is group boilerplate.
-  // Fail loudly instead, the same way auth_required does above.
-  const articleCount = (await page.$$('div[role="article"]')).length;
-  if (articleCount === 0) {
-    const wall = await page.evaluate(() => (document.body?.innerText || '').slice(0, 2000)).catch(() => '');
-    if (/\bJoin group\b|\bGabung ke [Gg]rup\b|Only members can see/i.test(wall)) {
-      return { ok: false, error: 'not_a_member', url: canonical };
-    }
-    // Deleted / audience-restricted posts render their own interstitial. It has
-    // real text (~250 chars), so the empty_post guard below never sees it and
-    // Kasa would store the error page as the listing body.
-    if (/content isn.{0,3}t available|Konten ini sedang tidak tersedia/i.test(wall)) {
-      return { ok: false, error: 'content_unavailable', url: canonical };
-    }
+  // Classify the pages Facebook serves INSTEAD of a post before picking a
+  // scope. A join wall has its own role=main, so scoping to it first would
+  // store the wall as the listing body.
+  const wall = await page.evaluate(() => (document.body?.innerText || '').slice(0, 2000)).catch(() => '');
+  if (/\bJoin group\b|\bGabung ke [Gg]rup\b|Only members can see/i.test(wall)) {
+    return { ok: false, error: 'not_a_member', url: canonical };
   }
+  // Deleted / audience-restricted posts render their own interstitial, ~250
+  // chars of real text, so the empty_post guard below never catches them.
+  if (/content isn.{0,3}t available|Konten ini sedang tidak tersedia/i.test(wall)) {
+    return { ok: false, error: 'content_unavailable', url: canonical };
+  }
+
+  // Group posts live in role=article. Marketplace items have no article at
+  // all and live in role=main. Never fall back to <body>: on Marketplace that
+  // swallows the entire grid of ~20 unrelated listings -- a scooter, an
+  // iPhone, three other villas -- and stores it as THIS listing's text.
+  const scope = (await page.$('div[role="article"]')) || (await page.$('div[role="main"]'));
+  if (!scope) return { ok: false, error: 'no_post_container', url: canonical };
 
   const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
 
