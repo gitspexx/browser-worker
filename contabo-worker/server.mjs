@@ -6096,16 +6096,30 @@ async function _fbGetPost(page, post_url) {
   // all and live in role=main. Never fall back to <body>: on Marketplace that
   // swallows the entire grid of ~20 unrelated listings -- a scooter, an
   // iPhone, three other villas -- and stores it as THIS listing's text.
-  // A group permalink renders SEVERAL role=article nodes: the composer, the
-  // post, and one per comment. page.$ returns the first, which is usually the
-  // empty composer -- and an empty scope reports empty_post on a post that
-  // rendered perfectly. Take the largest by text instead.
-  let scope = null;
-  let scopeLen = 0;
-  for (const a of await page.$$('div[role="article"]')) {
-    const len = await a.evaluate((e) => (e.innerText || '').length).catch(() => 0);
-    if (len > scopeLen) { scopeLen = len; scope = a; }
-  }
+  // Where the post body actually lives, established by enumerating a live
+  // group permalink rather than guessing:
+  //   articles = [0, 0, 57, 102, 57, 102] chars -- two empty, and four that
+  //   are just the comments plus a duplicate copy of them. The post is in NO
+  //   role=article at all. It sits in a role=dialog overlay (1485 chars,
+  //   labelled "<Name>'s Post"), alongside a shorter notifications dialog
+  //   and a role=main holding only the feed composer.
+  // Picking the first article gave empty_post; picking the largest gave a
+  // 102-char comment reply, which then failed the rental screen.
+  const largestOf = async (sel, reject) => {
+    let best = null, bestLen = 0;
+    for (const el of await page.$$(sel)) {
+      const t = await el.evaluate((e) => e.innerText || '').catch(() => '');
+      if (!t.trim() || (reject && reject.test(t))) continue;
+      if (t.length > bestLen) { bestLen = t.length; best = el; }
+    }
+    return best;
+  };
+
+  // Marketplace items have no dialog and no article -- their content is
+  // role=main. Branch on the URL so a stray dialog cannot hijack them.
+  let scope = /\/marketplace\/item\//.test(canonical) ? await page.$('div[role="main"]') : null;
+  if (!scope) scope = await largestOf('div[role="dialog"]', /^\s*Notifications\b/i);
+  if (!scope) scope = await largestOf('div[role="article"]');
   if (!scope) scope = await page.$('div[role="main"]');
   if (!scope) return { ok: false, error: 'no_post_container', url: canonical };
 
