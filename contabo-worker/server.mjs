@@ -6194,10 +6194,15 @@ async function _fbGetPost(page, post_url) {
   }).catch(() => null);
 
   // Full-size photo URLs live on scontent.*; thumbnails and emoji do not.
-  const photos = await page.evaluate(() => {
+  // Queried through `scope`, not `page`: this used to hardcode
+  // div[role="article"] img, the exact selector the text extraction was moved
+  // off because Marketplace items have no role=article at all. Every
+  // Marketplace listing therefore came back with zero photos while its text
+  // scraped fine.
+  const photos = await scope.evaluate((root) => {
     const out = new Set();
-    for (const img of document.querySelectorAll('div[role="article"] img, img[data-visualcompletion="media-vc-image"]')) {
-      const src = img.currentSrc || img.src || '';
+    for (const img of root.querySelectorAll('img, image')) {
+      const src = img.currentSrc || img.src || img.getAttribute('xlink:href') || '';
       if (!/scontent|fbcdn/.test(src)) continue;
       if (/emoji|static|rsrc\.php/.test(src)) continue;
       const w = img.naturalWidth || img.width || 0;
