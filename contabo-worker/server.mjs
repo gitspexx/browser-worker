@@ -1778,17 +1778,35 @@ const handlers = {
         if (await submit.count().catch(() => 0)) { await submit.first().click().catch(() => {}); }
         await page.waitForTimeout(4000);
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        // prefer USD on the quote page if a currency selector is present
+        // The premium only renders after choosing a currency + the lowest
+        // deductible ($0) and 0% co-insurance for each plan tier (most
+        // comprehensive cover, matching the applicant's high-limit prefs).
+        // Premiums show as decimal amounts ("$ 485.02"); deductibles are
+        // round ($375), so we extract by the decimals to avoid confusion.
         await setSel('#product', /US Dollars|Dollar/i).catch(() => null);
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(1000);
+        await setSel('#coreBenefitDeductibleSelect', /\$0\b/).catch(() => null);
+        for (const cid of [
+          '#coreBenefitCoInsuranceOptionsSelectHighDtcAndNotAppLink',
+          '#coreBenefitCoInsuranceOptionsSelectMidDtcAndNotAppLink',
+          '#coreBenefitCoInsuranceOptionsSelectLowDtcAndNotAppLink',
+        ]) {
+          await setSel(cid, /0% Cost share/).catch(() => null);
+        }
+        await page.waitForTimeout(2800);
 
         const reached = /YourQuote/i.test(page.url());
         const prices = await page.evaluate(() => {
           const txt = document.body.innerText || '';
-          const tiers = (txt.match(/(Platinum|Gold|Silver)[\s\S]{0,140}?(US\$|USD|\$|€|£)\s?[\d,]+(\.\d+)?/gi) || []).slice(0, 6).map((s) => s.replace(/\s+/g, ' ').trim());
-          const any = (txt.match(/(US\$|USD|\$|€|£)\s?[\d,]{3,}(\.\d+)?/g) || []).slice(0, 12);
-          return { tiers, any };
-        }).catch(() => ({ tiers: [], any: [] }));
+          // premiums carry cents ("$ 485.02"); deductibles are round.
+          const premiums = [...new Set((txt.match(/(US\$|USD|\$|€|£)\s?[\d,]+\.\d{2}/g) || []))]
+            .map((s) => s.replace(/\s+/g, ' ').trim()).slice(0, 6);
+          // overall annual benefit limits (e.g. $2,000,000).
+          const limits = [...new Set((txt.match(/\$\s?[\d,]{7,}/g) || []))]
+            .map((s) => s.replace(/\s+/g, ' ').trim()).slice(0, 4);
+          const monthly = /per month|monthly/i.test(txt);
+          return { premiums, limits, monthly };
+        }).catch(() => ({ premiums: [], limits: [], monthly: false }));
 
         return {
           portal: 'insurance_quote_assist',
@@ -6054,8 +6072,24 @@ async function _fbGetPost(page, post_url) {
     try { await page.locator(sel).first().click({ timeout: 1500 }); await _fbSleep(600); } catch (e) {}
   }
 
-  const art = await page.$('div[role="article"]');
-  const scope = art || page;
+  // Fall back to <body>, NOT to `page`: page.evaluate(fn) calls fn with no
+  // argument, so `e.innerText` throws and the .catch() below turns a missing
+  // article into a silent empty post that looks like a successful scrape.
+  // Every downstream consumer (Kasa) then stores a listing with no text.
+  const art = (await page.$('div[role="article"]')) || (await page.$('body'));
+  const scope = art;
+
+  // A private group we have not joined renders the group landing page, not the
+  // post: no role=article, and the body is the join wall. Returning ok:true with
+  // that text would hand Kasa a listing whose raw_text is group boilerplate.
+  // Fail loudly instead, the same way auth_required does above.
+  const articleCount = (await page.$$('div[role="article"]')).length;
+  if (articleCount === 0) {
+    const wall = await page.evaluate(() => (document.body?.innerText || '').slice(0, 2000)).catch(() => '');
+    if (/\bJoin group\b|\bGabung ke [Gg]rup\b|Only members can see/i.test(wall)) {
+      return { ok: false, error: 'not_a_member', url: canonical };
+    }
+  }
 
   const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
 
@@ -6085,6 +6119,10 @@ async function _fbGetPost(page, post_url) {
     }
     return [...out].slice(0, 12);
   }).catch(() => []);
+
+  // No text at all means the scrape failed, whatever the reason. Reporting
+  // ok:true here is what let an empty listing reach Kasa's database.
+  if (!text) return { ok: false, error: 'empty_post', url: canonical };
 
   return {
     ok: true,
