@@ -6089,6 +6089,12 @@ async function _fbGetPost(page, post_url) {
     if (/\bJoin group\b|\bGabung ke [Gg]rup\b|Only members can see/i.test(wall)) {
       return { ok: false, error: 'not_a_member', url: canonical };
     }
+    // Deleted / audience-restricted posts render their own interstitial. It has
+    // real text (~250 chars), so the empty_post guard below never sees it and
+    // Kasa would store the error page as the listing body.
+    if (/content isn.{0,3}t available|Konten ini sedang tidak tersedia/i.test(wall)) {
+      return { ok: false, error: 'content_unavailable', url: canonical };
+    }
   }
 
   const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
