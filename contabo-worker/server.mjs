@@ -1687,6 +1687,104 @@ const handlers = {
     await page.screenshot({ path: shot, fullPage: true });
     return { portal: 'enac', preview: shot, note: 'ENAC passenger complaint — free web form for EU261' };
   },
+  // ── insurance_quote_assist: best-effort IPMI quote-form assist ────────────
+  // Called by admin/persona (server/routes/quotes.ts) with
+  // { url, applicant: {fullName|firstName/lastName, dob, nationality,
+  // country|residencyCountry, email, phone, ...}, account?: {email, password} }.
+  // NOT a guaranteed submit — insurer forms vary wildly. Best-effort fill of
+  // generic fields via tolerant selector fallbacks (same pattern as `btb`
+  // above), fill an account/login/signup form if one is present, screenshot,
+  // and hand back to a human to finish. Always resolves — never throws past
+  // this handler so a bad/unknown form still returns a usable screenshot.
+  async insurance_quote_assist(page, payload) {
+    const { url, applicant = {}, account } = payload || {};
+    const filled = {};
+    const shotPath = () => path.join(OUT, `insurance-quote-${Date.now()}.png`);
+    const tryFill = async (sel, val) => {
+      if (val == null || val === '') return null;
+      for (const s of sel) {
+        if (await page.locator(s).count().catch(() => 0)) {
+          await page.locator(s).first().fill(String(val)).catch(() => {});
+          return s;
+        }
+      }
+      return null;
+    };
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(2000);
+
+      const fullName = applicant.fullName || [applicant.firstName, applicant.lastName].filter(Boolean).join(' ');
+      const firstName = applicant.firstName || (applicant.fullName || '').split(' ')[0] || null;
+      const lastName = applicant.lastName || (applicant.fullName || '').split(' ').slice(1).join(' ') || null;
+      const country = applicant.country || applicant.residencyCountry;
+
+      filled.name = await tryFill(
+        ['input[name="name"]', 'input[name*="full_name"]', 'input[id*="full-name"]', '#name', 'input[autocomplete="name"]'],
+        fullName
+      );
+      filled.firstName = await tryFill(
+        ['input[name="first_name"]', 'input[name*="firstname"]', 'input[id*="first-name"]', 'input[autocomplete="given-name"]'],
+        firstName
+      );
+      filled.lastName = await tryFill(
+        ['input[name="last_name"]', 'input[name*="lastname"]', 'input[id*="last-name"]', 'input[autocomplete="family-name"]'],
+        lastName
+      );
+      filled.email = await tryFill(
+        ['input[type="email"]', 'input[name*="email"]', 'input[id*="email"]', 'input[autocomplete="email"]'],
+        applicant.email
+      );
+      filled.dob = await tryFill(
+        ['input[type="date"]', 'input[name*="dob"]', 'input[name*="birth"]', 'input[id*="dob"]', 'input[id*="birth"]'],
+        applicant.dob
+      );
+      filled.nationality = await tryFill(
+        ['select[name*="nationality"]', 'input[name*="nationality"]', 'select[id*="nationality"]'],
+        applicant.nationality
+      );
+      filled.country = await tryFill(
+        ['select[name*="country"]', 'input[name*="country"]', 'select[id*="residence"]', 'input[name*="residence"]'],
+        country
+      );
+      filled.phone = await tryFill(
+        ['input[type="tel"]', 'input[name*="phone"]', 'input[id*="phone"]', 'input[autocomplete="tel"]'],
+        applicant.phone
+      );
+
+      // Account / login / signup form — only touch it if the page actually
+      // has a password field (i.e. this is really an account step) and we
+      // were given credentials to use.
+      if (account?.email && account?.password && await page.locator('input[type="password"]').count().catch(() => 0)) {
+        filled.accountEmail = await tryFill(
+          ['input[type="email"]', 'input[name*="email"]', 'input[id*="email"]'],
+          account.email
+        );
+        filled.accountPassword = await tryFill(
+          ['input[type="password"]', 'input[name*="password"]', 'input[id*="password"]'],
+          account.password
+        );
+      }
+
+      const preview = shotPath();
+      await page.screenshot({ path: preview, fullPage: true }).catch(() => {});
+
+      return {
+        portal: 'insurance_quote_assist',
+        url: page.url(),
+        filled,
+        preview,
+        note: 'best-effort assist — finish/submit manually',
+      };
+    } catch (e) {
+      let preview = null;
+      try {
+        preview = shotPath();
+        await page.screenshot({ path: preview, fullPage: true });
+      } catch { /* best-effort — page may be unusable */ }
+      return { portal: 'insurance_quote_assist', error: String(e), url: page.url(), preview };
+    }
+  },
   async inspect(page, { claimId, url }) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(2000);
