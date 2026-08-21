@@ -5923,6 +5923,51 @@ async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
 // Harvest IN-GROUP SEARCH results. Search cards expose no anchor href at all
 // (FB navigates them via JS), so the only reliable way to get a permalink is to
 // CLICK the result and read the URL bar, then go back. Slower but bulletproof.
+/**
+ * Buy/sell groups do not contain posts. Their feed is Marketplace commerce
+ * listings shared into the group, and those carry NO /posts/ or /permalink/
+ * href at all -- only /commerce/listing/<id>. Measured on BALI LONG TERM
+ * Yearly/Monthly Rentals: role=feed with 12 children, role=article count 0,
+ * pagePostLinks 0, and the one rendered child carrying
+ * /commerce/listing/873975982251601/?ref=share_attachment.
+ *
+ * Both harvesters above look for articles and post permalinks, so they report
+ * zero on a page visibly full of listings. Normalised to /marketplace/item/,
+ * which is the same object and the form /fb-pool/post/get already scrapes via
+ * role=main.
+ */
+async function _fbHarvestCommerce(page, max_posts, scroll_passes) {
+  await page.bringToFront().catch(() => {});
+  await _fbSleep(3000);
+  // The feed is virtualised: 11 of 12 children render empty until scrolled.
+  for (let i = 0; i < Math.max(scroll_passes, 4); i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 2, 1600))).catch(() => {});
+    await _fbSleep(2600);
+    const n = await page.$$eval('a[href*="/commerce/listing/"], a[href*="/marketplace/item/"]', els => els.length).catch(() => 0);
+    if (n >= max_posts + 4) break;
+  }
+
+  const raw = await page.$$eval('a[href*="/commerce/listing/"], a[href*="/marketplace/item/"]', (els) => els.map((e) => {
+    const card = e.closest('div[role="feed"] > div') || e.parentElement;
+    return {
+      href: e.href || e.getAttribute('href') || '',
+      text: ((card && card.innerText) || '').replace(/Facebook/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 800),
+    };
+  })).catch(() => []);
+
+  const out = []; const seen = new Set();
+  for (const r of raw) {
+    const m = String(r.href).match(/\/(?:commerce\/listing|marketplace\/item)\/(\d+)/);
+    if (!m) continue;
+    const url = `https://www.facebook.com/marketplace/item/${m[1]}/`;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({ post_url: url, post_text: r.text, post_author: '' });
+    if (out.length >= max_posts) break;
+  }
+  return out;
+}
+
 async function _fbSearchHarvest(page, gid, max_posts) {
   await page.bringToFront().catch(() => {});
   await _fbSleep(3500);
@@ -6015,7 +6060,12 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
     const result = await _fbHarvestPosts(page, gid, max_posts, scroll_passes);
-    const posts = result.posts;
+    let posts = result.posts;
+    // A buy/sell group has no posts to find: its results are commerce
+    // listings carrying no /posts/ href, so the harvester above returns
+    // zero on a page full of them. Only fall through when it came back
+    // empty, so ordinary groups keep their richer per-post text.
+    if (!posts.length) posts = await _fbHarvestCommerce(page, max_posts, scroll_passes);
     await page.close().catch(() => {});
     return res.json({ ok: true, group_url, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
   } catch (e) {
@@ -6045,7 +6095,12 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
       return res.status(200).json({ ok: false, error: 'auth_required', url: page.url() });
     }
     const result = await _fbSearchHarvest(page, gid, max_posts);
-    const posts = result.posts;
+    let posts = result.posts;
+    // A buy/sell group has no posts to find: its results are commerce
+    // listings carrying no /posts/ href, so the harvester above returns
+    // zero on a page full of them. Only fall through when it came back
+    // empty, so ordinary groups keep their richer per-post text.
+    if (!posts.length) posts = await _fbHarvestCommerce(page, max_posts, 4);
     await page.close().catch(() => {});
     return res.json({ ok: true, group_url, query, count: posts.length, posts, debug: result.debug, scraped_at: new Date().toISOString() });
   } catch (e) {
