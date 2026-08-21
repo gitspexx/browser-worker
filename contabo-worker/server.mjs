@@ -5841,6 +5841,88 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
   }
 });
 
+// Resolve a share link to its real permalink, then harvest the full post.
+// share/p/<id> only 302s to the permalink inside a logged-in session, which is
+// why this cannot be a plain fetch.
+async function _fbGetPost(page, post_url) {
+  await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await _fbSleep(3500);
+  if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
+    return { ok: false, error: 'auth_required', url: page.url() };
+  }
+
+  const canonical = page.url();
+
+  // Expand "See more" so the text is not truncated mid-listing.
+  for (const sel of ['div[role="button"]:has-text("See more")', 'div[role="button"]:has-text("Lihat selengkapnya")']) {
+    try { await page.locator(sel).first().click({ timeout: 1500 }); await _fbSleep(600); } catch (e) {}
+  }
+
+  const art = await page.$('div[role="article"]');
+  const scope = art || page;
+
+  const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
+
+  const author = await scope.evaluate((e) => {
+    const a = e.querySelector('h2 a, h3 a, h4 a, strong a, span a[role="link"]');
+    return a ? { name: (a.innerText || '').trim().slice(0, 80), url: a.href || '' } : { name: '', url: '' };
+  }).catch(() => ({ name: '', url: '' }));
+
+  const posted_at = await scope.evaluate((e) => {
+    for (const a of e.querySelectorAll('a[role="link"]')) {
+      const t = (a.getAttribute('aria-label') || a.innerText || '').trim();
+      if (/^\d+\s*(m|h|d|w)$|\b(20\d\d)\b|\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/.test(t)) return t.slice(0, 60);
+    }
+    return null;
+  }).catch(() => null);
+
+  // Full-size photo URLs live on scontent.*; thumbnails and emoji do not.
+  const photos = await page.evaluate(() => {
+    const out = new Set();
+    for (const img of document.querySelectorAll('div[role="article"] img, img[data-visualcompletion="media-vc-image"]')) {
+      const src = img.currentSrc || img.src || '';
+      if (!/scontent|fbcdn/.test(src)) continue;
+      if (/emoji|static|rsrc\.php/.test(src)) continue;
+      const w = img.naturalWidth || img.width || 0;
+      if (w && w < 200) continue;
+      out.add(src);
+    }
+    return [...out].slice(0, 12);
+  }).catch(() => []);
+
+  return {
+    ok: true,
+    post_url,
+    canonical_url: _fbNormPermalink(canonical, (canonical.match(/groups\/([^/?#]+)/) || [])[1] || '') || canonical,
+    text,
+    author: author.name,
+    author_url: author.url,
+    posted_at,
+    photos,
+    scraped_at: new Date().toISOString(),
+  };
+}
+
+// POST /fb-pool/post/get — full single-post fetch (text + photos + author).
+// groups/scan gives 800 chars and no photos; Kasa needs both.
+app.post('/fb-pool/post/get', auth(), async (req, res) => {
+  const { profile, post_url } = req.body ?? {};
+  const user_id = FB_POST_PROFILE_MAP[profile];
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  if (!post_url) return res.status(422).json({ ok: false, error: 'post_url required' });
+  let page = null;
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    const out = await _fbGetPost(page, post_url);
+    await page.close().catch(() => {});
+    return res.status(200).json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/inbox — READ-ONLY: scrape a warmup profile's Messenger thread
 // list (people DMing us after seeing comments/posts) so GrowthOps can show it.
 app.post('/fb-pool/inbox', auth(), async (req, res) => {
