@@ -6059,11 +6059,18 @@ app.post('/fb-pool/groups/search', auth(), async (req, res) => {
 // share/p/<id> only 302s to the permalink inside a logged-in session, which is
 // why this cannot be a plain fetch.
 async function _fbGetPost(page, post_url) {
-  await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await _fbSleep(3500);
+  await page.goto(post_url, { waitUntil: 'domcontentloaded', timeout: 75000 });
+  await _fbSleep(1500);
   if (/\/login|\/checkpoint|two_step_verification/.test(page.url())) {
     return { ok: false, error: 'auth_required', url: page.url() };
   }
+
+  // Wait for the post to paint rather than sleeping a fixed 3.5s. Facebook
+  // through a rotating residential exit routinely takes longer than that, and
+  // reading too early yields a blank body -- which the guards below correctly
+  // but uselessly report as empty_post on a perfectly good listing.
+  await page.waitForSelector('div[role="article"]', { timeout: 25000 }).catch(() => {});
+  await _fbSleep(1200);
 
   const canonical = page.url();
 
