@@ -1710,6 +1710,102 @@ const handlers = {
       }
       return null;
     };
+    // ── Cigna Global: real instant-quote flow ──────────────────────────────
+    // Cigna's quote engine (About You -> Your Quote) shows live plan prices
+    // after a single step. Fields are native <select>s with stable ids
+    // (mapped 2026-08-21), so we can fill + submit reliably rather than the
+    // generic best-effort path below. Returns base64 screenshot + prices.
+    if (payload?.provider === 'cigna_global' || /cignaglobal\.com/i.test(url || '')) {
+      const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const b64 = async () => {
+        const buf = await page.screenshot({ fullPage: true }).catch(() => null);
+        return buf ? buf.toString('base64') : null;
+      };
+      const setText = async (sel, val) => {
+        if (val == null || val === '') return false;
+        const e = page.locator(sel);
+        if (await e.count().catch(() => 0)) { await e.first().fill(String(val)).catch(() => {}); return true; }
+        return false;
+      };
+      const setSel = async (sel, rx) => {
+        const e = page.locator(sel);
+        if (!(await e.count().catch(() => 0))) return null;
+        const opts = await e.first().locator('option').allTextContents().catch(() => []);
+        const m = opts.find((o) => rx.test((o || '').trim()));
+        if (m) { await e.first().selectOption({ label: m }).catch(() => {}); return m.trim(); }
+        return null;
+      };
+      try {
+        await page.goto('https://www.cignaglobal.com/quote/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(1500);
+        // cookie banner (OneTrust)
+        for (const s of ['#onetrust-accept-btn-handler', 'button:has-text("Accept All Cookies")']) {
+          const el = page.locator(s);
+          if (await el.count().catch(() => 0)) { await el.first().click().catch(() => {}); await page.waitForTimeout(500); break; }
+        }
+        // reach "About You"
+        if (!/PersonalInformation/i.test(page.url())) {
+          const link = page.locator('a:has-text("click here")');
+          if (await link.count().catch(() => 0)) { await link.first().click().catch(() => {}); await page.waitForTimeout(1500); }
+        }
+        if (!/PersonalInformation/i.test(page.url())) {
+          await page.goto('https://www.cignaglobal.com/quote/pages/Home,$DirectLink.sdirect', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+          await page.waitForTimeout(1500);
+        }
+        const firstName = applicant.firstName || (applicant.fullName || '').split(' ')[0] || '';
+        const lastName = applicant.lastName || (applicant.fullName || '').split(' ').slice(1).join(' ') || '';
+        const dob = String(applicant.dob || '').split('-'); // yyyy-mm-dd
+        const nat = applicant.nationality === 'Italian' ? 'Italy' : (applicant.nationality || '');
+        const residence = applicant.residencyCountry || applicant.country || '';
+        const phoneDigits = String(applicant.phone || '').replace(/[^\d]/g, '').replace(/^1(?=\d{10}$)/, '');
+
+        await setText('#mainMemberFirstName', firstName);
+        await setText('#mainMemberFamilyName', lastName);
+        await setText('#mainMemberEmail', applicant.email);
+        await setText('#numberTextField_0', phoneDigits);
+        const filledC = {};
+        if (dob.length === 3) {
+          filledC.day = await setSel('#selectedDay_0', new RegExp('^0?' + parseInt(dob[2], 10) + '$'));
+          filledC.month = await setSel('#selectedMonth_0', new RegExp('^' + MONTHS[parseInt(dob[1], 10) - 1] + '$', 'i'));
+          filledC.year = await setSel('#selectedYear_0', new RegExp('^' + dob[0] + '$'));
+        }
+        filledC.prefix = await setSel('#prefixDropDown_0', /United States|USA/i) || await setSel('#prefixDropDown_0', /\(1\)/);
+        filledC.nationality = nat ? await setSel('#mainMemberNationality', new RegExp('^' + nat + '$', 'i')) : null;
+        filledC.country = residence ? await setSel('#mainMemberCountry_0', new RegExp(residence, 'i')) : null;
+        filledC.dependants = await setSel('#dependantsCountOptions', /^0$/);
+
+        const submit = page.locator('#ImageSubmit');
+        if (await submit.count().catch(() => 0)) { await submit.first().click().catch(() => {}); }
+        await page.waitForTimeout(4000);
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        // prefer USD on the quote page if a currency selector is present
+        await setSel('#product', /US Dollars|Dollar/i).catch(() => null);
+        await page.waitForTimeout(1500);
+
+        const reached = /YourQuote/i.test(page.url());
+        const prices = await page.evaluate(() => {
+          const txt = document.body.innerText || '';
+          const tiers = (txt.match(/(Platinum|Gold|Silver)[\s\S]{0,140}?(US\$|USD|\$|€|£)\s?[\d,]+(\.\d+)?/gi) || []).slice(0, 6).map((s) => s.replace(/\s+/g, ' ').trim());
+          const any = (txt.match(/(US\$|USD|\$|€|£)\s?[\d,]{3,}(\.\d+)?/g) || []).slice(0, 12);
+          return { tiers, any };
+        }).catch(() => ({ tiers: [], any: [] }));
+
+        return {
+          portal: 'insurance_quote_assist',
+          provider: 'cigna_global',
+          ok: true,
+          url: page.url(),
+          filled: filledC,
+          prices,
+          quoteReached: reached,
+          previewB64: await b64(),
+          note: reached ? 'Cigna live quote reached — plan prices captured' : 'Cigna step 1 submitted; check screenshot',
+        };
+      } catch (e) {
+        return { portal: 'insurance_quote_assist', provider: 'cigna_global', ok: false, error: String(e), url: page.url(), previewB64: await b64() };
+      }
+    }
+
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(2000);
@@ -1767,22 +1863,24 @@ const handlers = {
       }
 
       const preview = shotPath();
-      await page.screenshot({ path: preview, fullPage: true }).catch(() => {});
+      const buf = await page.screenshot({ path: preview, fullPage: true }).catch(() => null);
 
       return {
         portal: 'insurance_quote_assist',
         url: page.url(),
         filled,
         preview,
+        previewB64: buf ? buf.toString('base64') : null,
         note: 'best-effort assist — finish/submit manually',
       };
     } catch (e) {
       let preview = null;
+      let buf = null;
       try {
         preview = shotPath();
-        await page.screenshot({ path: preview, fullPage: true });
+        buf = await page.screenshot({ path: preview, fullPage: true });
       } catch { /* best-effort — page may be unusable */ }
-      return { portal: 'insurance_quote_assist', error: String(e), url: page.url(), preview };
+      return { portal: 'insurance_quote_assist', error: String(e), url: page.url(), preview, previewB64: buf ? buf.toString('base64') : null };
     }
   },
   async inspect(page, { claimId, url }) {
