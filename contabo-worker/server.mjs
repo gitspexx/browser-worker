@@ -6178,6 +6178,27 @@ async function _fbGetPost(page, post_url) {
   if (!scope) scope = await page.$('div[role="main"]');
   if (!scope) return { ok: false, error: 'no_post_container', url: canonical };
 
+  // Marketplace item pages append a recommendation grid -- "Today's picks" --
+  // of ~20 unrelated items: a scooter, an iPhone, a massage, other villas.
+  // role=main contains it, so it was landing in the listing body: on one post
+  // it was 44% of the stored text, and its prices and phone numbers fed
+  // extraction, dedupe and the rental screen as if they belonged to the unit.
+  // Removed from the live DOM before anything is read, so the photo query
+  // below is cleaned by the same cut and keeps naturalWidth on what remains.
+  await scope.evaluate((root) => {
+    const MARKER = /^\s*(?:Today's picks|More like this|Related items|Similar listings|Pilihan hari ini|Lihat juga|Sponsored)\b/i;
+    for (const el of root.querySelectorAll('div, section')) {
+      const t = el.innerText || '';
+      if (!MARKER.test(t)) continue;
+      // Outermost block that STARTS with the marker: an ancestor whose text
+      // also starts there is a bigger wrapper around the same grid, and
+      // removing a child first would leave the wrapper's copy behind.
+      const parent = el.parentElement;
+      if (parent && MARKER.test(parent.innerText || '')) continue;
+      el.remove();
+    }
+  }).catch(() => {});
+
   const text = await scope.evaluate((e) => (e.innerText || '').replace(/\r/g, '').trim().slice(0, 8000)).catch(() => '');
 
   const author = await scope.evaluate((e) => {
