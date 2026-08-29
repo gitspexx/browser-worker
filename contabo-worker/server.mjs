@@ -5251,6 +5251,9 @@ app.get('/status', auth(), async (req, res) => {
     role: req.role,
     adspower: { reachable: ready, url: ADS },
     worker: { port: PORT, node: process.version, uptime_s: Math.round(process.uptime()) },
+    // Proves the proxy-quota saving is actually in effect. `blocked: 0` with a
+    // non-zero `allowed` means the route filter silently stopped applying.
+    fb_assets: { enabled: FB_BLOCK_ASSETS, ...fbAssetStats },
   });
 });
 
@@ -5724,6 +5727,36 @@ function _fbParseMembers(text) {
   else if (unit === 'm' || unit === 'jt') n *= 1000000;
   return Math.round(n);
 }
+// Every FB profile browses through a metered residential proxy, and images,
+// video and fonts are the bulk of a Facebook page's bytes. None of them are
+// used: the photo scrape reads `img.src` (a URL, not pixels), and Kasa then
+// re-downloads each scontent URL itself over the box's own unproxied link —
+// see kasa/server/services/photos.ts `ingestPhotos`. So the browser was paying
+// residential rates for bytes that were fetched a second time for free. That
+// duplicate spend is what consumed a 10 GB/month plan in six days (2026-08-27),
+// paused the account, and 407'd every scrape.
+//
+// Stylesheets and scripts are deliberately NOT blocked — Facebook is a React
+// app and renders nothing without them.
+const FB_BLOCK_ASSETS = String(process.env.FB_BLOCK_ASSETS ?? '1') !== '0';
+const FB_BLOCKED_TYPES = new Set(['image', 'media', 'font']);
+const fbAssetStats = { blocked: 0, allowed: 0 };
+
+// Photo extraction survives this: `img.src` is the resolved attribute and is set
+// whether or not the fetch happened, and the `naturalWidth < 200` size filter is
+// skipped when the width is 0 (`if (w && w < 200)`), which is what an aborted
+// image reports.
+async function _fbBlockAssets(page) {
+  if (!FB_BLOCK_ASSETS) return;
+  await page.route('**/*', (route) => {
+    const blocked = FB_BLOCKED_TYPES.has(route.request().resourceType());
+    if (blocked) fbAssetStats.blocked++; else fbAssetStats.allowed++;
+    // The page can close mid-flight; a rejected abort/continue must not take
+    // down the scrape.
+    return (blocked ? route.abort() : route.continue()).catch(() => {});
+  }).catch(() => {});
+}
+
 async function _fbStartProfile(user_id) {
   const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
   if (active?.status === 'Active') {
@@ -5736,6 +5769,7 @@ async function _fbStartProfile(user_id) {
   const browser = await chromium.connectOverCDP(ws);
   const ctx = browser.contexts()[0] || (await browser.newContext());
   const page = await ctx.newPage();
+  await _fbBlockAssets(page);
   return { browser, page };
 }
 
