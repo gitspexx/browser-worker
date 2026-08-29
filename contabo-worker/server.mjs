@@ -6260,8 +6260,20 @@ async function _fbGetPost(page, post_url) {
       const src = img.currentSrc || img.src || img.getAttribute('xlink:href') || '';
       if (!/scontent|fbcdn/.test(src)) continue;
       if (/emoji|static|rsrc\.php/.test(src)) continue;
-      const w = img.naturalWidth || img.width || 0;
+      // Size filter, drops thumbnails and chrome.
+      //
+      // `naturalWidth` is the ONLY trustworthy width here. This used to read
+      // `img.naturalWidth || img.width || 0`, which looks equivalent and is not:
+      // for an image whose request was aborted, naturalWidth is 0 but
+      // `img.width` reports Chromium's 16px broken-image placeholder. The `||`
+      // chain therefore produced 16, the `< 200` test dropped it, and asset
+      // blocking silently returned zero photos for every post.
+      const w = img.naturalWidth || 0;
       if (w && w < 200) continue;
+      // With the bytes blocked there is no rendered width to judge, so fall
+      // back to the size Facebook encodes in the URL path itself
+      // (/s160x160/, /p64x64/) to keep thumbnails out.
+      if (!w && /\/[sp]\d{2,3}x\d{2,3}\//.test(src)) continue;
       out.add(src);
     }
     return [...out].slice(0, 12);
