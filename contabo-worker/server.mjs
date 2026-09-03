@@ -871,44 +871,51 @@ async function wyregDoKeycloakLoginIfPresent(page) {
   const password = process.env.WYREG_PASSWORD || '';
   if (!email || !password) throw new Error('wyreg login required but WYREG_USERNAME/WYREG_PASSWORD not set on worker');
 
-  // Keystroke typing — React's controlled inputs need real input events to
-  // register and the Sign in button stays disabled until validation fires.
-  await page.locator('#username').click();
-  await page.locator('#username').pressSequentially(email, { delay: 20 });
-  await page.locator('#password').click();
-  await page.locator('#password').pressSequentially(password, { delay: 20 });
-
-  const rememberChecked = await page.locator('#rememberMe').isChecked().catch(() => false);
-  if (!rememberChecked) await page.locator('#rememberMe').check({ force: true }).catch(() => {});
-
-  const btnEnabled = await page.locator('#kc-login:not([disabled])').isVisible({ timeout: 3000 }).catch(() => false);
-  if (btnEnabled) {
-    await page.locator('#kc-login').click();
-  } else {
-    await page.evaluate(() => document.getElementById('kc-form')?.submit());
-  }
+  // Everything here is JS-driven, deliberately. AdsPower lives in a
+  // disconnected RDP session where the compositor is throttled: keystrokes
+  // land but anything that needs a paint or a pointer hit-test (click(),
+  // actionability checks, full-page screenshots) hangs until timeout. That is
+  // what killed this poll silently. React's controlled inputs still need real
+  // input events, so we set the value through the native setter and dispatch
+  // input/change — same trick, no rendering required.
+  await page.evaluate(({ u, p }) => {
+    const set = (el, v) => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(el, v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    set(document.getElementById('username'), u);
+    set(document.getElementById('password'), p);
+    const rm = document.getElementById('rememberMe');
+    if (rm && !rm.checked) rm.click();
+  }, { u: email, p: password });
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    const btn = document.getElementById('kc-login');
+    if (btn && !btn.disabled) btn.click();
+    else document.getElementById('kc-form')?.submit();
+  });
 
   await page.waitForURL(/accounts\.wyregisteredagent\.net/, { timeout: 30000 }).catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(1500);
   const stillLogin = await page.locator('#password').isVisible().catch(() => false);
   if (stillLogin) {
-    // Dump the failing page to C:\worker\screenshots so the operator can see
-    // whether it's a CAPTCHA, 2FA prompt, "Continue as X" screen, or plain error.
     try {
+      await fs.promises.mkdir(OUT, { recursive: true });
       const shotPath = path.join(OUT, 'wyreg-login-fail.png');
-      await page.screenshot({ path: shotPath, fullPage: true });
+      // Viewport-only with a short timeout: a full-page shot needs layout work
+      // the throttled session may never finish.
+      await page.screenshot({ path: shotPath, fullPage: false, timeout: 8000 }).catch(() => {});
       const htmlPath = path.join(OUT, 'wyreg-login-fail.html');
-      const html = await page.content();
-      await fs.promises.writeFile(htmlPath, html);
-      const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
-      console.warn(`[wyreg-login-fail] url=${page.url()}`);
-      console.warn(`[wyreg-login-fail] body=${(body || '').slice(0, 600).replace(/\s+/g, ' ')}`);
-      console.warn(`[wyreg-login-fail] shot=${shotPath} html=${htmlPath}`);
-    } catch (err) {
-      console.warn(`[wyreg-login-fail] diagnostic dump failed: ${err.message}`);
-    }
-    throw new Error('wyreg login failed — check credentials, 2FA, or CAPTCHA');
+      await fs.promises.writeFile(htmlPath, await page.content());
+    } catch { /* diagnostics must never mask the real error */ }
+    const kcErr = await page.evaluate(() =>
+      document.querySelector('#input-error, .alert-error, .kc-feedback-text, [class*="error"]')?.textContent?.trim() || ''
+    ).catch(() => '');
+    const typed = await page.evaluate(() => (document.getElementById('username')?.value || '').length).catch(() => -1);
+    throw new Error(`wyreg login failed — kcError=${JSON.stringify(kcErr.slice(0, 200))} typedUsernameLen=${typed} url=${page.url()}`);
   }
 }
 
@@ -1267,7 +1274,7 @@ async function wyregDownloadDocRow(page, row) {
     try {
       const [download] = await Promise.all([
         page.waitForEvent('download', { timeout: 20000 }),
-        page.locator(row.downloadClickSelector).first().click({ force: true }),
+        page.locator(row.downloadClickSelector).first().evaluate((el) => el.click()),
       ]);
       return await drainDownload(download);
     } catch (err) {
@@ -1282,7 +1289,7 @@ async function wyregDownloadDocRow(page, row) {
   if (row.openDetailSelector) {
     try {
       const listUrl = page.url();
-      await page.locator(row.openDetailSelector).first().click({ timeout: 8000 });
+      await page.locator(row.openDetailSelector).first().evaluate((el) => el.click());
       const changed = await (async () => {
         const end = Date.now() + 10000;
         while (Date.now() < end) {
@@ -1310,7 +1317,7 @@ async function wyregDownloadDocRow(page, row) {
       // already in the context.
       const [download] = await Promise.all([
         page.waitForEvent('download', { timeout: 30000 }),
-        downloadBtn.click({ timeout: 8000 }),
+        downloadBtn.evaluate((el) => el.click()),
       ]);
       const dlUrl = download.url();
       await download.cancel().catch(() => {}); // don't care about the browser-side save
@@ -6746,6 +6753,14 @@ app.get('/fb-pool/state', auth(), (_req, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`browser-worker on :${PORT} — auth ${AUTH_DISABLED ? 'DISABLED (dev)' : 'enabled'}`);
 });
+
+// Long-running portal actions (a full wyreg doc backfill runs ~20 min) exceed
+// Node's default 300s requestTimeout, which resets the socket mid-response and
+// surfaces as a bare "fetch failed" on the caller. Lift the per-request caps;
+// each action already enforces its own timeout budget.
+server.requestTimeout = 0;
+server.headersTimeout = 60_000;
+server.keepAliveTimeout = 75_000;
