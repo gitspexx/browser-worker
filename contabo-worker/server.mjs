@@ -1188,7 +1188,12 @@ async function wyregEnumerateDocRowsOnce(page) {
         rowEl.getAttribute('data-row-id') ||
         rowEl.id ||
         null;
-      const docId = idAttr || `row-${idx}-${text.slice(0, 32).replace(/\s+/g, '_')}`;
+      // Content-derived id, NEVER the row index: the list re-orders as new
+      // documents arrive, so a positional id makes the same PDF look new on
+      // every poll — which is exactly how duplicate rows (and duplicate IRS
+      // notices) got created downstream. Row text carries entity + filename +
+      // filing date, which identifies the document regardless of position.
+      const docId = idAttr || `doc-${text.slice(0, 96).replace(/\s+/g, '_').replace(/[^A-Za-z0-9_.-]/g, '')}`;
 
       let entityNameHint = null;
       const entityMatch = text.match(/([A-Z][A-Za-z0-9 &.,'\-]{1,60}\b(?:LLC|L\.L\.C\.|Inc\.?|Corp\.?|Corporation|Ltd\.?))/);
