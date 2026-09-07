@@ -6404,6 +6404,21 @@ async function _fbGetPost(page, post_url) {
   // and returned no_post_container (2026-09-08).
   const isCommerce = /\/marketplace\/item\/|\/commerce\/listing\//.test(canonical);
   let scope = isCommerce ? await page.$('div[role="main"]') : null;
+
+  // A /commerce/listing/<id> page carries NO semantic container at all --
+  // measured 2026-09-08: role=main 0, role=dialog 0, role=article 0, while the
+  // full listing sat in document.body at 1875 chars. So for commerce URLs only,
+  // body is the scope of last resort.
+  //
+  // The "never fall back to <body>" rule below still stands where it was aimed:
+  // the Marketplace GRID, where body swallows ~20 unrelated listings. A single
+  // listing page is not that, and the length guard keeps the two apart -- a grid
+  // runs many times longer than one item.
+  const COMMERCE_BODY_MAX = Number(process.env.FB_COMMERCE_BODY_MAX ?? 8000);
+  if (!scope && isCommerce) {
+    const len = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+    if (len > 80 && len <= COMMERCE_BODY_MAX) scope = await page.$('body');
+  }
   if (!scope) scope = await largestOf('div[role="dialog"]', /^\s*Notifications\b/i);
   if (!scope) scope = await largestOf('div[role="article"]');
   if (!scope) scope = await page.$('div[role="main"]');
