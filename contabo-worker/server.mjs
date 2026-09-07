@@ -6045,8 +6045,17 @@ function _fbNormPermalink(raw, gid) {
     const u = new URL(raw, 'https://www.facebook.com');
     const m = u.pathname.match(/\/(?:posts|permalink)\/(\d+)/);
     const pid = m ? m[1] : (u.searchParams.get('story_fbid') || null);
-    if (!pid) return null;
-    return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
+    if (pid) return `https://www.facebook.com/groups/${gid}/posts/${pid}/`;
+    // A buy/sell group's results are commerce listings and photo posts. These
+    // are already absolute permalinks and have no group-scoped /posts/ form, so
+    // returning null here dropped every result in such a group -- the second
+    // half of why search yielded nothing (2026-09-08).
+    const passthrough = u.pathname.match(/\/(?:commerce\/listing|marketplace\/item)\/(\d+)/);
+    if (passthrough) return `https://www.facebook.com${u.pathname.replace(/\/?$/, '/')}`;
+    if (/^\/photo\/?$/.test(u.pathname) && u.searchParams.get('fbid')) {
+      return `https://www.facebook.com/photo/?fbid=${u.searchParams.get('fbid')}`;
+    }
+    return null;
   } catch (e) { return null; }
 }
 
@@ -6162,23 +6171,37 @@ async function _fbHarvestCommerce(page, max_posts, scroll_passes) {
 async function _fbSearchHarvest(page, gid, max_posts) {
   await page.bringToFront().catch(() => {});
   await _fbSleep(3500);
+  // Facebook moved group search results OUT of div[role="article"] (observed
+  // 2026-09-08 on cheapvillarentalbali). Each result is now a plain, role-less
+  // direct child of div[role="feed"]:
+  //
+  //   div[role="feed"] > div                  <- one per result, ~800-1200 chars
+  //     a[href="/groups/<gid>/user/<uid>/"]      author
+  //     a[href="/commerce/listing/<id>/"]        the permalink
+  //
+  // Measured on a page showing 7 real villa listings: role="article" matched 0
+  // and a[href*="/posts/"] matched 0, so the harvester reported resultCards:0
+  // and fell through to the commerce fallback. role="article" stays as a
+  // fallback -- other group surfaces still use it.
+  const CARD_SEL = 'div[role="feed"] > div, div[role="article"]';
+
   // Wait for real results to replace the skeleton ("Facebook Facebook…") cards.
-  await page.waitForFunction(() => {
-    for (const a of document.querySelectorAll('div[role="article"]')) {
+  await page.waitForFunction((sel) => {
+    for (const a of document.querySelectorAll(sel)) {
       const t = (a.innerText || '').replace(/Facebook/g, '').replace(/\s+/g, ' ').trim();
       if (t.length > 40) return true;
     }
     return false;
-  }, { timeout: 25000 }).catch(() => {});
+  }, CARD_SEL, { timeout: 25000 }).catch(() => {});
   await _fbSleep(2500); // let the timestamp hrefs settle
 
-  const count = await page.$$eval('div[role="article"]', els => els.length).catch(() => 0);
+  const count = await page.$$eval(CARD_SEL, els => els.length).catch(() => 0);
   const n = Math.min(count, max_posts);
   const out = []; const seen = new Set();
   let debugClicks = 0;
   for (let i = 0; i < n; i++) {
     // Re-query fresh each pass — goBack rebuilds the search DOM, stale handles die.
-    const arts = await page.$$('div[role="article"]');
+    const arts = await page.$$(CARD_SEL);
     if (i >= arts.length) break;
     const art = arts[i];
     const text = await art.evaluate(e => (e.innerText || '').replace(/Facebook/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 800)).catch(() => '');
@@ -6188,10 +6211,21 @@ async function _fbSearchHarvest(page, gid, max_posts) {
       return a ? (a.innerText || '').trim().slice(0, 80) : '';
     }).catch(() => '');
 
+    // Permalink shapes in preference order. /commerce/listing/<id> is what a
+    // buy/sell group's results actually carry -- without it every result in
+    // such a group is unaddressable and silently dropped.
     const readHref = () => art.evaluate(e => {
-      for (const l of e.querySelectorAll('a')) {
-        const h = l.href || l.getAttribute('href') || '';
-        if (/\/(?:posts|permalink)\/\d+|story_fbid=\d+/.test(h)) return h;
+      const pats = [
+        /\/(?:posts|permalink)\/\d+|story_fbid=\d+/,
+        /\/commerce\/listing\/\d+/,
+        /\/marketplace\/item\/\d+/,
+        /\/photo\/?\?fbid=\d+/,
+      ];
+      for (const re of pats) {
+        for (const l of e.querySelectorAll('a')) {
+          const h = l.href || l.getAttribute('href') || '';
+          if (re.test(h)) return h;
+        }
       }
       return null;
     }).catch(() => null);
