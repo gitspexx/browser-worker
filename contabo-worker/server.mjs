@@ -80,6 +80,22 @@ async function adsReachable() {
   }
 }
 
+// AdsPower restores every tab the profile had when it was last stopped, and nothing
+// ever closes them, so the tab set is a one-way ratchet. Playwright's
+// connectOverCDP has to initialize every restored page target before it resolves
+// (CRBrowser.connect -> _waitForAllPagesToBeInitialized), which makes connect time
+// linear in tab count. Measured on fb-bali-secondary 2026-09-07:
+//
+//     74 tabs -> 27424 ms      (over the 30s default timeout: a permanent "hang")
+//      1 tab  ->    28 ms
+//
+// `open_tabs=1` tells AdsPower NOT to restore them (the naming is inverted vs the
+// docs' wording) and `ip_tab=0` drops the IP-check tab, which is also the page most
+// likely to stall forever when a proxy is dead. Closing tabs at runtime does NOT
+// work -- AdsPower restores from its own saved session state, verified by closing 73
+// of 74 and getting all 74 back on the next start.
+const ADS_START_PARAMS = '&open_tabs=1&ip_tab=0';
+
 async function withSession(profileId, fn, useAdsPower = true) {
   if (!useAdsPower || !profileId) {
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
@@ -87,7 +103,7 @@ async function withSession(profileId, fn, useAdsPower = true) {
     const page = await ctx.newPage();
     try { return await fn(page); } finally { await browser.close().catch(() => {}); }
   }
-  const start = await ads(`/api/v1/browser/start?user_id=${profileId}`);
+  const start = await ads(`/api/v1/browser/start?user_id=${profileId}${ADS_START_PARAMS}`);
   const browser = await chromium.connectOverCDP(start.ws.puppeteer);
   const ctx = browser.contexts()[0] ?? (await browser.newContext());
   const page = ctx.pages()[0] ?? (await ctx.newPage());
@@ -5368,7 +5384,7 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
     }
 
     // Start the profile (returns ws.puppeteer URL for CDP).
-    const start = await ads(`/api/v1/browser/start?user_id=${encodeURIComponent(userId)}`);
+    const start = await ads(`/api/v1/browser/start?user_id=${encodeURIComponent(userId)}${ADS_START_PARAMS}`);
     const browser = await chromium.connectOverCDP(start.ws.puppeteer);
     const ctx = browser.contexts()[0] ?? (await browser.newContext());
 
@@ -5775,7 +5791,7 @@ async function _fbStartProfile(user_id) {
     await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
     await _fbSleep(2000);
   }
-  const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}`);
+  const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}${ADS_START_PARAMS}`);
   const ws = started?.ws?.puppeteer;
   if (!ws) throw new Error('adspower start: no CDP url returned');
   const browser = await chromium.connectOverCDP(ws);
