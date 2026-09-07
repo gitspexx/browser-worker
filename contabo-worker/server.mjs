@@ -6397,7 +6397,13 @@ async function _fbGetPost(page, post_url) {
 
   // Marketplace items have no dialog and no article -- their content is
   // role=main. Branch on the URL so a stray dialog cannot hijack them.
-  let scope = /\/marketplace\/item\//.test(canonical) ? await page.$('div[role="main"]') : null;
+  // /commerce/listing/<id> is the same surface as /marketplace/item/<id> -- a
+  // group's buy/sell results link to the former, and it renders in role="main"
+  // with no dialog and no article. Matching only /marketplace/item/ meant every
+  // commerce listing fell through to the dialog/article branch, found neither,
+  // and returned no_post_container (2026-09-08).
+  const isCommerce = /\/marketplace\/item\/|\/commerce\/listing\//.test(canonical);
+  let scope = isCommerce ? await page.$('div[role="main"]') : null;
   if (!scope) scope = await largestOf('div[role="dialog"]', /^\s*Notifications\b/i);
   if (!scope) scope = await largestOf('div[role="article"]');
   if (!scope) scope = await page.$('div[role="main"]');
