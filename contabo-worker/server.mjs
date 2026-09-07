@@ -63,18 +63,30 @@ function auth(requiredRole = null) {
 }
 
 // ── AdsPower helpers ────────────────────────────────────────────────────────
+// Every AdsPower call is bounded. These used to be bare fetch(), which inherits
+// undici's 300s default -- and several of them are awaited inside a finally, so a
+// wedged AdsPower could hold a request handler open for five minutes.
+const ADS_TIMEOUT_MS = Number(process.env.ADS_TIMEOUT_MS ?? 15000);
+
 async function ads(pathname) {
   await _adsGate();
-  const r = await fetch(ADS + pathname);
+  const r = await fetch(ADS + pathname, { signal: AbortSignal.timeout(ADS_TIMEOUT_MS) });
   const j = await r.json();
   if (j.code !== 0) throw new Error('AdsPower: ' + j.msg);
   return j.data;
 }
 
+// Liveness means the LOCAL API answers, not that a socket accepted. This used to
+// fetch `${ADS}/status` and return r.ok without reading the body -- AdsPower's shell
+// answers 200 there regardless, so /status reported adspower.reachable:true for an
+// hour after the API had stopped responding entirely (2026-08-30). Hit a real API
+// route and require code === 0.
 async function adsReachable() {
   try {
-    const r = await fetch(`${ADS}/status`);
-    return r.ok;
+    const r = await fetch(`${ADS}/api/v1/user/list?page=1&page_size=1`, { signal: AbortSignal.timeout(ADS_TIMEOUT_MS) });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return j?.code === 0;
   } catch {
     return false;
   }
@@ -96,6 +108,106 @@ async function adsReachable() {
 // of 74 and getting all 74 back on the next start.
 const ADS_START_PARAMS = '&open_tabs=1&ip_tab=0';
 
+
+// ── AdsPower session registry + reaper ──────────────────────────────────────
+//
+// withSession deliberately does NOT stop the browser when a handler returns:
+// consumidor.gov.br issues session cookies with a short server-side TTL, so a
+// stop between calls kills the login. That trade-off is correct, but it was
+// unbounded -- nothing ever stopped a session, so browsers accumulated until the
+// box ran out of memory (measured 2026-08-30: 87 SunBrowser processes holding
+// 5.2 GB, free RAM down to 6.3 of 16).
+//
+// So: keep sessions warm, but not forever. A session is reaped only when it has
+// been IDLE longer than ADS_IDLE_MS -- idle meaning no handler has touched it,
+// not merely that time has passed since it started. A portal that is polled
+// hourly stays warm indefinitely; one used once and abandoned goes away.
+//
+// Three safety properties, in order of importance:
+//   1. NEVER REAP BLIND. If the active-session list cannot be read, reap nothing.
+//      A wedged AdsPower must not look like "no sessions are in use".
+//   2. Sessions this process did not start are left alone until ADS_ORPHAN_GRACE_MS
+//      has passed since boot. After a worker restart every live browser is an
+//      orphan (the CDP client is gone), but a deploy should not race a handler
+//      that is mid-flight in the outgoing process.
+//   3. ADS_NEVER_REAP is an explicit allowlist of profile ids that are never
+//      touched, for a login too expensive to rebuild.
+const ADS_IDLE_MS = Number(process.env.ADS_IDLE_MS ?? 45 * 60 * 1000);
+const ADS_REAP_EVERY_MS = Number(process.env.ADS_REAP_EVERY_MS ?? 5 * 60 * 1000);
+const ADS_ORPHAN_GRACE_MS = Number(process.env.ADS_ORPHAN_GRACE_MS ?? 10 * 60 * 1000);
+const ADS_NEVER_REAP = new Set(
+  (process.env.ADS_NEVER_REAP ?? '').split(',').map((x) => x.trim()).filter(Boolean),
+);
+const ADS_REAP_ENABLED = String(process.env.ADS_REAP_ENABLED ?? '1') !== '0';
+
+const adsSessions = new Map(); // profileId -> { startedAt, lastUsedAt }
+const adsBootAt = Date.now();
+const adsReapStats = { runs: 0, reaped: 0, skippedBlind: 0, lastRunAt: null, lastError: null };
+
+/** Record that a profile is in use. Called on every start and on every touch. */
+function adsTouch(profileId) {
+  if (!profileId) return;
+  const now = Date.now();
+  const prev = adsSessions.get(profileId);
+  adsSessions.set(profileId, { startedAt: prev?.startedAt ?? now, lastUsedAt: now });
+}
+
+/** Stop a profile, with the failure actually reported. The 13 call sites that
+ *  wrapped this in a bare `catch {}` could not tell a successful stop from a
+ *  timeout, which is how sessions leaked without a trace. */
+async function adsStop(profileId, reason) {
+  if (!profileId) return false;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await fbPostAds(`/api/v1/browser/stop?user_id=${profileId}`);
+      adsSessions.delete(profileId);
+      return true;
+    } catch (e) {
+      if (attempt === 2) {
+        console.error(`[ads] stop failed profile=${profileId} reason=${reason}: ${e?.message || e}`);
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  return false;
+}
+
+async function adsReapOnce() {
+  adsReapStats.runs++;
+  adsReapStats.lastRunAt = new Date().toISOString();
+  let active;
+  try {
+    const data = await ads('/api/v1/browser/local-active');
+    active = (data?.list ?? []).map((x) => x.user_id).filter(Boolean);
+  } catch (e) {
+    // Property 1: cannot enumerate -> reap nothing.
+    adsReapStats.skippedBlind++;
+    adsReapStats.lastError = String(e?.message || e).slice(0, 200);
+    return;
+  }
+  const now = Date.now();
+  for (const id of active) {
+    if (ADS_NEVER_REAP.has(id)) continue;
+    const rec = adsSessions.get(id);
+    if (!rec) {
+      // Property 2: not ours -- an orphan from a previous process.
+      if (now - adsBootAt < ADS_ORPHAN_GRACE_MS) continue;
+      if (await adsStop(id, 'orphan')) adsReapStats.reaped++;
+      continue;
+    }
+    if (now - rec.lastUsedAt < ADS_IDLE_MS) continue;
+    if (await adsStop(id, 'idle')) adsReapStats.reaped++;
+  }
+  // A session we track but AdsPower no longer reports is already gone.
+  for (const id of [...adsSessions.keys()]) if (!active.includes(id)) adsSessions.delete(id);
+}
+
+if (ADS_REAP_ENABLED) {
+  const timer = setInterval(() => { adsReapOnce().catch(() => {}); }, ADS_REAP_EVERY_MS);
+  timer.unref?.();
+}
+
 async function withSession(profileId, fn, useAdsPower = true) {
   if (!useAdsPower || !profileId) {
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
@@ -104,12 +216,18 @@ async function withSession(profileId, fn, useAdsPower = true) {
     try { return await fn(page); } finally { await browser.close().catch(() => {}); }
   }
   const start = await ads(`/api/v1/browser/start?user_id=${profileId}${ADS_START_PARAMS}`);
+  adsTouch(profileId);
   const browser = await chromium.connectOverCDP(start.ws.puppeteer);
   const ctx = browser.contexts()[0] ?? (await browser.newContext());
   const page = ctx.pages()[0] ?? (await ctx.newPage());
   try {
     return await fn(page);
   } finally {
+    // Still deliberately not stopping the browser here -- see the note below.
+    // What changed is that the session is now REGISTERED, so the reaper above
+    // will stop it once it has gone ADS_IDLE_MS without being touched. Warm
+    // stays warm; abandoned no longer means forever.
+    adsTouch(profileId);
     // IMPORTANT: don't close Chrome between calls. consumidor.gov.br uses
     // session cookies + a short server-side TTL — every stop kills the
     // login. Leave the AdsPower profile running; AdsPower handles idle
@@ -5282,6 +5400,15 @@ app.get('/status', auth(), async (req, res) => {
     // Proves the proxy-quota saving is actually in effect. `blocked: 0` with a
     // non-zero `allowed` means the route filter silently stopped applying.
     fb_assets: { enabled: FB_BLOCK_ASSETS, ...fbAssetStats },
+    // Sessions this process is keeping warm, and what the reaper has done.
+    // skippedBlind climbing means the reaper cannot enumerate AdsPower and is
+    // deliberately doing nothing -- that is a fault to investigate, not idleness.
+    ads_sessions: {
+      tracked: adsSessions.size,
+      idle_ms: ADS_IDLE_MS,
+      never_reap: [...ADS_NEVER_REAP],
+      ...adsReapStats,
+    },
   });
 });
 
@@ -5385,6 +5512,7 @@ app.post('/airline/setup', auth('admin'), async (_req, res) => {
 
     // Start the profile (returns ws.puppeteer URL for CDP).
     const start = await ads(`/api/v1/browser/start?user_id=${encodeURIComponent(userId)}${ADS_START_PARAMS}`);
+    adsTouch(userId);
     const browser = await chromium.connectOverCDP(start.ws.puppeteer);
     const ctx = browser.contexts()[0] ?? (await browser.newContext());
 
@@ -5571,7 +5699,7 @@ const FB_POST_BUTTON_SELECTORS = [
 ];
 async function fbPostAds(pathname) {
   await _adsGate();
-  const r = await fetch(`${ADS}${pathname}`);
+  const r = await fetch(`${ADS}${pathname}`, { signal: AbortSignal.timeout(ADS_TIMEOUT_MS) });
   const j = await r.json();
   if (j.code !== 0) throw new Error(`adspower ${pathname}: ${j.msg}`);
   return j.data || {};
@@ -5792,6 +5920,7 @@ async function _fbStartProfile(user_id) {
     await _fbSleep(2000);
   }
   const started = await fbPostAds(`/api/v1/browser/start?user_id=${user_id}${ADS_START_PARAMS}`);
+  adsTouch(user_id);
   const ws = started?.ws?.puppeteer;
   if (!ws) throw new Error('adspower start: no CDP url returned');
   const browser = await chromium.connectOverCDP(ws);
