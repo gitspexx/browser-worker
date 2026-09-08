@@ -5849,8 +5849,34 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
         }
       } catch {}
     }
+    // Clicking Post is not evidence the post exists. Most Bali job and rental
+    // groups hold member posts for admin approval, and FB says so in a notice
+    // rather than an error -- so the click succeeds, no permalink is ever
+    // minted, and this handler used to report ok:true on a post that never
+    // went live. Measured 2026-09-08 on ubud.jobs: ok:true, posted_url:null,
+    // and a search of the group minutes later did not find the post.
+    //
+    // Report what is actually known:
+    //   live      -- a permalink exists, the post is addressable
+    //   pending   -- FB showed an approval notice; it is queued, not published
+    //   unverified-- clicked, no permalink, no notice. May be either.
+    let status = permalink ? 'live' : 'unverified';
+    let notice = null;
+    if (!permalink) {
+      const PENDING = /pending approval|will be visible once|awaiting approval|being reviewed|admin(?:s)? (?:will|must) (?:review|approve)|menunggu persetujuan|sedang ditinjau|perlu disetujui/i;
+      notice = await page.evaluate((src) => {
+        const re = new RegExp(src, 'i');
+        for (const el of document.querySelectorAll('div[role="dialog"], div[role="alert"], div[role="status"], span, div')) {
+          const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+          if (t.length > 400 || t.length < 8) continue;
+          if (re.test(t)) return t.slice(0, 200);
+        }
+        return null;
+      }, PENDING.source).catch(() => null);
+      if (notice) status = 'pending';
+    }
     await page.close().catch(() => {});
-    return res.json({ ok: true, posted_url: permalink });
+    return res.json({ ok: true, status, posted_url: permalink, notice });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
