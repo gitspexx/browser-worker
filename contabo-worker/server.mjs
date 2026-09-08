@@ -5922,21 +5922,58 @@ function _fbParseMembers(text) {
 // app and renders nothing without them.
 const FB_BLOCK_ASSETS = String(process.env.FB_BLOCK_ASSETS ?? '1') !== '0';
 const FB_BLOCKED_TYPES = new Set(['image', 'media', 'font']);
-const fbAssetStats = { blocked: 0, allowed: 0 };
+const fbAssetStats = { blocked: 0, allowed: 0, mode: 'cdp' };
 
-// Photo extraction survives this: `img.src` is the resolved attribute and is set
-// whether or not the fetch happened, and the `naturalWidth < 200` size filter is
-// skipped when the width is 0 (`if (w && w < 200)`), which is what an aborted
-// image reports.
+// URL patterns for CDP Network.setBlockedURLs. Wildcards match the WHOLE url,
+// so every pattern needs a trailing `*` -- Facebook serves
+// `.../foo.jpg?stp=dst-jpg&_nc_ht=...` and a bare `*.jpg` would miss all of it.
+const FB_BLOCKED_URL_PATTERNS = [
+  '*.jpg*', '*.jpeg*', '*.png*', '*.gif*', '*.webp*', '*.svg*', '*.ico*', '*.bmp*',
+  '*.mp4*', '*.webm*', '*.m4v*', '*.mov*',
+  '*.woff*', '*.woff2*', '*.ttf*', '*.otf*', '*.eot*',
+];
+
+// Blocking is done at the network layer (CDP), NOT with page.route().
+//
+// Playwright request interception disables Chromium's HTTP cache for every
+// intercepted request -- and `page.route('**/*')` intercepts all of them. So
+// Facebook's React bundles were re-downloaded in full on every single page
+// load, and the "saving" cost far more than it saved. Measured 2026-09-09,
+// six consecutive group searches in one warm session:
+//
+//   page.route            8,208 / 8,432 / 8,834 / 8,403 / 8,626 / 8,383 KB
+//   Network.setBlockedURLs  1,159 /  940 / 1,003 /  899 /  901 /  925 KB
+//
+// 8.5 MB -> 0.97 MB per search, an 8.8x cut, purely from letting the cache
+// work. This is what consumed a 10 GB/month plan in six days (2026-08-27).
+//
+// Stylesheets and scripts are still deliberately NOT blocked -- Facebook is a
+// React app and renders nothing without them.
+//
+// Photo extraction survives this: `img.src` is the resolved attribute and is
+// set whether or not the fetch happened, and the `naturalWidth < 200` size
+// filter is skipped when the width is 0, which is what a blocked image reports.
 async function _fbBlockAssets(page) {
   if (!FB_BLOCK_ASSETS) return;
-  await page.route('**/*', (route) => {
-    const blocked = FB_BLOCKED_TYPES.has(route.request().resourceType());
-    if (blocked) fbAssetStats.blocked++; else fbAssetStats.allowed++;
-    // The page can close mid-flight; a rejected abort/continue must not take
-    // down the scrape.
-    return (blocked ? route.abort() : route.continue()).catch(() => {});
-  }).catch(() => {});
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Network.enable');
+    await cdp.send('Network.setBlockedURLs', { urls: FB_BLOCKED_URL_PATTERNS });
+    // Keep /health's proof-of-saving meaningful: blocked:0 with a non-zero
+    // allowed still means the filter stopped applying.
+    cdp.on('Network.loadingFailed', (e) => { if (e?.blockedReason) fbAssetStats.blocked++; });
+    cdp.on('Network.loadingFinished', () => { fbAssetStats.allowed++; });
+    fbAssetStats.mode = 'cdp';
+  } catch {
+    // CDP unavailable (non-Chromium target, session already closed). Fall back
+    // to the routed filter -- worse for bandwidth, but better than no blocking.
+    fbAssetStats.mode = 'route';
+    await page.route('**/*', (route) => {
+      const blocked = FB_BLOCKED_TYPES.has(route.request().resourceType());
+      if (blocked) fbAssetStats.blocked++; else fbAssetStats.allowed++;
+      return (blocked ? route.abort() : route.continue()).catch(() => {});
+    }).catch(() => {});
+  }
 }
 
 async function _fbStartProfile(user_id) {
