@@ -6040,6 +6040,37 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   }
 });
 
+// Facebook stopped exposing the poster's name in any of the heading anchors the
+// harvesters query, so post_author came back '' on every card. The name is
+// still there -- it is the head of the card's own innerText, sitting before the
+// " \u00b7 " that separates the byline from the body:
+//
+//   "Ida Ayu Utari \u00b7 HIRING - SITE MANAGER ..."
+//
+// On some cards FB pads the byline with an anti-scrape run of single letters
+// each glued to a U+034F COMBINING GRAPHEME JOINER. Stripping the joiners turns
+// that padding into one-character tokens, which a real name never starts with,
+// so the name is the leading run of tokens at least two characters long.
+function _fbAuthorFromCardText(text) {
+  const t = String(text || '');
+  const cut = t.indexOf('\u00b7');
+  // No byline separator means no byline to read -- guessing from the body would
+  // return the first words of the post as a person's name.
+  if (cut < 1) return '';
+  const head = t.slice(0, cut);
+  const clean = head
+    .replace(/[\u034f\u200b-\u200f\u2060\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return '';
+  const words = [];
+  for (const w of clean.split(' ')) {
+    if (w.length < 2 || words.length >= 5) break;
+    words.push(w);
+  }
+  return words.join(' ').slice(0, 80);
+}
+
 function _fbNormPermalink(raw, gid) {
   try {
     const u = new URL(raw, 'https://www.facebook.com');
@@ -6109,7 +6140,7 @@ async function _fbHarvestPosts(page, gid, max_posts, scroll_passes) {
       return a ? (a.innerText || '').trim().slice(0, 80) : '';
     }).catch(() => '');
     seen.add(perm);
-    out.push({ post_url: perm, post_text: text, post_author: author });
+    out.push({ post_url: perm, post_text: text, post_author: author || _fbAuthorFromCardText(text) });
   }
 
   const pageLinks = await page.$$eval('a[href*="/posts/"], a[href*="/permalink/"]', els => els.length).catch(() => 0);
@@ -6263,7 +6294,7 @@ async function _fbSearchHarvest(page, gid, max_posts) {
 
     if (!perm || seen.has(perm)) continue;
     seen.add(perm);
-    out.push({ post_url: perm, post_text: text, post_author: author });
+    out.push({ post_url: perm, post_text: text, post_author: author || _fbAuthorFromCardText(text) });
   }
   return { posts: out, debug: { resultCards: count, attemptedClicks: debugClicks, pageUrl: (page.url() || '').slice(0, 140) } };
 }
