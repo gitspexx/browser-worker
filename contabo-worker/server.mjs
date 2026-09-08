@@ -6064,8 +6064,50 @@ const FB_PENDING_SELECTORS = [
   'div[role="button"]:has-text("Requested")',
   'div[role="button"]:has-text("Pending")',
 ];
+// Answering the membership gate. A group can put up to three things between
+// Join and Joined: a rules checkbox, free-text membership questions, and a
+// final confirm. Callers pass `answers` (in question order) plus an
+// `answer_default` for anything unanswered, and `agree_rules` to tick the
+// rules box.
+//
+// When a dialog cannot be completed the handler returns `dialog` -- the real
+// labels, textboxes, checkboxes and buttons it found -- instead of guessing.
+// The selectors below were written against a live baliexpat join; every other
+// group's gate is unverified, so the dump is how we learn the next shape
+// rather than shipping a silent failure.
+const FB_SUBMIT_SELECTORS = [
+  'div[aria-label="Submit"][role="button"]',
+  'div[aria-label="Send"][role="button"]',
+  'div[aria-label="Join group"][role="button"]',
+  'div[role="button"]:has-text("Submit")',
+  'div[role="button"]:has-text("Send")',
+  'div[role="button"]:has-text("Kirim")',
+  'div[role="button"]:has-text("Join group")',
+  'div[role="button"]:has-text("Agree")',
+  'div[role="button"]:has-text("Setuju")',
+  'div[role="button"]:has-text("Continue")',
+];
+async function _fbDumpDialog(page) {
+  return page.evaluate(() => {
+    const ds = [...document.querySelectorAll('div[role="dialog"]')]
+      .filter(d => !/^Notifications/i.test(d.getAttribute('aria-label') || ''));
+    return ds.map(d => ({
+      label: d.getAttribute('aria-label'),
+      text: (d.innerText || '').replace(/\s+/g, ' ').slice(0, 600),
+      textboxes: [...d.querySelectorAll('div[contenteditable="true"],textarea,input[type="text"]')]
+        .map(t => ({ tag: t.tagName, label: t.getAttribute('aria-label') || t.getAttribute('placeholder') || '' })),
+      checkboxes: [...d.querySelectorAll('input[type="checkbox"],div[role="checkbox"]')]
+        .map(c => ({ label: c.getAttribute('aria-label') || '', checked: c.getAttribute('aria-checked') })),
+      buttons: [...d.querySelectorAll('[role="button"]')]
+        .map(x => ({ label: x.getAttribute('aria-label') || '', text: (x.innerText || '').trim().slice(0, 28), disabled: x.getAttribute('aria-disabled') })).slice(0, 16),
+    }));
+  }).catch(() => []);
+}
+
 app.post('/fb-pool/groups/join', auth(), async (req, res) => {
-  const { profile, group_url } = req.body ?? {};
+  const { profile, group_url, answers, answer_default, agree_rules = true } = req.body ?? {};
+  const answerList = Array.isArray(answers) ? answers.map(a => String(a ?? '')) : [];
+  const fallbackAnswer = answer_default == null ? '' : String(answer_default);
   if (!profile || !group_url) return res.status(422).json({ ok: false, error: 'profile, group_url required' });
   const user_id = FB_POST_PROFILE_MAP[profile];
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
@@ -6087,15 +6129,65 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
     }
     if (!clicked) { await page.close().catch(() => {}); return res.status(200).json({ ok: false, error: 'join_button_missing' }); }
     await _fbSleep(3500);
-    const questions = await isVisible('div[role="dialog"]:has-text("answer"), div[role="dialog"]:has-text("question")', 3000);
-    if (questions) { await page.close().catch(() => {}); return res.json({ ok: true, joined: false, needs_questions: true }); }
+
+    // Work through the gate: rules checkbox, then questions, then confirm.
+    // Bounded -- a dialog that will not advance must end the attempt rather
+    // than spin.
+    const filled = [];
+    let answerIdx = 0;
+    for (let pass = 0; pass < 4; pass++) {
+      const dlg = page.locator('div[role="dialog"]:not([aria-label="Notifications"])').last();
+      if (!(await dlg.count())) break;
+
+      if (agree_rules) {
+        const boxes = dlg.locator('input[type="checkbox"], div[role="checkbox"][aria-checked="false"]');
+        const n = await boxes.count().catch(() => 0);
+        for (let i = 0; i < n; i++) {
+          await boxes.nth(i).click({ timeout: 2500 }).catch(() => {});
+          await _fbSleep(300);
+        }
+        if (n) filled.push(`checked:${n}`);
+      }
+
+      const boxesSel = 'div[contenteditable="true"], textarea, input[type="text"]';
+      const tb = dlg.locator(boxesSel);
+      const tn = await tb.count().catch(() => 0);
+      for (let i = 0; i < tn; i++) {
+        const val = answerIdx < answerList.length ? answerList[answerIdx] : fallbackAnswer;
+        answerIdx++;
+        if (!val) continue;
+        const box = tb.nth(i);
+        await box.click({ timeout: 2500 }).catch(() => {});
+        await _fbSleep(250);
+        try { await box.fill(val); } catch { await box.pressSequentially(val, { delay: 8 }).catch(() => {}); }
+        filled.push(`answered:${val.slice(0, 24)}`);
+        await _fbSleep(400);
+      }
+
+      let advanced = false;
+      for (const sel of FB_SUBMIT_SELECTORS) {
+        try {
+          const btn = dlg.locator(sel).last();
+          if (!(await btn.count())) continue;
+          if ((await btn.getAttribute('aria-disabled')) === 'true') continue;
+          await btn.click({ timeout: 2500 });
+          advanced = true; break;
+        } catch {}
+      }
+      await _fbSleep(3000);
+      if (!advanced) break;
+    }
+
     let joined = false, pending = false;
     for (const sel of FB_JOINED_SELECTORS) { if (await isVisible(sel, 3000)) { joined = true; break; } }
     if (!joined) { for (const sel of FB_PENDING_SELECTORS) { if (await isVisible(sel, 2000)) { pending = true; break; } } }
+    // Only dump when the outcome is unknown -- the dump is a diagnostic for an
+    // unhandled gate, not routine output.
+    const dialog = (joined || pending) ? undefined : await _fbDumpDialog(page);
     await page.close().catch(() => {});
-    if (joined) return res.json({ ok: true, joined: true });
-    if (pending) return res.json({ ok: true, joined: true, pending: true });
-    return res.json({ ok: true, joined: false, unverified: true });
+    if (joined) return res.json({ ok: true, joined: true, filled });
+    if (pending) return res.json({ ok: true, joined: true, pending: true, filled });
+    return res.json({ ok: true, joined: false, unverified: true, filled, dialog });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
