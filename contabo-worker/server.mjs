@@ -5399,7 +5399,15 @@ app.get('/status', auth(), async (req, res) => {
     worker: { port: PORT, node: process.version, uptime_s: Math.round(process.uptime()) },
     // Proves the proxy-quota saving is actually in effect. `blocked: 0` with a
     // non-zero `allowed` means the route filter silently stopped applying.
-    fb_assets: { enabled: FB_BLOCK_ASSETS, ...fbAssetStats },
+    fb_assets: {
+      enabled: FB_BLOCK_ASSETS,
+      ...fbAssetStats,
+      mb: Math.round(fbAssetStats.bytes / 1048576 * 10) / 10,
+      // The number every proxy-plan decision actually turns on.
+      mb_per_page_load: fbAssetStats.pageLoads
+        ? Math.round(fbAssetStats.bytes / fbAssetStats.pageLoads / 1048576 * 100) / 100
+        : null,
+    },
     // Sessions this process is keeping warm, and what the reaper has done.
     // skippedBlind climbing means the reaper cannot enumerate AdsPower and is
     // deliberately doing nothing -- that is a fault to investigate, not idleness.
@@ -5922,7 +5930,13 @@ function _fbParseMembers(text) {
 // app and renders nothing without them.
 const FB_BLOCK_ASSETS = String(process.env.FB_BLOCK_ASSETS ?? '1') !== '0';
 const FB_BLOCKED_TYPES = new Set(['image', 'media', 'font']);
-const fbAssetStats = { blocked: 0, allowed: 0, mode: 'cdp' };
+// bytes/pageLoads exist so proxy spend is measured, not estimated. Residential
+// traffic is billed by the byte and every projection of it so far has been
+// arithmetic over synthetic probes -- which understated the real cost, because
+// each scrape call starts and stops its own browser rather than reusing one
+// warm session. encodedDataLength is what the network actually carried
+// (compressed, headers included), so this is the same quantity the vendor bills.
+const fbAssetStats = { blocked: 0, allowed: 0, mode: 'cdp', bytes: 0, pageLoads: 0 };
 
 // URL patterns for CDP Network.setBlockedURLs. Wildcards match the WHOLE url,
 // so every pattern needs a trailing `*` -- Facebook serves
@@ -5962,7 +5976,13 @@ async function _fbBlockAssets(page) {
     // Keep /health's proof-of-saving meaningful: blocked:0 with a non-zero
     // allowed still means the filter stopped applying.
     cdp.on('Network.loadingFailed', (e) => { if (e?.blockedReason) fbAssetStats.blocked++; });
-    cdp.on('Network.loadingFinished', () => { fbAssetStats.allowed++; });
+    cdp.on('Network.loadingFinished', (e) => {
+      fbAssetStats.allowed++;
+      fbAssetStats.bytes += (e?.encodedDataLength || 0);
+    });
+    // One page per _fbStartProfile call, so this counts scrape operations --
+    // bytes/pageLoads is the per-call cost the projections need.
+    fbAssetStats.pageLoads++;
     fbAssetStats.mode = 'cdp';
   } catch {
     // CDP unavailable (non-Chromium target, session already closed). Fall back
