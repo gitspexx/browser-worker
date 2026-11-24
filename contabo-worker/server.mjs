@@ -5742,7 +5742,7 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
   if (!profile || !group_url || (!text && !imgs.length)) {
     return res.status(422).json({ error: 'profile, group_url, and (text or image_urls) required' });
   }
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ error: `unknown profile: ${profile}` });
   let page = null, permalink = null, imgTmp = null;
   try {
@@ -5902,6 +5902,32 @@ Object.assign(FB_POST_PROFILE_MAP, {
   'fb-bca-latam-main': 'k1dfw1g0',
   'fb-bca-latam-secondary': 'k1dkhla0',
 });
+// Accounts bought after the map above was written are addressed by their
+// AdsPower profile name, so a new account is an AdsPower profile, not a deploy.
+// Resolution order: the static map, a raw AdsPower user_id, then an exact
+// name match against the live profile list (cached 10 min). Never throws --
+// the routes run this before their try block, and Express 4 does not catch a
+// rejected async handler.
+const _fbNameCache = new Map(); // name -> { id, at }
+const FB_NAME_TTL_MS = 10 * 60 * 1000;
+async function _fbResolveProfile(profile) {
+  if (!profile || typeof profile !== 'string') return null;
+  if (FB_POST_PROFILE_MAP[profile]) return FB_POST_PROFILE_MAP[profile];
+  if (/^k1[a-z0-9]{5,}$/.test(profile)) return profile;
+  const hit = _fbNameCache.get(profile);
+  if (hit && Date.now() - hit.at < FB_NAME_TTL_MS) return hit.id;
+  try {
+    const data = await fbPostAds('/api/v1/user/list?page=1&page_size=200');
+    const now = Date.now();
+    for (const u of data.list || []) {
+      if (u?.name && u?.user_id) _fbNameCache.set(u.name, { id: u.user_id, at: now });
+    }
+  } catch (e) {
+    console.warn(`[fb] profile lookup failed for ${profile}: ${e?.message || e}`);
+    return null;
+  }
+  return _fbNameCache.get(profile)?.id ?? null;
+}
 const _fbSleep = (ms) => new Promise(r => setTimeout(r, ms));
 function _fbParseMembers(text) {
   if (!text) return null;
@@ -5997,7 +6023,41 @@ async function _fbBlockAssets(page) {
   }
 }
 
+// Proxy guard. 2026-11-24: IPRoyal ran dry, the Bali profiles were flipped to
+// no_proxy so they could be opened by hand, and the growthops crons kept
+// opening them here anyway -- from the OVH datacenter IP, nowhere near the
+// Denpasar history Facebook holds for those accounts. Debbie hit a checkpoint.
+// Every fb-pool route starts through _fbStartProfile, so refusing here covers
+// all of them. FB_ALLOW_NO_PROXY=1 is the escape hatch; only OK results are
+// cached, so a re-bound proxy is picked up on the next call.
+const _fbProxyOk = new Map(); // user_id -> checkedAt
+const FB_PROXY_OK_TTL_MS = 5 * 60 * 1000;
+function _fbHasProxy(u) {
+  if (u?.proxyid || u?.proxy_id) return true;
+  const c = u?.user_proxy_config;
+  return !!(c && c.proxy_soft && c.proxy_soft !== 'no_proxy');
+}
+async function _fbAssertProxy(user_id) {
+  if (process.env.FB_ALLOW_NO_PROXY === '1') return;
+  const at = _fbProxyOk.get(user_id);
+  if (at && Date.now() - at < FB_PROXY_OK_TTL_MS) return;
+  let data = await fbPostAds(`/api/v1/user/list?user_id=${encodeURIComponent(user_id)}`);
+  let prof = (data.list || []).find((u) => u.user_id === user_id);
+  // The user_id filter has come back empty for profiles that exist; fall back
+  // to the full list rather than refusing a healthy profile.
+  if (!prof) {
+    data = await fbPostAds('/api/v1/user/list?page=1&page_size=200');
+    prof = (data.list || []).find((u) => u.user_id === user_id);
+  }
+  if (!prof) throw new Error(`profile_not_found: AdsPower has no profile ${user_id}`);
+  if (!_fbHasProxy(prof)) {
+    throw new Error(`no_proxy_refused: AdsPower profile ${user_id} has no proxy; refusing to open Facebook from the VPS IP`);
+  }
+  _fbProxyOk.set(user_id, Date.now());
+}
+
 async function _fbStartProfile(user_id) {
+  await _fbAssertProxy(user_id);
   const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
   if (active?.status === 'Active') {
     await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
@@ -6017,7 +6077,7 @@ async function _fbStartProfile(user_id) {
 // POST /fb-pool/groups/discover — scrape FB Groups search via warmed profile.
 app.post('/fb-pool/groups/discover', auth(), async (req, res) => {
   const { profile, query = 'Bali', max_results = 30, scroll_passes = 3 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   try {
@@ -6130,7 +6190,7 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   const answerList = Array.isArray(answers) ? answers.map(a => String(a ?? '')) : [];
   const fallbackAnswer = answer_default == null ? '' : String(answer_default);
   if (!profile || !group_url) return res.status(422).json({ ok: false, error: 'profile, group_url required' });
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   const isVisible = async (sel, t = 2500) => { try { return await page.locator(sel).first().isVisible({ timeout: t }); } catch { return false; } };
@@ -6478,7 +6538,7 @@ async function _fbSearchHarvest(page, gid, max_posts) {
 // POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
 app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
   const { profile, group_url, max_posts = 15, scroll_passes = 3 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
   let page = null;
@@ -6512,7 +6572,7 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
 // (the search results page is a different surface that does render articles).
 app.post('/fb-pool/groups/search', auth(), async (req, res) => {
   const { profile, group_url, query, max_posts = 15, scroll_passes = 4 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
   if (!query) return res.status(422).json({ ok: false, error: 'query required' });
@@ -6719,7 +6779,7 @@ async function _fbGetPost(page, post_url) {
 // groups/scan gives 800 chars and no photos; Kasa needs both.
 app.post('/fb-pool/post/get', auth(), async (req, res) => {
   const { profile, post_url } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url) return res.status(422).json({ ok: false, error: 'post_url required' });
   let page = null;
@@ -6739,7 +6799,7 @@ app.post('/fb-pool/post/get', auth(), async (req, res) => {
 // list (people DMing us after seeing comments/posts) so GrowthOps can show it.
 app.post('/fb-pool/inbox', auth(), async (req, res) => {
   const { profile, max_threads = 25 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   try {
@@ -6800,7 +6860,7 @@ app.post('/fb-pool/inbox', auth(), async (req, res) => {
 // recent messages (text + direction) so GrowthOps can show the conversation.
 app.post('/fb-pool/thread', auth(), async (req, res) => {
   const { profile, thread_url, max_messages = 40 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!thread_url) return res.status(422).json({ ok: false, error: 'thread_url required' });
   let page = null;
@@ -6852,7 +6912,7 @@ const FB_MSG_COMPOSER_SELECTORS = [
 ];
 app.post('/fb-pool/send-message', auth(), async (req, res) => {
   const { profile, thread_url, text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!thread_url || !text) return res.status(422).json({ ok: false, error: 'thread_url, text required' });
   const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim();
@@ -6889,7 +6949,7 @@ app.post('/fb-pool/send-message', auth(), async (req, res) => {
 // open the ⋯ menu -> Edit, replace the text, save). Used to strip em dashes.
 app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
   const { profile, post_url, comment_url, old_text, new_text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url || !old_text || !new_text) return res.status(422).json({ ok: false, error: 'post_url, old_text, new_text required' });
   const want = String(old_text).replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
@@ -6971,7 +7031,7 @@ app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
 // comments whose deep-link wasn't captured at post time + to inspect format.
 app.post('/fb-pool/comment-find', auth(), async (req, res) => {
   const { profile, post_url, text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url || !text) return res.status(422).json({ ok: false, error: 'post_url, text required' });
   let page = null;
@@ -7034,7 +7094,7 @@ const FB_COMMENT_BOX_SELECTORS = [
 app.post('/fb-pool/comment', auth(), async (req, res) => {
   const { profile, post_url, text } = req.body ?? {};
   if (!profile || !post_url || !text) return res.status(422).json({ ok: false, error: 'profile, post_url, text required' });
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim(); // Enter submits — keep single line
   let page = null;
