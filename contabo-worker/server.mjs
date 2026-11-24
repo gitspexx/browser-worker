@@ -5,6 +5,7 @@ import path, { join } from 'path';
 import { spawn, exec as execCb } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
+import { wyregFormLlc } from './wyreg-form-llc.mjs';
 
 const exec = promisify(execCb);
 
@@ -7175,3 +7176,205 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 server.requestTimeout = 0;
 server.headersTimeout = 60_000;
 server.keepAliveTimeout = 75_000;
+
+
+// â”€â”€â”€ partner_apply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Fill (mode 'fill') or file (mode 'submit') a partner-programme application
+// on a third-party marketing form. Driven entirely by `payload`, which the
+// caller reads from banking_provider_ops.apply_payload â€” this handler knows
+// nothing about Brex or Payoneer specifically, so a new provider is a database
+// row, not a code change.
+//
+// SUBMIT FILES A REAL APPLICATION UNDER BCAX'S IDENTITY. Like
+// irs_apply_ein_submit, this refuses without a confirmation_token; the worker
+// does NOT enforce the approval gate (no job table, no dedupe, no idempotency
+// key here) â€” bca-app's partner-apply function does, and this token is the
+// proof that it did.
+//
+// Never tries to defeat a captcha, a bot wall or a login: it screenshots and
+// returns { manual: true } so a human takes over.
+handlers.partner_apply = async (page, { url, payload, mode = 'fill', submit = false, confirmation_token, jobId } = {}) => {
+  const tag = jobId || confirmation_token || `partner-${Date.now()}`;
+  const wantSubmit = mode === 'submit' || submit === true;
+
+  if (!url || !/^https:\/\//i.test(url)) throw new Error('partner_apply: https url required');
+  if (!payload || !Array.isArray(payload.fields) || payload.fields.length === 0) {
+    throw new Error('partner_apply: payload.fields required');
+  }
+  if (wantSubmit && !confirmation_token) {
+    throw new Error('partner_apply: confirmation_token required for mode=submit (the operator-approved token from the app)');
+  }
+
+  const shot = async (suffix) => {
+    const p = path.join(OUT, 'partner-apply', `${tag}-${suffix}.png`);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const buf = await page.screenshot({ path: p, fullPage: true }).catch(() => null);
+    return { path: p, b64: buf ? buf.toString('base64') : null };
+  };
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(2500);
+
+  // --- cookie consent ------------------------------------------------------
+  // Brex renders its Marketo form only after the consent gate is answered; left
+  // alone the page shows "It's not you it's us" and no form ever appears.
+  // This is a consent dialog a visitor must answer, not a bot wall: we answer
+  // it the privacy-preserving way (reject/necessary-only) and fall back to
+  // accept only if no reject control exists.
+  const consent = await page.evaluate(() => {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const btns = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"]')).filter(vis);
+    const byText = (re) => btns.find((b) => re.test((b.textContent || '').trim()));
+    const reject = byText(/^(reject all|reject|decline|only necessary|necessary only|essential only)$/i);
+    const accept = byText(/^(accept all|accept|allow all|agree|i agree|got it|ok)$/i);
+    const pick = reject || accept;
+    if (!pick) return null;
+    pick.click();
+    return (pick.textContent || '').trim().slice(0, 40);
+  }).catch(() => null);
+  if (consent) await page.waitForTimeout(2500);
+
+  // --- bot wall / login wall check, before anything is typed ---------------
+  // Hard rule: detect and report, never solve. The worker's CapMonster helpers
+  // (solveTurnstileChallenge, solveAntiCloudflare) are deliberately NOT used here.
+  const blocker = await page.evaluate(() => {
+    const has = (sel) => !!document.querySelector(sel);
+    if (has('iframe[src*="recaptcha"]') || has('.g-recaptcha') || has('[data-sitekey]')) return 'reCAPTCHA';
+    if (has('iframe[src*="challenges.cloudflare.com"]') || has('.cf-turnstile')) return 'Cloudflare Turnstile';
+    if (has('iframe[src*="hcaptcha"]') || has('.h-captcha')) return 'hCaptcha';
+    const t = (document.title || '').toLowerCase();
+    const b = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+    if (t.includes('just a moment') || b.includes('verify you are human') || b.includes('checking your browser')) return 'bot challenge interstitial';
+    if (has('input[type="password"]') && !document.querySelector('form[id^="mktoForm"]')) return 'login wall';
+    return null;
+  }).catch(() => null);
+  if (blocker) {
+    const s = await shot('blocked');
+    return {
+      portal: 'partner_apply', ok: false, manual: true, reason: blocker,
+      mode, url: page.url(), screenshot: s.path, screenshot_base64: s.b64,
+    };
+  }
+
+  // --- reveal the form if it lives behind a CTA / modal (Payoneer) ---------
+  if (payload.open_selector) {
+    const opener = page.locator(payload.open_selector).first();
+    if (await opener.count()) {
+      await opener.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  // --- wait for the async (Marketo) form to actually exist ----------------
+  // Marketo injects its fields with MktoForms2.loadForm AFTER load, so a
+  // domcontentloaded wait finds an empty container. Wait for a real input.
+  const ready = payload.ready_selector || `${payload.form_selector || 'form'} input`;
+  try {
+    await page.waitForSelector(ready, { state: 'visible', timeout: 45000 });
+  } catch {
+    const s = await shot('no-form');
+    return {
+      portal: 'partner_apply', ok: false, mode, url: page.url(),
+      error: `form never rendered (waited for ${ready})`,
+      consent_clicked: consent || null,
+      screenshot: s.path, screenshot_base64: s.b64,
+    };
+  }
+  await page.waitForTimeout(1000);
+
+  // --- type every field ---------------------------------------------------
+  const scope = payload.form_selector ? page.locator(payload.form_selector) : page;
+  const filled = [];
+  const missing = [];
+  for (const f of payload.fields) {
+    const value = typeof f.value === 'string' ? f.value : '';
+    if (!value) { if (f.required) missing.push(f.name); continue; }
+    const type = f.type || 'text';
+    try {
+      if (type === 'select') {
+        const sel = scope.locator(`select[name="${f.name}"]`).first();
+        if (!(await sel.count())) { missing.push(f.name); continue; }
+        // Marketo option VALUES routinely differ from their labels, so try the
+        // value first and fall back to the visible label rather than guessing.
+        try { await sel.selectOption({ value }); }
+        catch { await sel.selectOption({ label: value }); }
+      } else if (type === 'radio' || type === 'checkbox') {
+        const box = scope.locator(`input[name="${f.name}"][value="${value}"]`).first();
+        if (!(await box.count())) { missing.push(f.name); continue; }
+        await box.check({ force: true });
+      } else if (type === 'textarea') {
+        const ta = scope.locator(`textarea[name="${f.name}"]`).first();
+        if (!(await ta.count())) { missing.push(f.name); continue; }
+        await ta.fill(value);
+      } else {
+        const input = scope.locator(`input[name="${f.name}"]`).first();
+        if (!(await input.count())) { missing.push(f.name); continue; }
+        await input.fill(value);
+        // Marketo validates on blur; without this its inline errors fire late.
+        await input.blur().catch(() => {});
+      }
+      filled.push(f.name);
+    } catch (e) {
+      missing.push(`${f.name} (${String(e).slice(0, 120)})`);
+    }
+    await page.waitForTimeout(150);
+  }
+
+  const before = await shot(wantSubmit ? 'before-submit' : 'filled');
+
+  if (!wantSubmit) {
+    // The whole point of mode 'fill': stop here, hand back the picture.
+    return {
+      portal: 'partner_apply', ok: true, mode: 'fill', submitted: false,
+      url: page.url(), filled, missing,
+      screenshot: before.path, screenshot_base64: before.b64,
+    };
+  }
+
+  // --- submit -------------------------------------------------------------
+  const btn = scope.locator(payload.submit_selector || 'button[type="submit"], input[type="submit"], button.mktoButton').first();
+  if (!(await btn.count())) {
+    return {
+      portal: 'partner_apply', ok: false, mode: 'submit', submitted: false,
+      url: page.url(), filled, missing, error: 'submit button not found',
+      screenshot: before.path, screenshot_base64: before.b64,
+    };
+  }
+  await btn.click();
+  await page.waitForTimeout(9000);
+
+  // Marketo blocks a bad submit with inline .mktoError text and stays put.
+  const errors = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.mktoError, .mktoErrorMsg'))
+      .map((e) => (e.textContent || '').trim()).filter(Boolean).slice(0, 10)
+  ).catch(() => []);
+  const after = await shot('after-submit');
+
+  if (errors.length) {
+    return {
+      portal: 'partner_apply', ok: false, mode: 'submit', submitted: false,
+      url: page.url(), filled, missing, error: `form rejected: ${errors.join(' | ')}`,
+      screenshot: after.path, screenshot_base64: after.b64,
+    };
+  }
+
+  const confirmation = await page.evaluate(() => {
+    const t = (document.body?.innerText || '');
+    const m = t.match(/(thank you[^\n]{0,180}|we(?:'| ha)ve received[^\n]{0,180}|submission (?:received|successful)[^\n]{0,180})/i);
+    return m ? m[0].trim() : null;
+  }).catch(() => null);
+
+  return {
+    portal: 'partner_apply', ok: true, mode: 'submit', submitted: true,
+    url: page.url(), filled, missing,
+    confirmation: confirmation || 'submitted (no explicit confirmation banner)',
+    screenshot: after.path, screenshot_base64: after.b64,
+  };
+};
+
+// wyreg_form_llc -- staged Wyoming LLC formation in the wyreg cabinet. The stage
+// contract lives in wyreg-form-llc.mjs. Stages run one per /submit call because
+// the AdsPower watchdog can restart the browser mid-run; only the "pay" stage
+// spends money, and it refuses to unless the caller passes confirm_charge:true
+// along with the total the cart stage reported.
+handlers.wyreg_form_llc = wyregFormLlc;
