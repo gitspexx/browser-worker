@@ -5,6 +5,7 @@ import path, { join } from 'path';
 import { spawn, exec as execCb } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
+import { wyregFormLlc } from './wyreg-form-llc.mjs';
 
 const exec = promisify(execCb);
 
@@ -71,6 +72,21 @@ const ADS_TIMEOUT_MS = Number(process.env.ADS_TIMEOUT_MS ?? 15000);
 async function ads(pathname) {
   await _adsGate();
   const r = await fetch(ADS + pathname, { signal: AbortSignal.timeout(ADS_TIMEOUT_MS) });
+  const j = await r.json();
+  if (j.code !== 0) throw new Error('AdsPower: ' + j.msg);
+  return j.data;
+}
+
+// POST counterpart of ads(): same gate, same bound, same code check. The write
+// endpoints (user/create, user/update) only take JSON bodies.
+async function adsPost(pathname, body) {
+  await _adsGate();
+  const r = await fetch(ADS + pathname, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(ADS_TIMEOUT_MS),
+  });
   const j = await r.json();
   if (j.code !== 0) throw new Error('AdsPower: ' + j.msg);
   return j.data;
@@ -5466,6 +5482,74 @@ app.post('/adspower/ensure-running', auth(), async (_req, res) => {
   res.status(504).json({ error: 'AdsPower did not come online within 30s' });
 });
 
+// Upsert the AdsPower profile for a purchased Facebook account. Matches an
+// existing profile by user_id, else by exact name, else creates one. A new FB
+// profile must carry a proxy (the fb-pool guard refuses to open one without)
+// and always gets a desktop fingerprint: a mobile UA makes Facebook serve the
+// m.facebook DOM, which no fb-pool route can read (BR profiles, 2026-06-29).
+// The proxy password and cookies are passed through, never logged or echoed.
+const FB_DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36';
+app.post('/adspower/fb-profile', auth(), async (req, res) => {
+  const { name, user_id, group_name = 'facebook', remark, proxy, cookies, ua } = req.body ?? {};
+  if (!name && !user_id) return res.status(422).json({ ok: false, error: 'name or user_id required' });
+  let proxyCfg = null;
+  if (proxy) {
+    const type = proxy.type || 'http';
+    if (!['http', 'https', 'socks5'].includes(type) || !proxy.host || !proxy.port) {
+      return res.status(422).json({ ok: false, error: 'proxy needs type (http|https|socks5), host, port' });
+    }
+    proxyCfg = {
+      proxy_soft: 'other',
+      proxy_type: type,
+      proxy_host: String(proxy.host),
+      proxy_port: String(proxy.port),
+      proxy_user: proxy.user ? String(proxy.user) : '',
+      proxy_password: proxy.password ? String(proxy.password) : '',
+    };
+  }
+  const cookie = cookies == null ? null : typeof cookies === 'string' ? cookies : JSON.stringify(cookies);
+  try {
+    let id = user_id || null;
+    if (!id && name) {
+      const list = await ads('/api/v1/user/list?page=1&page_size=200');
+      id = (list.list ?? []).find((u) => u.name === name)?.user_id || null;
+    }
+    let created = false;
+    if (id) {
+      const body = { user_id: id };
+      if (name) body.name = name;
+      if (remark != null) body.remark = String(remark);
+      if (proxyCfg) body.user_proxy_config = proxyCfg;
+      if (cookie) body.cookie = cookie;
+      if (ua) body.fingerprint_config = { ua: String(ua) };
+      await adsPost('/api/v1/user/update', body);
+    } else {
+      if (!proxyCfg) return res.status(422).json({ ok: false, error: 'proxy required to create an FB profile' });
+      const groups = await ads('/api/v1/group/list?page=1&page_size=100');
+      const group = (groups.list ?? []).find((g) => g.group_name === group_name) ?? groups.list?.[0];
+      const body = {
+        name,
+        group_id: group?.group_id ?? '0',
+        user_proxy_config: proxyCfg,
+        fingerprint_config: { ua: ua ? String(ua) : FB_DESKTOP_UA, screen_resolution: '1920_1080', language: ['en-US', 'en'] },
+      };
+      if (remark != null) body.remark = String(remark);
+      if (cookie) body.cookie = cookie;
+      const out = await adsPost('/api/v1/user/create', body);
+      id = out?.id;
+      if (!id) throw new Error('AdsPower create returned no id');
+      created = true;
+    }
+    _fbProxyOk.delete(id);
+    for (const [k, v] of _fbNameCache) if (k === name || v.id === id) _fbNameCache.delete(k);
+    return res.json({ ok: true, user_id: id, created });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // One-shot operator setup for airline_balance. Creates (or finds) the
 // shared "airlines-shared" AdsPower profile, opens it, opens each airline's
 // login URL in a separate tab, and leaves the browser open for the operator
@@ -5741,7 +5825,7 @@ app.post('/fb-pool/post', auth(), async (req, res) => {
   if (!profile || !group_url || (!text && !imgs.length)) {
     return res.status(422).json({ error: 'profile, group_url, and (text or image_urls) required' });
   }
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ error: `unknown profile: ${profile}` });
   let page = null, permalink = null, imgTmp = null;
   try {
@@ -5901,6 +5985,32 @@ Object.assign(FB_POST_PROFILE_MAP, {
   'fb-bca-latam-main': 'k1dfw1g0',
   'fb-bca-latam-secondary': 'k1dkhla0',
 });
+// Accounts bought after the map above was written are addressed by their
+// AdsPower profile name, so a new account is an AdsPower profile, not a deploy.
+// Resolution order: the static map, a raw AdsPower user_id, then an exact
+// name match against the live profile list (cached 10 min). Never throws --
+// the routes run this before their try block, and Express 4 does not catch a
+// rejected async handler.
+const _fbNameCache = new Map(); // name -> { id, at }
+const FB_NAME_TTL_MS = 10 * 60 * 1000;
+async function _fbResolveProfile(profile) {
+  if (!profile || typeof profile !== 'string') return null;
+  if (FB_POST_PROFILE_MAP[profile]) return FB_POST_PROFILE_MAP[profile];
+  if (/^k1[a-z0-9]{5,}$/.test(profile)) return profile;
+  const hit = _fbNameCache.get(profile);
+  if (hit && Date.now() - hit.at < FB_NAME_TTL_MS) return hit.id;
+  try {
+    const data = await fbPostAds('/api/v1/user/list?page=1&page_size=200');
+    const now = Date.now();
+    for (const u of data.list || []) {
+      if (u?.name && u?.user_id) _fbNameCache.set(u.name, { id: u.user_id, at: now });
+    }
+  } catch (e) {
+    console.warn(`[fb] profile lookup failed for ${profile}: ${e?.message || e}`);
+    return null;
+  }
+  return _fbNameCache.get(profile)?.id ?? null;
+}
 const _fbSleep = (ms) => new Promise(r => setTimeout(r, ms));
 function _fbParseMembers(text) {
   if (!text) return null;
@@ -5996,7 +6106,41 @@ async function _fbBlockAssets(page) {
   }
 }
 
+// Proxy guard. 2026-11-24: IPRoyal ran dry, the Bali profiles were flipped to
+// no_proxy so they could be opened by hand, and the growthops crons kept
+// opening them here anyway -- from the OVH datacenter IP, nowhere near the
+// Denpasar history Facebook holds for those accounts. Debbie hit a checkpoint.
+// Every fb-pool route starts through _fbStartProfile, so refusing here covers
+// all of them. FB_ALLOW_NO_PROXY=1 is the escape hatch; only OK results are
+// cached, so a re-bound proxy is picked up on the next call.
+const _fbProxyOk = new Map(); // user_id -> checkedAt
+const FB_PROXY_OK_TTL_MS = 5 * 60 * 1000;
+function _fbHasProxy(u) {
+  if (u?.proxyid || u?.proxy_id) return true;
+  const c = u?.user_proxy_config;
+  return !!(c && c.proxy_soft && c.proxy_soft !== 'no_proxy');
+}
+async function _fbAssertProxy(user_id) {
+  if (process.env.FB_ALLOW_NO_PROXY === '1') return;
+  const at = _fbProxyOk.get(user_id);
+  if (at && Date.now() - at < FB_PROXY_OK_TTL_MS) return;
+  let data = await fbPostAds(`/api/v1/user/list?user_id=${encodeURIComponent(user_id)}`);
+  let prof = (data.list || []).find((u) => u.user_id === user_id);
+  // The user_id filter has come back empty for profiles that exist; fall back
+  // to the full list rather than refusing a healthy profile.
+  if (!prof) {
+    data = await fbPostAds('/api/v1/user/list?page=1&page_size=200');
+    prof = (data.list || []).find((u) => u.user_id === user_id);
+  }
+  if (!prof) throw new Error(`profile_not_found: AdsPower has no profile ${user_id}`);
+  if (!_fbHasProxy(prof)) {
+    throw new Error(`no_proxy_refused: AdsPower profile ${user_id} has no proxy; refusing to open Facebook from the VPS IP`);
+  }
+  _fbProxyOk.set(user_id, Date.now());
+}
+
 async function _fbStartProfile(user_id) {
+  await _fbAssertProxy(user_id);
   const active = await fbPostAds(`/api/v1/browser/active?user_id=${user_id}`);
   if (active?.status === 'Active') {
     await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`);
@@ -6013,10 +6157,141 @@ async function _fbStartProfile(user_id) {
   return { browser, page };
 }
 
+// Shared by /fb-pool/health and /fb-pool/warm: where did the page land?
+// A checkpoint can sit on facebook.com/ with no /checkpoint in the URL, so the
+// body text is checked too. two_step_verification counts as a login wall --
+// the session is not usable either way.
+const FB_LANDED_SELECTOR = 'div[role="main"], form[action*="login"], input[name="email"]';
+const FB_CHECKPOINT_RE = /confirm your identity|we suspended your account|your account has been (locked|disabled)|we noticed unusual activity/i;
+async function _fbClassifyPage(page) {
+  const url = page.url();
+  const text = await page.evaluate(() => (document.body?.innerText || '').slice(0, 5000)).catch(() => '');
+  const loginInput = await page.$('input[name="email"], input[name="pass"]').then(Boolean).catch(() => false);
+  return {
+    url,
+    checkpoint: /\/checkpoint/.test(url) || FB_CHECKPOINT_RE.test(text),
+    login_wall: loginInput || /\/login|two_step_verification/.test(url),
+  };
+}
+const _fbRand = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
+
+// POST /fb-pool/health — is this account usable right now? Checks the proxy
+// exit before Facebook ever sees the profile: a dead proxy or the wrong country
+// returns without opening facebook.com, so a health probe can't do the damage
+// it is meant to detect.
+app.post('/fb-pool/health', auth(), async (req, res) => {
+  const { profile, expect_country } = req.body ?? {};
+  const user_id = await _fbResolveProfile(profile);
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  const t0 = Date.now();
+  const done = (body) => res.json({ ok: true, profile, user_id, ...body, duration_ms: Date.now() - t0 });
+  let page = null;
+  try {
+    try {
+      ({ page } = await _fbStartProfile(user_id));
+    } catch (e) {
+      if (/^no_proxy_refused/.test(String(e?.message))) {
+        return done({ proxy: { configured: false }, fb: null, skipped: 'no_proxy' });
+      }
+      throw e;
+    }
+    const proxy = { configured: true, exit_ip: null, exit_country: null, exit_city: null };
+    try {
+      await page.goto('https://ipinfo.io/json', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const body = await page.evaluate(() => document.body?.innerText || '');
+      let info = {};
+      try { info = JSON.parse(body); } catch {
+        info = {
+          ip: body.match(/"ip":\s*"([^"]+)"/)?.[1],
+          country: body.match(/"country":\s*"([^"]+)"/)?.[1],
+          city: body.match(/"city":\s*"([^"]+)"/)?.[1],
+        };
+      }
+      proxy.exit_ip = info.ip || null;
+      proxy.exit_country = info.country || null;
+      proxy.exit_city = info.city || null;
+      if (!proxy.exit_ip) throw new Error('no ip in ipinfo response');
+    } catch (e) {
+      proxy.exit_error = String(e?.message || e).slice(0, 300);
+      return done({ proxy, fb: null, skipped: 'proxy_dead' });
+    }
+    if (expect_country && String(expect_country).toUpperCase() !== String(proxy.exit_country).toUpperCase()) {
+      return done({ proxy, fb: null, skipped: 'geo_mismatch' });
+    }
+    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 75000 });
+    await page.waitForSelector(FB_LANDED_SELECTOR, { timeout: 15000 }).catch(() => {});
+    const state = await _fbClassifyPage(page);
+    const cookies = await page.context().cookies('https://www.facebook.com').catch(() => []);
+    const c_user = cookies.find((c) => c.name === 'c_user')?.value || null;
+    await page.close().catch(() => {});
+    return done({
+      proxy,
+      fb: { logged_in: !!c_user && !state.login_wall && !state.checkpoint, c_user, checkpoint: state.checkpoint, login_wall: state.login_wall, url: state.url },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
+// POST /fb-pool/warm — a passive session to keep an account looking lived-in:
+// home feed, a detour through the groups feed, scroll and pause. Replaces the
+// C:\fb-verify\warmup.py runner that was lost with VPS1's AdsPower (2026-08-16).
+// Deliberately read-only: no likes, no clicks on posts, no typing. Bails out the
+// moment it sees a checkpoint or login wall.
+app.post('/fb-pool/warm', auth(), async (req, res) => {
+  const { profile, minutes = 5, visit_groups = true } = req.body ?? {};
+  const user_id = await _fbResolveProfile(profile);
+  if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
+  const budgetMs = Math.min(15, Math.max(2, Number(minutes) || 5)) * 60000;
+  const t0 = Date.now();
+  const visited = [];
+  let page = null, scrolls = 0, state = { checkpoint: false, login_wall: false };
+  const finish = () => res.json({
+    ok: true, profile, scrolls, visited,
+    checkpoint: state.checkpoint, login_wall: state.login_wall,
+    duration_ms: Date.now() - t0,
+  });
+  const land = async (url, label) => {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 75000 });
+    visited.push(label);
+    await page.waitForSelector(FB_LANDED_SELECTOR, { timeout: 15000 }).catch(() => {});
+    state = await _fbClassifyPage(page);
+    return !(state.checkpoint || state.login_wall);
+  };
+  const scrollOnce = async () => {
+    await page.mouse.wheel(0, _fbRand(300, 900)).catch(() => {});
+    scrolls++;
+    await _fbSleep(Math.random() < 0.15 ? _fbRand(10000, 25000) : _fbRand(2000, 7000));
+  };
+  try {
+    ({ page } = await _fbStartProfile(user_id));
+    if (!(await land('https://www.facebook.com/', '/'))) return finish();
+    let groupsDone = !visit_groups;
+    while (Date.now() - t0 < budgetMs) {
+      if (!groupsDone && Date.now() - t0 > budgetMs / 2) {
+        groupsDone = true;
+        if (!(await land('https://www.facebook.com/groups/feed/', '/groups/feed/'))) return finish();
+        for (let i = _fbRand(3, 6); i > 0 && Date.now() - t0 < budgetMs; i--) await scrollOnce();
+        if (!(await land('https://www.facebook.com/', '/'))) return finish();
+        continue;
+      }
+      await scrollOnce();
+    }
+    await page.close().catch(() => {});
+    return finish();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e), scrolls, visited });
+  } finally {
+    try { await fbPostAds(`/api/v1/browser/stop?user_id=${user_id}`); } catch {}
+  }
+});
+
 // POST /fb-pool/groups/discover — scrape FB Groups search via warmed profile.
 app.post('/fb-pool/groups/discover', auth(), async (req, res) => {
   const { profile, query = 'Bali', max_results = 30, scroll_passes = 3 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   try {
@@ -6129,7 +6404,7 @@ app.post('/fb-pool/groups/join', auth(), async (req, res) => {
   const answerList = Array.isArray(answers) ? answers.map(a => String(a ?? '')) : [];
   const fallbackAnswer = answer_default == null ? '' : String(answer_default);
   if (!profile || !group_url) return res.status(422).json({ ok: false, error: 'profile, group_url required' });
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   const isVisible = async (sel, t = 2500) => { try { return await page.locator(sel).first().isVisible({ timeout: t }); } catch { return false; } };
@@ -6477,7 +6752,7 @@ async function _fbSearchHarvest(page, gid, max_posts) {
 // POST /fb-pool/groups/scan — scrape a group's recent posts (comment targeting).
 app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
   const { profile, group_url, max_posts = 15, scroll_passes = 3 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
   let page = null;
@@ -6511,7 +6786,7 @@ app.post('/fb-pool/groups/scan', auth(), async (req, res) => {
 // (the search results page is a different surface that does render articles).
 app.post('/fb-pool/groups/search', auth(), async (req, res) => {
   const { profile, group_url, query, max_posts = 15, scroll_passes = 4 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!group_url) return res.status(422).json({ ok: false, error: 'group_url required' });
   if (!query) return res.status(422).json({ ok: false, error: 'query required' });
@@ -6718,7 +6993,7 @@ async function _fbGetPost(page, post_url) {
 // groups/scan gives 800 chars and no photos; Kasa needs both.
 app.post('/fb-pool/post/get', auth(), async (req, res) => {
   const { profile, post_url } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url) return res.status(422).json({ ok: false, error: 'post_url required' });
   let page = null;
@@ -6738,7 +7013,7 @@ app.post('/fb-pool/post/get', auth(), async (req, res) => {
 // list (people DMing us after seeing comments/posts) so GrowthOps can show it.
 app.post('/fb-pool/inbox', auth(), async (req, res) => {
   const { profile, max_threads = 25 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   let page = null;
   try {
@@ -6799,7 +7074,7 @@ app.post('/fb-pool/inbox', auth(), async (req, res) => {
 // recent messages (text + direction) so GrowthOps can show the conversation.
 app.post('/fb-pool/thread', auth(), async (req, res) => {
   const { profile, thread_url, max_messages = 40 } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!thread_url) return res.status(422).json({ ok: false, error: 'thread_url required' });
   let page = null;
@@ -6851,7 +7126,7 @@ const FB_MSG_COMPOSER_SELECTORS = [
 ];
 app.post('/fb-pool/send-message', auth(), async (req, res) => {
   const { profile, thread_url, text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!thread_url || !text) return res.status(422).json({ ok: false, error: 'thread_url, text required' });
   const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim();
@@ -6888,7 +7163,7 @@ app.post('/fb-pool/send-message', auth(), async (req, res) => {
 // open the ⋯ menu -> Edit, replace the text, save). Used to strip em dashes.
 app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
   const { profile, post_url, comment_url, old_text, new_text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url || !old_text || !new_text) return res.status(422).json({ ok: false, error: 'post_url, old_text, new_text required' });
   const want = String(old_text).replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
@@ -6970,7 +7245,7 @@ app.post('/fb-pool/comment-edit', auth(), async (req, res) => {
 // comments whose deep-link wasn't captured at post time + to inspect format.
 app.post('/fb-pool/comment-find', auth(), async (req, res) => {
   const { profile, post_url, text } = req.body ?? {};
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   if (!post_url || !text) return res.status(422).json({ ok: false, error: 'post_url, text required' });
   let page = null;
@@ -7033,7 +7308,7 @@ const FB_COMMENT_BOX_SELECTORS = [
 app.post('/fb-pool/comment', auth(), async (req, res) => {
   const { profile, post_url, text } = req.body ?? {};
   if (!profile || !post_url || !text) return res.status(422).json({ ok: false, error: 'profile, post_url, text required' });
-  const user_id = FB_POST_PROFILE_MAP[profile];
+  const user_id = await _fbResolveProfile(profile);
   if (!user_id) return res.status(400).json({ ok: false, error: `unknown profile: ${profile}` });
   const oneLine = String(text).replace(/\s*\n\s*/g, ' ').trim(); // Enter submits — keep single line
   let page = null;
@@ -7175,3 +7450,205 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 server.requestTimeout = 0;
 server.headersTimeout = 60_000;
 server.keepAliveTimeout = 75_000;
+
+
+// â”€â”€â”€ partner_apply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Fill (mode 'fill') or file (mode 'submit') a partner-programme application
+// on a third-party marketing form. Driven entirely by `payload`, which the
+// caller reads from banking_provider_ops.apply_payload â€” this handler knows
+// nothing about Brex or Payoneer specifically, so a new provider is a database
+// row, not a code change.
+//
+// SUBMIT FILES A REAL APPLICATION UNDER BCAX'S IDENTITY. Like
+// irs_apply_ein_submit, this refuses without a confirmation_token; the worker
+// does NOT enforce the approval gate (no job table, no dedupe, no idempotency
+// key here) â€” bca-app's partner-apply function does, and this token is the
+// proof that it did.
+//
+// Never tries to defeat a captcha, a bot wall or a login: it screenshots and
+// returns { manual: true } so a human takes over.
+handlers.partner_apply = async (page, { url, payload, mode = 'fill', submit = false, confirmation_token, jobId } = {}) => {
+  const tag = jobId || confirmation_token || `partner-${Date.now()}`;
+  const wantSubmit = mode === 'submit' || submit === true;
+
+  if (!url || !/^https:\/\//i.test(url)) throw new Error('partner_apply: https url required');
+  if (!payload || !Array.isArray(payload.fields) || payload.fields.length === 0) {
+    throw new Error('partner_apply: payload.fields required');
+  }
+  if (wantSubmit && !confirmation_token) {
+    throw new Error('partner_apply: confirmation_token required for mode=submit (the operator-approved token from the app)');
+  }
+
+  const shot = async (suffix) => {
+    const p = path.join(OUT, 'partner-apply', `${tag}-${suffix}.png`);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const buf = await page.screenshot({ path: p, fullPage: true }).catch(() => null);
+    return { path: p, b64: buf ? buf.toString('base64') : null };
+  };
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(2500);
+
+  // --- cookie consent ------------------------------------------------------
+  // Brex renders its Marketo form only after the consent gate is answered; left
+  // alone the page shows "It's not you it's us" and no form ever appears.
+  // This is a consent dialog a visitor must answer, not a bot wall: we answer
+  // it the privacy-preserving way (reject/necessary-only) and fall back to
+  // accept only if no reject control exists.
+  const consent = await page.evaluate(() => {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const btns = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"]')).filter(vis);
+    const byText = (re) => btns.find((b) => re.test((b.textContent || '').trim()));
+    const reject = byText(/^(reject all|reject|decline|only necessary|necessary only|essential only)$/i);
+    const accept = byText(/^(accept all|accept|allow all|agree|i agree|got it|ok)$/i);
+    const pick = reject || accept;
+    if (!pick) return null;
+    pick.click();
+    return (pick.textContent || '').trim().slice(0, 40);
+  }).catch(() => null);
+  if (consent) await page.waitForTimeout(2500);
+
+  // --- bot wall / login wall check, before anything is typed ---------------
+  // Hard rule: detect and report, never solve. The worker's CapMonster helpers
+  // (solveTurnstileChallenge, solveAntiCloudflare) are deliberately NOT used here.
+  const blocker = await page.evaluate(() => {
+    const has = (sel) => !!document.querySelector(sel);
+    if (has('iframe[src*="recaptcha"]') || has('.g-recaptcha') || has('[data-sitekey]')) return 'reCAPTCHA';
+    if (has('iframe[src*="challenges.cloudflare.com"]') || has('.cf-turnstile')) return 'Cloudflare Turnstile';
+    if (has('iframe[src*="hcaptcha"]') || has('.h-captcha')) return 'hCaptcha';
+    const t = (document.title || '').toLowerCase();
+    const b = (document.body?.innerText || '').slice(0, 4000).toLowerCase();
+    if (t.includes('just a moment') || b.includes('verify you are human') || b.includes('checking your browser')) return 'bot challenge interstitial';
+    if (has('input[type="password"]') && !document.querySelector('form[id^="mktoForm"]')) return 'login wall';
+    return null;
+  }).catch(() => null);
+  if (blocker) {
+    const s = await shot('blocked');
+    return {
+      portal: 'partner_apply', ok: false, manual: true, reason: blocker,
+      mode, url: page.url(), screenshot: s.path, screenshot_base64: s.b64,
+    };
+  }
+
+  // --- reveal the form if it lives behind a CTA / modal (Payoneer) ---------
+  if (payload.open_selector) {
+    const opener = page.locator(payload.open_selector).first();
+    if (await opener.count()) {
+      await opener.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  // --- wait for the async (Marketo) form to actually exist ----------------
+  // Marketo injects its fields with MktoForms2.loadForm AFTER load, so a
+  // domcontentloaded wait finds an empty container. Wait for a real input.
+  const ready = payload.ready_selector || `${payload.form_selector || 'form'} input`;
+  try {
+    await page.waitForSelector(ready, { state: 'visible', timeout: 45000 });
+  } catch {
+    const s = await shot('no-form');
+    return {
+      portal: 'partner_apply', ok: false, mode, url: page.url(),
+      error: `form never rendered (waited for ${ready})`,
+      consent_clicked: consent || null,
+      screenshot: s.path, screenshot_base64: s.b64,
+    };
+  }
+  await page.waitForTimeout(1000);
+
+  // --- type every field ---------------------------------------------------
+  const scope = payload.form_selector ? page.locator(payload.form_selector) : page;
+  const filled = [];
+  const missing = [];
+  for (const f of payload.fields) {
+    const value = typeof f.value === 'string' ? f.value : '';
+    if (!value) { if (f.required) missing.push(f.name); continue; }
+    const type = f.type || 'text';
+    try {
+      if (type === 'select') {
+        const sel = scope.locator(`select[name="${f.name}"]`).first();
+        if (!(await sel.count())) { missing.push(f.name); continue; }
+        // Marketo option VALUES routinely differ from their labels, so try the
+        // value first and fall back to the visible label rather than guessing.
+        try { await sel.selectOption({ value }); }
+        catch { await sel.selectOption({ label: value }); }
+      } else if (type === 'radio' || type === 'checkbox') {
+        const box = scope.locator(`input[name="${f.name}"][value="${value}"]`).first();
+        if (!(await box.count())) { missing.push(f.name); continue; }
+        await box.check({ force: true });
+      } else if (type === 'textarea') {
+        const ta = scope.locator(`textarea[name="${f.name}"]`).first();
+        if (!(await ta.count())) { missing.push(f.name); continue; }
+        await ta.fill(value);
+      } else {
+        const input = scope.locator(`input[name="${f.name}"]`).first();
+        if (!(await input.count())) { missing.push(f.name); continue; }
+        await input.fill(value);
+        // Marketo validates on blur; without this its inline errors fire late.
+        await input.blur().catch(() => {});
+      }
+      filled.push(f.name);
+    } catch (e) {
+      missing.push(`${f.name} (${String(e).slice(0, 120)})`);
+    }
+    await page.waitForTimeout(150);
+  }
+
+  const before = await shot(wantSubmit ? 'before-submit' : 'filled');
+
+  if (!wantSubmit) {
+    // The whole point of mode 'fill': stop here, hand back the picture.
+    return {
+      portal: 'partner_apply', ok: true, mode: 'fill', submitted: false,
+      url: page.url(), filled, missing,
+      screenshot: before.path, screenshot_base64: before.b64,
+    };
+  }
+
+  // --- submit -------------------------------------------------------------
+  const btn = scope.locator(payload.submit_selector || 'button[type="submit"], input[type="submit"], button.mktoButton').first();
+  if (!(await btn.count())) {
+    return {
+      portal: 'partner_apply', ok: false, mode: 'submit', submitted: false,
+      url: page.url(), filled, missing, error: 'submit button not found',
+      screenshot: before.path, screenshot_base64: before.b64,
+    };
+  }
+  await btn.click();
+  await page.waitForTimeout(9000);
+
+  // Marketo blocks a bad submit with inline .mktoError text and stays put.
+  const errors = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.mktoError, .mktoErrorMsg'))
+      .map((e) => (e.textContent || '').trim()).filter(Boolean).slice(0, 10)
+  ).catch(() => []);
+  const after = await shot('after-submit');
+
+  if (errors.length) {
+    return {
+      portal: 'partner_apply', ok: false, mode: 'submit', submitted: false,
+      url: page.url(), filled, missing, error: `form rejected: ${errors.join(' | ')}`,
+      screenshot: after.path, screenshot_base64: after.b64,
+    };
+  }
+
+  const confirmation = await page.evaluate(() => {
+    const t = (document.body?.innerText || '');
+    const m = t.match(/(thank you[^\n]{0,180}|we(?:'| ha)ve received[^\n]{0,180}|submission (?:received|successful)[^\n]{0,180})/i);
+    return m ? m[0].trim() : null;
+  }).catch(() => null);
+
+  return {
+    portal: 'partner_apply', ok: true, mode: 'submit', submitted: true,
+    url: page.url(), filled, missing,
+    confirmation: confirmation || 'submitted (no explicit confirmation banner)',
+    screenshot: after.path, screenshot_base64: after.b64,
+  };
+};
+
+// wyreg_form_llc -- staged Wyoming LLC formation in the wyreg cabinet. The stage
+// contract lives in wyreg-form-llc.mjs. Stages run one per /submit call because
+// the AdsPower watchdog can restart the browser mid-run; only the "pay" stage
+// spends money, and it refuses to unless the caller passes confirm_charge:true
+// along with the total the cart stage reported.
+handlers.wyreg_form_llc = wyregFormLlc;
