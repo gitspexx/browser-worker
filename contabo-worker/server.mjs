@@ -6215,8 +6215,22 @@ app.post('/fb-pool/health', auth(), async (req, res) => {
       proxy.exit_error = String(e?.message || e).slice(0, 300);
       return done({ proxy, fb: null, skipped: 'proxy_dead' });
     }
+    // Geo databases disagree on proxy-vendor IP space (Cyberyozh ID static 31.59.98.3:
+    // ipinfo says Kuala Lumpur, ip-api and proxycheck say Surabaya, AdsPower sets
+    // Asia/Jakarta). Before refusing, ask a second database; accept if it matches.
     if (expect_country && String(expect_country).toUpperCase() !== String(proxy.exit_country).toUpperCase()) {
-      return done({ proxy, fb: null, skipped: 'geo_mismatch' });
+      try {
+        await page.goto('http://ip-api.com/json/?fields=countryCode,city', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        const alt = JSON.parse(await page.evaluate(() => document.body?.innerText || '{}'));
+        proxy.alt_country = alt.countryCode || null;
+        proxy.alt_city = alt.city || null;
+      } catch (e) {
+        proxy.alt_error = String(e?.message || e).slice(0, 200);
+      }
+      if (String(expect_country).toUpperCase() !== String(proxy.alt_country).toUpperCase()) {
+        return done({ proxy, fb: null, skipped: 'geo_mismatch' });
+      }
+      proxy.geo_split = true;
     }
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 75000 });
     await page.waitForSelector(FB_LANDED_SELECTOR, { timeout: 15000 }).catch(() => {});
